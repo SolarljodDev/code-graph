@@ -1,0 +1,14 @@
+{
+  "name": "code-graph-vault",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Parses a C codebase (inc/src layout) into an Obsidian vault with a files-include graph and a whole-program function-call graph.",
+  "main": "index.mjs",
+  "scripts": {
+    "build": "node index.mjs"
+  },
+  "dependencies": {
+    "tree-sitter": "^0.21.1",
+    "tree-sitter-c": "^0.21.4"
+  }
+}
