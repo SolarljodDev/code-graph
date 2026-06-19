@@ -20,6 +20,28 @@ Or, from any directory, using the bundled wrapper:
 "<path-to-this-repo>\graph.cmd" <outDir> <sourceRoot1> [<sourceRoot2> ...]
 ```
 
+### Drop-in launcher (no local clone needed)
+
+Copy just `vault.ps1` (and `vault.cmd`, for double-click convenience) into the root of any C project and run it:
+
+```
+.\vault.cmd
+```
+
+or in PowerShell:
+
+```
+.\vault.ps1
+```
+
+On first run it clones this repo into `%LOCALAPPDATA%\code-graph-vault`, runs `npm install` there once, then auto-detects every `inc`/`src` pair under the folder you dropped it in and generates `.\graph-vault\` next to itself. Later runs just `git pull` the cached copy and re-generate — no reinstall. Requires Git and Node.js on PATH.
+
+Options:
+```
+.\vault.ps1 -OutDir .\my-vault
+.\vault.ps1 -Roots .\device,.\user
+```
+
 Open `<outDir>` as an Obsidian vault. In Graph View, filter by:
 
 - `path:Files` — file include graph
