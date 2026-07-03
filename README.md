@@ -1,11 +1,38 @@
-# code-graph-vault
+# code-graph
 
-Parses a C codebase (`inc`/`src` layout) directly with [tree-sitter](https://tree-sitter.github.io/tree-sitter/) and generates an [Obsidian](https://obsidian.md/) vault containing two graphs:
+Parses a C codebase directly with [tree-sitter](https://tree-sitter.github.io/tree-sitter/) and generates a **static HTML site of Mermaid diagrams** — open `index.html` in any browser, nothing to install, works offline (the renderer is bundled into the output).
 
-- **Files graph** — nodes are source files, edges are `#include` relationships.
-- **Whole-program call graph** — nodes are functions (qualified as `name__file` when the same name is defined in multiple files, e.g. static helpers), edges are function calls resolved across the entire merged codebase. Calls that resolve to nothing in the codebase (library/macro calls, e.g. CMSIS intrinsics) are linked as separate `external` stub notes.
+The diagrams follow the classic **data-flow diagram** idea (functions + data stores as two node kinds), which is what makes interrupt-driven embedded code readable: an ISR node alone says nothing, but "ISR *writes* `adc_buf`, *sets* `data_ready`; main loop *reads* both" shows the actual architecture.
 
-No external pipeline or pre-built knowledge graph is required — it walks the given directories and parses the C source itself.
+## What it extracts
+
+- **Functions** — including interrupt handlers (`*_IRQHandler` / `*_Handler`, highlighted red) and `main` (green).
+- **Global variables** — file-scope definitions, with `static` / `volatile` flags (volatile = ISR↔main communication channels, highlighted).
+- **Read / write edges** — for every function, which globals it reads, writes, or both (assignments, `++`/`--`, compound assignments, address-of; array writes attributed to the array, `*ptr = x` counts as a read of the pointer).
+- **Call edges** — resolved across all scanned files; calls into libraries/macros shown as dashed external nodes. Functions passed as values (callbacks) count as call edges too.
+- **Descriptions from comments** — a comment directly adjacent to a declaration (same-line trailing comment, or comment lines immediately above with no blank line) becomes the description of that function/variable: shown inside function nodes, in hover tooltips and in the index tables. Section banners (`// ==== ... ====`) are recognized and never attached to the declaration below them.
+
+## Viewer features
+
+- **ELK layout** (Eclipse Layout Kernel, layered/Sugiyama with orthogonal edge routing) instead of mermaid's default dagre — fewer crossings, no long diagonal edges. Bundled offline as `mermaid-elk.min.js` (built once with esbuild, cached in `dist/`).
+- **Hover highlighting** — hovering a node fades everything except the node, every edge from/to it and its direct neighbors; hovering an edge highlights the edge and both endpoints.
+- **Cursor tooltip** — kind, signature/type, file, description, writers/readers list (from `graph-data.js`).
+- **Self-describing nodes** — every node carries a small dim kind tag on the left (`func` / `ISR` / `main` / `var` / `volatile` / `ext` / `file`), so no external color legend is needed.
+
+## Output structure
+
+```
+outDir/
+  index.html          overview diagram + include graph + tables (files / functions / globals)
+  files/<file>.html   one diagram per file: its functions & globals, plus dashed "ghost"
+                      nodes for everything one step outside the file (clickable)
+  functions/<fn>.html one diagram per function: callers, callees, globals touched
+  mermaid-elk.min.js  bundled renderer: mermaid + ELK layout (offline)
+  app.js              viewer runtime: rendering, hover highlighting, tooltips
+  graph-data.js       node metadata for tooltips
+```
+
+Edge semantics: `func → var` = write, `var → func` = read, `↔` = read+write, dotted = call. Every node is clickable and navigates to its page. If the whole program is too big for one readable diagram (>130 nodes), the overview collapses to a file-level graph with aggregated edge counts.
 
 ## Usage
 
@@ -22,33 +49,19 @@ Or, from any directory, using the bundled wrapper:
 
 ### Drop-in launcher (no local clone needed)
 
-Copy just `vault.ps1` (and `vault.cmd`, for double-click convenience) into the root of any C project and run it:
+Copy just `codegraph.ps1` (and `codegraph.cmd`, for double-click convenience) into the root of any C project and run it:
 
 ```
-.\vault.cmd
+.\codegraph.cmd
 ```
 
-or in PowerShell:
-
-```
-.\vault.ps1
-```
-
-On first run it clones this repo into `%LOCALAPPDATA%\code-graph-vault`, runs `npm install` there once, then auto-detects every `inc`/`src` pair under the folder you dropped it in and generates `.\graph-vault\` next to itself. Later runs just `git pull` the cached copy and re-generate — no reinstall. Requires Git and Node.js on PATH.
+On first run it clones this repo into `%LOCALAPPDATA%\code-graph`, runs `npm install` there once, then auto-detects every `inc`/`src` pair under the folder you dropped it in and generates `.\graph-html\` next to itself. Later runs just `git pull` the cached copy and re-generate. Requires Git and Node.js (searched in common install locations even if not on PATH).
 
 Options:
 ```
-.\vault.ps1 -OutDir .\my-vault
-.\vault.ps1 -Roots .\device,.\user
+.\codegraph.ps1 -OutDir .\my-graph
+.\codegraph.ps1 -Roots .\device,.\user
 ```
-
-Open `<outDir>` as an Obsidian vault. In Graph View, filter by:
-
-- `path:Files` — file include graph
-- `path:Functions -path:_external` — call graph, internal calls only
-- `path:Functions` — call graph including external/library calls as leaf nodes
-
-Use Graph View "Groups" to color nodes by tag (`function`, `external`, `file`, `module/...`).
 
 ## Setup on a new machine
 

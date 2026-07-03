@@ -1,24 +1,25 @@
 <#
-Drop this file (and vault.cmd, optionally) into any folder with C source code
-and run it. It fetches/updates the code-graph-vault tool into a local cache,
+Drop this file (and codegraph.cmd, optionally) into any folder with C source code
+and run it. It fetches/updates the code-graph tool into a local cache,
 installs its dependencies once, auto-detects inc/src module folders under
-the current directory, and generates an Obsidian vault next to this script.
+the current directory, and generates a static HTML site of Mermaid diagrams
+(call graph + global-variable dataflow) next to this script.
 
 Usage:
-  .\vault.ps1                          # auto-detect everything
-  .\vault.ps1 -OutDir .\my-vault        # custom output folder
-  .\vault.ps1 -Roots .\device,.\user    # explicit source roots
+  .\codegraph.ps1                          # auto-detect everything
+  .\codegraph.ps1 -OutDir .\my-graph        # custom output folder
+  .\codegraph.ps1 -Roots .\device,.\user    # explicit source roots
 #>
 
 param(
-    [string]$OutDir = (Join-Path $PSScriptRoot "graph-vault"),
+    [string]$OutDir = (Join-Path $PSScriptRoot "graph-html"),
     [string[]]$Roots
 )
 
 $ErrorActionPreference = "Stop"
 
-$ToolHome = Join-Path $env:LOCALAPPDATA "code-graph-vault"
-$RepoUrl = "https://github.com/SolarljodDev/code-graph-vault.git"
+$ToolHome = Join-Path $env:LOCALAPPDATA "code-graph"
+$RepoUrl = "https://github.com/SolarljodDev/code-graph.git"
 
 function Search-CommonDirs($exeName) {
     $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, "$env:LOCALAPPDATA\Programs") |
@@ -70,18 +71,17 @@ function Ensure-Tool {
     Use-ToolDir $nodePath
 
     if (-not (Test-Path $ToolHome)) {
-        Write-Host "Cloning code-graph-vault into $ToolHome ..."
+        Write-Host "Cloning code-graph into $ToolHome ..."
         git clone --depth 1 $RepoUrl $ToolHome | Out-Null
     } else {
-        Write-Host "Updating code-graph-vault ..."
+        Write-Host "Updating code-graph ..."
         git -C $ToolHome pull --ff-only 2>$null | Out-Null
     }
 
-    if (-not (Test-Path (Join-Path $ToolHome "node_modules"))) {
-        Write-Host "Installing tool dependencies (one-time) ..."
-        Push-Location $ToolHome
-        try { npm install --no-fund --no-audit } finally { Pop-Location }
-    }
+    # cheap no-op when already up to date; picks up newly added dependencies after git pull
+    Write-Host "Checking tool dependencies ..."
+    Push-Location $ToolHome
+    try { npm install --no-fund --no-audit | Out-Null } finally { Pop-Location }
 }
 
 function Find-SourceRoots {
@@ -110,4 +110,4 @@ Write-Host ""
 node (Join-Path $ToolHome "index.mjs") $OutDir @Roots
 
 Write-Host ""
-Write-Host "Done. Open '$OutDir' as a vault in Obsidian (File -> Open folder as vault)."
+Write-Host "Done. Open '$(Join-Path $OutDir "index.html")' in a browser."

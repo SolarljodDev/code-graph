@@ -1,3 +1,5 @@
 node_modules/
-vault-*/
+graph-html*/
+graph-html/
+dist/
 *.log

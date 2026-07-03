@@ -1,13 +1,16 @@
 {
-  "name": "code-graph-vault",
-  "version": "1.0.0",
+  "name": "code-graph",
+  "version": "2.0.0",
   "type": "module",
-  "description": "Parses a C codebase (inc/src layout) into an Obsidian vault with a files-include graph and a whole-program function-call graph.",
+  "description": "Parses a C codebase with tree-sitter and generates a static HTML site of Mermaid dataflow diagrams: functions + global variables (read/write edges), call graph, per-file and per-function views. No Obsidian needed — open index.html in a browser.",
   "main": "index.mjs",
   "scripts": {
     "build": "node index.mjs"
   },
   "dependencies": {
+    "@mermaid-js/layout-elk": "^0.2.2",
+    "esbuild": "^0.28.1",
+    "mermaid": "^11.16.0",
     "tree-sitter": "^0.21.1",
     "tree-sitter-c": "^0.21.4"
   }
