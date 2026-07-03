@@ -171,5 +171,25 @@
       console.error('mermaid render:', e);
     }
     document.querySelectorAll('.diagram svg').forEach(setupSvg);
+
+    // diagrams inside <details> render lazily on open: hidden elements
+    // measure text incorrectly, so they carry class "mermaid-lazy" until then
+    document.querySelectorAll('details').forEach(d => {
+      d.addEventListener('toggle', async () => {
+        if (!d.open) return;
+        const lazies = Array.from(d.querySelectorAll('pre.mermaid-lazy'));
+        if (!lazies.length) return;
+        for (const el of lazies) {
+          el.classList.remove('mermaid-lazy');
+          el.classList.add('mermaid');
+        }
+        try {
+          await mermaid.run({ nodes: lazies });
+        } catch (e) {
+          console.error('mermaid render (lazy):', e);
+        }
+        d.querySelectorAll('.diagram svg').forEach(setupSvg);
+      });
+    });
   });
 })();

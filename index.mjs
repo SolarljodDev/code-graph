@@ -296,6 +296,244 @@ function analyzeFunction(funcNode) {
 }
 
 // ---------------------------------------------------------------------------
+// Control-flow graph (flowchart) of a function body.
+// Consecutive plain statements are merged into one block; statements that call
+// a function stand alone (they become clickable). Conditions and loops become
+// diamonds with labeled branches; return/break/continue/goto are routed.
+// ---------------------------------------------------------------------------
+
+const CFG_MAX_NODES = 200;
+
+function buildCfg(body) {
+  if (!body) return null;
+  const nodes = [];
+  const edges = [];
+  let seq = 0;
+
+  const mkNode = (kind, label, calls = []) => {
+    const id = 'c' + seq++;
+    nodes.push({ id, kind, label, calls });
+    return id;
+  };
+  const mkEdge = (from, to, label) => { edges.push({ from, to, label: label || '' }); };
+  const attach = (pending, id) => { for (const p of pending) mkEdge(p.from, id, p.label); };
+
+  const trunc = (s, n = 40) => {
+    const t = s.replace(/\s+/g, ' ').trim();
+    return t.length > n ? t.slice(0, n - 1) + '…' : t;
+  };
+  const callNames = n => {
+    const out = [];
+    walkTree(n, x => {
+      if (x.type === 'call_expression') {
+        const f = x.childForFieldName('function');
+        if (f && f.type === 'identifier') out.push(f.text);
+      }
+    });
+    return out;
+  };
+
+  const labelIds = new Map(); // label name -> node id
+  const gotos = [];           // { from, name }
+  const SIMPLE = new Set(['expression_statement', 'declaration']);
+
+  function buildSeq(stmts, ctx) {
+    let entry = null;
+    let pending = []; // dangling exits waiting for the next node
+    let alive = true;
+    let blockLines = [];
+
+    const flushBlock = () => {
+      if (!blockLines.length) return;
+      const shown = blockLines.slice(0, 4);
+      if (blockLines.length > 4) shown.push('…');
+      const id = mkNode('stmt', shown.join('\n'));
+      if (!entry) entry = id;
+      attach(pending, id);
+      pending = [{ from: id }];
+      blockLines = [];
+    };
+
+    for (const s of stmts) {
+      if (!alive) break; // unreachable after return/break/continue
+      if (s.type === 'comment') continue;
+      if (SIMPLE.has(s.type)) {
+        const calls = callNames(s);
+        if (calls.length) {
+          flushBlock();
+          const id = mkNode('call', trunc(s.text, 46), calls);
+          if (!entry) entry = id;
+          attach(pending, id);
+          pending = [{ from: id }];
+        } else {
+          blockLines.push(trunc(s.text));
+        }
+        continue;
+      }
+      flushBlock();
+      const r = buildStmt(s, ctx);
+      if (r && r.entry) {
+        if (!entry) entry = r.entry;
+        attach(pending, r.entry);
+        pending = r.exits;
+        if (!r.exits.length) alive = false;
+      }
+    }
+    flushBlock();
+    return { entry, exits: pending };
+  }
+
+  function buildAny(s, ctx) {
+    if (!s) return null;
+    if (SIMPLE.has(s.type)) {
+      const calls = callNames(s);
+      const id = mkNode(calls.length ? 'call' : 'stmt', trunc(s.text, 46), calls);
+      return { entry: id, exits: [{ from: id }] };
+    }
+    return buildStmt(s, ctx);
+  }
+
+  function buildStmt(s, ctx) {
+    switch (s.type) {
+      case 'compound_statement':
+        return buildSeq(s.namedChildren, ctx);
+
+      case 'if_statement': {
+        const cond = mkNode('cond', trunc('if ' + (s.childForFieldName('condition')?.text ?? '')));
+        const exits = [];
+        const cr = buildAny(s.childForFieldName('consequence'), ctx);
+        if (cr && cr.entry) { mkEdge(cond, cr.entry, 'да'); exits.push(...cr.exits); }
+        else exits.push({ from: cond, label: 'да' });
+        const altClause = s.childForFieldName('alternative'); // else_clause
+        if (altClause) {
+          const ar = buildAny(altClause.namedChildren[0], ctx);
+          if (ar && ar.entry) { mkEdge(cond, ar.entry, 'нет'); exits.push(...ar.exits); }
+          else exits.push({ from: cond, label: 'нет' });
+        } else {
+          exits.push({ from: cond, label: 'нет' });
+        }
+        return { entry: cond, exits };
+      }
+
+      case 'while_statement': {
+        const cond = mkNode('loop', trunc('while ' + (s.childForFieldName('condition')?.text ?? '')));
+        const breaks = [];
+        const br = buildAny(s.childForFieldName('body'), { ...ctx, breaks, continueTo: cond });
+        if (br && br.entry) {
+          mkEdge(cond, br.entry, 'да');
+          for (const e of br.exits) mkEdge(e.from, cond, e.label);
+        }
+        return { entry: cond, exits: [{ from: cond, label: 'нет' }, ...breaks] };
+      }
+
+      case 'do_statement': {
+        const breaks = [];
+        const cond = mkNode('loop', trunc('while ' + (s.childForFieldName('condition')?.text ?? '')));
+        const br = buildAny(s.childForFieldName('body'), { ...ctx, breaks, continueTo: cond });
+        let entry = cond;
+        if (br && br.entry) {
+          entry = br.entry;
+          for (const e of br.exits) mkEdge(e.from, cond, e.label);
+          mkEdge(cond, br.entry, 'да');
+        }
+        return { entry, exits: [{ from: cond, label: 'нет' }, ...breaks] };
+      }
+
+      case 'for_statement': {
+        const bodyNode = s.childForFieldName('body');
+        const header = bodyNode ? s.text.slice(0, bodyNode.startIndex - s.startIndex) : s.text;
+        const cond = mkNode('loop', trunc(header, 46));
+        const breaks = [];
+        const br = buildAny(bodyNode, { ...ctx, breaks, continueTo: cond });
+        if (br && br.entry) {
+          mkEdge(cond, br.entry, 'цикл');
+          for (const e of br.exits) mkEdge(e.from, cond, e.label);
+        }
+        return { entry: cond, exits: [{ from: cond, label: 'конец' }, ...breaks] };
+      }
+
+      case 'switch_statement': {
+        const sw = mkNode('cond', trunc('switch ' + (s.childForFieldName('condition')?.text ?? '')));
+        const breaks = [];
+        const bodyNode = s.childForFieldName('body');
+        let fall = []; // fallthrough exits of the previous case
+        let sawDefault = false;
+        const cases = bodyNode ? bodyNode.namedChildren.filter(c => c.type === 'case_statement') : [];
+        for (const cs of cases) {
+          const valNode = cs.childForFieldName('value');
+          const lbl = valNode ? trunc(valNode.text, 20) : 'default';
+          if (!valNode) sawDefault = true;
+          const stmts = cs.namedChildren.filter(c => !valNode || c.id !== valNode.id);
+          const r = buildSeq(stmts, { ...ctx, breaks });
+          if (r.entry) {
+            mkEdge(sw, r.entry, lbl);
+            attach(fall, r.entry);
+            fall = r.exits;
+          } else {
+            fall.push({ from: sw, label: lbl }); // empty case falls through
+          }
+        }
+        const exits = [...breaks, ...fall];
+        if (!sawDefault) exits.push({ from: sw, label: 'иначе' });
+        return { entry: sw, exits };
+      }
+
+      case 'return_statement': {
+        const id = mkNode('ret', trunc(s.text, 42));
+        mkEdge(id, ctx.exitId);
+        return { entry: id, exits: [] };
+      }
+
+      case 'break_statement': {
+        const id = mkNode('jump', 'break');
+        if (ctx.breaks) ctx.breaks.push({ from: id });
+        return { entry: id, exits: [] };
+      }
+
+      case 'continue_statement': {
+        const id = mkNode('jump', 'continue');
+        if (ctx.continueTo) mkEdge(id, ctx.continueTo, '↩');
+        return { entry: id, exits: [] };
+      }
+
+      case 'labeled_statement': {
+        const name = s.childForFieldName('label')?.text ?? '';
+        const id = mkNode('stmt', name + ':');
+        labelIds.set(name, id);
+        const inner = s.namedChildren.find(c => c.type !== 'statement_identifier');
+        const r = inner ? buildAny(inner, ctx) : null;
+        if (r && r.entry) { mkEdge(id, r.entry); return { entry: id, exits: r.exits }; }
+        return { entry: id, exits: [{ from: id }] };
+      }
+
+      case 'goto_statement': {
+        const name = s.childForFieldName('label')?.text ?? '';
+        const id = mkNode('jump', 'goto ' + name);
+        gotos.push({ from: id, name });
+        return { entry: id, exits: [] };
+      }
+
+      default: {
+        const calls = callNames(s);
+        const id = mkNode(calls.length ? 'call' : 'stmt', trunc(s.text, 46), calls);
+        return { entry: id, exits: [{ from: id }] };
+      }
+    }
+  }
+
+  const startId = mkNode('term', 'начало');
+  const exitId = mkNode('term', 'конец');
+  const r = buildSeq(body.namedChildren, { exitId, breaks: null, continueTo: null });
+  if (r.entry) mkEdge(startId, r.entry); else mkEdge(startId, exitId);
+  for (const e of r.exits) mkEdge(e.from, exitId, e.label);
+  for (const g of gotos) if (labelIds.has(g.name)) mkEdge(g.from, labelIds.get(g.name), 'goto');
+
+  if (nodes.length > CFG_MAX_NODES) return null; // too big to be readable
+  if (nodes.length <= 3) return null;            // trivial body
+  return { nodes, edges };
+}
+
+// ---------------------------------------------------------------------------
 // Pass 1: parse every file
 // ---------------------------------------------------------------------------
 
@@ -326,6 +564,7 @@ for (const filePath of allFiles) {
   const funcs = extractFunctions(root).map(f => ({
     name: f.name,
     desc: docCommentFor(f.node, commentIdx),
+    cfg: buildCfg(f.node.childForFieldName('body')),
     ...analyzeFunction(f.node),
   }));
   fileRecords.push({ filePath, basename, includes, funcs, vars });
@@ -383,7 +622,7 @@ for (const f of fileRecords) {
     const key = funcKey(fn.name, f.basename);
     const rec = {
       key, name: fn.name, file: f.basename, signature: fn.signature,
-      desc: fn.desc || '',
+      desc: fn.desc || '', cfg: fn.cfg,
       isISR: ISR_RE.test(fn.name), isEntry: fn.name === 'main',
       calls: new Set(),      // funcKeys
       extCalls: new Set(),   // bare names
@@ -483,6 +722,11 @@ const CLASSDEFS = [
   'classDef gvolatile fill:#fef3c7,stroke:#dc2626,stroke-width:2.5px,color:#713f12',
   'classDef ghost fill:#f4f4f5,stroke:#a1a1aa,color:#52525b,stroke-dasharray:5 4',
   'classDef focus stroke-width:3.5px',
+  'classDef cfgstmt fill:#f8fafc,stroke:#94a3b8,color:#0f172a',
+  'classDef cfgcall fill:#dbeafe,stroke:#2563eb,color:#1e3a5f',
+  'classDef cfgcond fill:#fef3c7,stroke:#d97706,color:#713f12',
+  'classDef cfgterm fill:#e2e8f0,stroke:#64748b,color:#334155',
+  'classDef cfgjump fill:#fce7f3,stroke:#db2777,color:#831843',
 ];
 
 function fnClass(fn) {
@@ -699,6 +943,98 @@ function buildFileDiagram(f, rel) {
   return mermaidFlow(lines, 'LR');
 }
 
+// Flowchart of the function's own control flow (branches, loops, calls in order)
+function buildCfgDiagram(fn, rel) {
+  if (!fn.cfg) return null;
+  const lines = [];
+  for (const n of fn.cfg.nodes) {
+    const label = n.label.split('\n').map(escLabel).join('<br>');
+    switch (n.kind) {
+      case 'term': lines.push(`${n.id}(["${label}"]):::cfgterm`); break;
+      case 'ret': lines.push(`${n.id}(["${label}"]):::cfgterm`); break;
+      case 'cond':
+      case 'loop': lines.push(`${n.id}{"${label}"}:::cfgcond`); break;
+      case 'call': lines.push(`${n.id}["${label}"]:::cfgcall`); break;
+      case 'jump': lines.push(`${n.id}(["${label}"]):::cfgjump`); break;
+      default: lines.push(`${n.id}["${label}"]:::cfgstmt`);
+    }
+    // clickable: jump to the first call target defined in this codebase
+    for (const cname of n.calls || []) {
+      const cands = functionsByName.get(cname);
+      if (cands && cands.length) {
+        const target = cands.find(c => c.basename === fn.file) || cands[0];
+        lines.push(`click ${n.id} "${rel}functions/${pageName(funcKey(cname, target.basename))}.html"`);
+        break;
+      }
+    }
+  }
+  for (const e of fn.cfg.edges) {
+    lines.push(e.label ? `${e.from} -->|"${escLabel(e.label)}"| ${e.to}` : `${e.from} --> ${e.to}`);
+  }
+  return mermaidFlow(lines, 'TB');
+}
+
+// Level 0: entry points (main + ISRs) and the globals they exchange data
+// through — directly (solid) or somewhere inside their call trees (dashed)
+function buildLevel0Diagram(rel) {
+  const entries = [...funcs.values()].filter(f => f.isEntry || f.isISR);
+  if (entries.length === 0) return null;
+
+  const info = new Map(); // entryKey -> Map(varKey -> {r, w, direct})
+  for (const e of entries) {
+    const acc = new Map();
+    const seen = new Set([e.key]);
+    const queue = [e.key];
+    while (queue.length) {
+      const k = queue.shift();
+      const f = funcs.get(k);
+      if (!f) continue;
+      const direct = k === e.key;
+      for (const [vk, m] of f.access) {
+        const cur = acc.get(vk) || { r: false, w: false, direct: false };
+        if (m.includes('r')) cur.r = true;
+        if (m.includes('w')) cur.w = true;
+        if (direct) cur.direct = true;
+        acc.set(vk, cur);
+      }
+      for (const c of f.calls) if (!seen.has(c)) { seen.add(c); queue.push(c); }
+    }
+    info.set(e.key, acc);
+  }
+
+  // show vars that connect >=2 entries, plus volatile ones (ISR channels)
+  const touchCount = new Map();
+  for (const acc of info.values()) {
+    for (const vk of acc.keys()) touchCount.set(vk, (touchCount.get(vk) || 0) + 1);
+  }
+  const show = new Set();
+  for (const [vk, n] of touchCount) {
+    const v = varDefs.get(vk);
+    if (v && (n >= 2 || v.isVolatile)) show.add(vk);
+  }
+
+  const lines = [];
+  for (const e of entries) lines.push(fnNodeLine(e));
+  for (const vk of show) lines.push(varNodeLine(varDefs.get(vk), { withType: true, withFile: true }));
+
+  let edgeIdx = 0;
+  const dashedIdx = [];
+  for (const e of entries) {
+    for (const [vk, a] of info.get(e.key)) {
+      if (!show.has(vk)) continue;
+      const mode = a.r && a.w ? 'rw' : a.w ? 'w' : 'r';
+      for (const line of accessEdges(e.key, vk, mode)) {
+        lines.push(line);
+        if (!a.direct) dashedIdx.push(edgeIdx);
+        edgeIdx++;
+      }
+    }
+  }
+  if (dashedIdx.length) lines.push(`linkStyle ${dashedIdx.join(',')} stroke-dasharray:5,opacity:0.55`);
+  for (const e of entries) lines.push(`click ${fnId(e.key)} "${rel}functions/${pageName(e.key)}.html"`);
+  return mermaidFlow(lines, 'LR');
+}
+
 function buildFunctionDiagram(fn, rel) {
   const lines = [];
   lines.push(fnNodeLine(fn, { focus: true }));
@@ -793,7 +1129,7 @@ const LEGEND = `
   <span>функция <b>&rarr;</b> переменная = <b>запись</b></span>
   <span>переменная <b>&rarr;</b> функция = <b>чтение</b></span>
   <span><b>&harr;</b> = чтение + запись</span>
-  <span><b>&#8943;&gt;</b> (пунктир) = вызов</span>
+  <span><b>&#8943;&gt;</b> (пунктир) = вызов, передача управления</span>
   <span><span class="chip" style="background:#f4f4f5;border-color:#a1a1aa;border-style:dashed"></span>из другого файла / внешнее</span>
   <span class="muted">наведите курсор на элемент — подсветятся его связи и появится описание</span>
 </div>`;
@@ -819,13 +1155,14 @@ ${body}
 </html>`;
 }
 
-function diagramBlock(code) {
+// lazy: rendered on <details> open (hidden diagrams measure text incorrectly)
+function diagramBlock(code, { lazy = false } = {}) {
   return `<div class="diagram">
 <div class="zoombar">
   <button onclick="zoom(this, 1.25)">+</button>
   <button onclick="zoom(this, 0.8)">&minus;</button>
 </div>
-<div class="inner"><pre class="mermaid">${escapeHtml(code)}</pre></div>
+<div class="inner"><pre class="${lazy ? 'mermaid-lazy' : 'mermaid'}">${escapeHtml(code)}</pre></div>
 </div>`;
 }
 
@@ -909,16 +1246,26 @@ fs.copyFileSync(path.join(here, 'viewer.js'), path.join(outDir, 'app.js'));
       `<td>${users(v.writers)}</td><td>${users(v.readers)}</td></tr>`;
   }).join('\n');
 
+  const level0 = buildLevel0Diagram('');
   const body = `
 <h1>Обзор программы</h1>
 <p class="muted">Источник: ${roots.map(r => escapeHtml(path.resolve(r))).join(', ')} —
 файлов: ${fileRecords.length}, функций: ${funcs.size}, глобальных переменных: ${varDefs.size}</p>
 ${LEGEND}
-${diagramBlock(buildOverviewDiagram(''))}
+${level0 ? `
+<h2>Уровень 0 — точки входа и обмен через глобальные переменные</h2>
+<p class="muted">main и обработчики прерываний. Сплошная связь — функция обращается к переменной сама,
+пунктирная — где-то внутри её вызовов. Клик по функции — спуск на уровень ниже (связи + блок-схема алгоритма).</p>
+${diagramBlock(level0)}
+
+<details>
+<summary>Полная карта — все функции и переменные</summary>
+${diagramBlock(buildOverviewDiagram(''), { lazy: true })}
+</details>` : diagramBlock(buildOverviewDiagram(''))}
 
 <details>
 <summary>Граф include (файлы)</summary>
-${diagramBlock(buildIncludeDiagram())}
+${diagramBlock(buildIncludeDiagram(), { lazy: true })}
 </details>
 
 <h2>Файлы</h2>
@@ -956,11 +1303,16 @@ for (const fn of funcs.values()) {
     const modeText = { r: 'читает', w: 'пишет', rw: 'читает + пишет' }[mode];
     return `<li><b>${escapeHtml(v.name)}</b> — ${modeText}${v.isVolatile ? ' <b style="color:#dc2626">volatile</b>' : ''}${v.file ? ` <span class="muted">(${escapeHtml(v.file)})</span>` : ' <span class="muted">(внешняя)</span>'}${v.desc ? ` — ${escapeHtml(v.desc)}` : ''}</li>`;
   }).join('\n');
+  const cfgCode = buildCfgDiagram(fn, '../');
   const body = `
 <h1>${escapeHtml(fn.name)}${fn.isISR ? ' <span style="color:#dc2626;font-size:0.8em">обработчик прерывания</span>' : ''}</h1>
 <p><span class="sig">${escapeHtml(fn.signature)}</span> &nbsp; в файле <a href="../files/${sanitize(fn.file)}.html">${escapeHtml(fn.file)}</a></p>
 ${fn.desc ? `<p>${escapeHtml(fn.desc)}</p>` : ''}
 ${LEGEND}
+${cfgCode ? `<h2>Алгоритм</h2>
+<p class="muted">Порядок выполнения: ромбы — условия и циклы, синие блоки — вызовы (кликабельны), «да/нет» — ветви.</p>
+${diagramBlock(cfgCode)}` : ''}
+<h2>Связи</h2>
 ${diagramBlock(buildFunctionDiagram(fn, '../'))}
 ${varList ? `<h2>Глобальные переменные функции</h2><ul>${varList}</ul>` : ''}`;
   fs.writeFileSync(path.join(funcsDir, `${pageName(fn.key)}.html`),
