@@ -839,6 +839,7 @@ const CLASSDEFS = [
   'classDef gvolatilehot fill:#fecaca,stroke:#991b1b,stroke-width:3.5px,color:#7f1d1d',
   'classDef gvolatileminor fill:#fef8f6,stroke:#e5b4ae,color:#9a6a63',
   'classDef ghost fill:#f4f4f5,stroke:#a1a1aa,color:#52525b,stroke-dasharray:5 4',
+  'classDef ghostbtn fill:#e4e4e7,stroke:#71717a,color:#27272a,font-weight:600',
   'classDef periph fill:#e0e7ff,stroke:#4338ca,color:#312e81',
   'classDef periphhot fill:#c7d2fe,stroke:#3730a3,stroke-width:2.5px,color:#1e1b4b',
   'classDef focus stroke-width:3.5px',
@@ -898,6 +899,26 @@ function varNodeLine(v, { ghost = false, withFile = false, withType = false, tie
 
 function extNodeLine(name) {
   return `${extId(name)}["${cap('ext')}<b>${esc(name)}</b>"]:::ghost`;
+}
+
+// A variable-only "list" group: collapsed to a single clickable summary node
+// (the whole node acts as the "expand" button); expanded, that same content
+// node grows to hold the full alphabetical name list and gets a small
+// dedicated "свернуть" button node wired next to it. The content node's id
+// and the edges into it never change between states, so opening or closing
+// one never reflows anything else — and while expanded, clicking the content
+// node itself is left free to behave like a normal node (locks the hover
+// highlight) since the button is what collapses it.
+function varListGroup(id, header, vars, edges) {
+  const btnId = `${id}_btn`;
+  const names = vars.map(v => esc(v.name)).sort((x, y) => x.localeCompare(y));
+  const phLine = `${id}["${header}<br><small>${vars.length} перем.</small><br><b>&#9656; развернуть</b>"]:::ghost`;
+  const fullLines = [
+    `${id}["${header}${names.map(n => `<br>${n}`).join('')}"]:::ghost`,
+    `${btnId}["&#9662; свернуть"]:::ghostbtn`,
+    `${id} --- ${btnId}`,
+  ];
+  return { id, btnId, kind: 'list', phLine, fullLines, edges };
 }
 
 // peripheral instance node (register block reached via `X->field`, never
@@ -1229,14 +1250,8 @@ function buildFileDiagram(f) {
     if (gr.varMembers.size && !gr.fnMembers.size) {
       const vars = [...gr.varMembers.values()];
       const header = `${cap('группа')}<b>${esc(gr.label)}</b>`;
-      const names = vars.map(v => esc(v.name)).sort((x, y) => x.localeCompare(y));
-      const phLine = `${id}["${header}<br><small>${count} перем. — клик, чтобы показать</small>"]:::ghost`;
-      const fullLine = `${id}["${header}${names.map(n => `<br>${n}`).join('')}<br><small>клик — свернуть</small>"]:::ghost`;
-      groupList.push({
-        id, label: gr.label, count, kind: 'list',
-        phLine, fullLine,
-        edges: [...gr.collapsed].map(e => e.replace(/GID/g, id)),
-      });
+      const edges = [...gr.collapsed].map(e => e.replace(/GID/g, id));
+      groupList.push({ ...varListGroup(id, header, vars, edges), label: gr.label, count });
       continue;
     }
 
@@ -1456,10 +1471,8 @@ function buildLevel0Diagram() {
     const writerNames = b.writers.map(k => funcs.get(k)?.name || k).join(', ') || '—';
     const readerNames = b.readers.map(k => funcs.get(k)?.name || k).join(', ') || '—';
     const header = `${cap('канал данных')}<b>${esc(writerNames)} &rarr; ${esc(readerNames)}</b>`;
-    const names = b.vars.map(vk => esc(varDefs.get(vk).name)).sort((x, y) => x.localeCompare(y));
-    const phLine = `${id}["${header}<br><small>${b.vars.length} перем. — клик, чтобы показать</small>"]:::ghost`;
-    const fullLine = `${id}["${header}${names.map(n => `<br>${n}`).join('')}<br><small>клик — свернуть</small>"]:::ghost`;
-    groups.push({ id, kind: 'list', phLine, fullLine, edges });
+    const vars = b.vars.map(vk => varDefs.get(vk));
+    groups.push(varListGroup(id, header, vars, edges));
   }
 
   const note = [varCapNote, periphCapNote].filter(Boolean).join('; ');
@@ -1636,7 +1649,7 @@ function groupedDiagramBlock(fileDiagram) {
   const payload = {
     baseLines, classDefs,
     groups: groups.map(g => g.kind === 'list'
-      ? { id: g.id, kind: 'list', phLine: g.phLine, fullLine: g.fullLine, edges: g.edges }
+      ? { id: g.id, btnId: g.btnId, kind: 'list', phLine: g.phLine, fullLines: g.fullLines, edges: g.edges }
       : { id: g.id, phLine: g.phLine, realLines: g.realLines, collapsedEdges: g.collapsedEdges, expandedEdges: g.expandedEdges }),
   };
   return `<div class="diagram" data-groups="true">

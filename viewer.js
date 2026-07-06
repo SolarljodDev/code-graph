@@ -306,15 +306,23 @@
     let data;
     try { data = JSON.parse(script.textContent); } catch (e) { return null; }
     const expanded = new Set();
-    const groupById = new Map(data.groups.map(g => [g.id, g]));
+    // list-kind groups are looked up by either their content node id or
+    // their "свернуть" button's id — both resolve back to the same group
+    const groupByAnyId = new Map();
+    for (const g of data.groups) {
+      groupByAnyId.set(g.id, g);
+      if (g.btnId) groupByAnyId.set(g.btnId, g);
+    }
 
     function compose() {
       const parts = ['flowchart LR', ...data.classDefs.map(c => '  ' + c), ...data.baseLines];
       for (const g of data.groups) {
         if (g.kind === 'list') {
-          // same node id and the same edges either way — only its own label
-          // text changes, so opening/closing one never reflows anything else
-          parts.push(expanded.has(g.id) ? g.fullLine : g.phLine, ...g.edges);
+          // same content node id and the same edges into it either way —
+          // expanding only adds a sibling button node, so opening/closing
+          // one never reflows anything else on the diagram
+          if (expanded.has(g.id)) parts.push(...g.fullLines, ...g.edges);
+          else parts.push(g.phLine, ...g.edges);
         } else if (expanded.has(g.id)) {
           parts.push(...g.realLines, ...g.expandedEdges);
         } else {
@@ -327,13 +335,18 @@
     function wire(svg) {
       if (!svg) return;
       setupSvg(svg, {
-        extraKeys: groupById.keys(),
+        extraKeys: groupByAnyId.keys(),
         onNodeClick(key) {
-          const g = groupById.get(key);
+          const g = groupByAnyId.get(key);
           if (!g) return false;
           if (g.kind === 'list') {
-            if (expanded.has(key)) expanded.delete(key);
-            else expanded.add(key);
+            if (key === g.btnId) {
+              expanded.delete(g.id);
+            } else if (!expanded.has(g.id)) {
+              expanded.add(g.id);
+            } else {
+              return false; // already expanded: let the content node behave like a normal node (hover-lock) — the button collapses it
+            }
           } else {
             if (expanded.has(key)) return false; // function groups only ever expand forward
             expanded.add(key);
