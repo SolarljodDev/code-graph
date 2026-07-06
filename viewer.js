@@ -229,7 +229,13 @@
     periph: 'периферия (регистры)',
   };
 
-  function nodes() { return (window.GRAPH && window.GRAPH.nodes) || {}; }
+  // PAGE_EXTRA_NODES holds page-local synthetic nodes (e.g. level 0's
+  // variable barrels, bnd_0/bnd_1/...) that aren't real entities and so were
+  // never worth putting in the shared graph-data.js — same idea as
+  // CFG_LINKS below, just for tooltip info instead of a href.
+  function nodes() {
+    return { ...(window.GRAPH && window.GRAPH.nodes), ...window.PAGE_EXTRA_NODES };
+  }
 
   // Node ids known on the current page: graph-data.js entries (functions,
   // globals, files — shared across all pages, hrefs stored root-relative)
@@ -449,17 +455,8 @@
     function compose() {
       const parts = ['flowchart LR', ...data.classDefs.map(c => '  ' + c), ...data.baseLines];
       for (const g of data.groups) {
-        if (g.kind === 'list') {
-          // same node id and the same edges into it either way — toggling
-          // just swaps its label, so opening/closing one never reflows
-          // anything else on the diagram
-          if (expanded.has(g.id)) parts.push(g.fullLine, ...g.edges);
-          else parts.push(g.phLine, ...g.edges);
-        } else if (expanded.has(g.id)) {
-          parts.push(...g.realLines, ...g.expandedEdges);
-        } else {
-          parts.push(g.phLine, ...g.collapsedEdges);
-        }
+        if (expanded.has(g.id)) parts.push(...g.realLines, ...g.expandedEdges);
+        else parts.push(g.phLine, ...g.collapsedEdges);
       }
       return parts.join('\n');
     }
@@ -471,14 +468,8 @@
         onNodeClick(key) {
           const g = groupByAnyId.get(key);
           if (!g) return false;
-          if (g.kind === 'list') {
-            // the barrel itself is the fold/unfold control: click again to collapse
-            if (expanded.has(g.id)) expanded.delete(g.id);
-            else expanded.add(g.id);
-          } else {
-            if (expanded.has(key)) return false; // function groups only ever expand forward
-            expanded.add(key);
-          }
+          if (expanded.has(key)) return false; // groups only ever expand forward, never fold back
+          expanded.add(key);
           rerender();
           return true;
         },
@@ -518,8 +509,10 @@
     }
 
     // the first pass is already-rendered (fully collapsed) by the normal
-    // mermaid.run over .mermaid — just wire clicks onto it, no re-render
-    return wire;
+    // mermaid.run over .mermaid — just wire clicks onto it, no re-render.
+    // rerender is exposed too, so a global setting change (layout algorithm)
+    // can force a fresh render without losing which groups are expanded.
+    return { wire, rerender };
   }
 
   // Explorer-style navigation history: every page visited extends the trail;
@@ -552,31 +545,114 @@
     if (main) main.insertBefore(bar, main.firstChild);
   }
 
+  // Node placement strategy trades off compactness vs straight edges (ELK
+  // still routes orthogonally either way — NETWORK_SIMPLEX optimizes total
+  // edge length and will zigzag through free space to shave it down,
+  // BRANDES_KOEPF explicitly favors straight runs at the cost of more
+  // whitespace). Picked once per browser via the nav dropdown, not baked
+  // into the generated page, so switching doesn't need a regeneration.
+  const PLACEMENT_KEY = 'cg_placement';
+  const PLACEMENTS = { straight: 'BRANDES_KOEPF', compact: 'NETWORK_SIMPLEX' };
+  function currentPlacement() {
+    const v = localStorage.getItem(PLACEMENT_KEY);
+    return v && PLACEMENTS[v] ? v : 'straight';
+  }
+  function mermaidConfig(placement) {
+    return {
+      startOnLoad: false,
+      securityLevel: 'loose',
+      layout: 'elk',
+      elk: { nodePlacementStrategy: PLACEMENTS[placement] },
+      // ELK still routes orthogonally (right-angle bends); this smooths the
+      // rendered line through those points instead of drawing hard corners
+      curve: 'basis',
+      flowchart: { useMaxWidth: false, htmlLabels: true },
+      maxTextSize: 2000000,
+      maxEdges: 5000,
+    };
+  }
+
+  function buildPlacementControl(onChange) {
+    const nav = document.querySelector('nav');
+    if (!nav) return;
+    const label = document.createElement('label');
+    label.style.marginLeft = 'auto';
+    label.style.fontSize = '0.85em';
+    label.style.color = '#cbd5e1';
+    label.textContent = 'раскладка: ';
+    const select = document.createElement('select');
+    select.style.marginLeft = '4px';
+    select.style.background = '#334155';
+    select.style.color = '#e2e8f0';
+    select.style.border = '1px solid #475569';
+    select.style.borderRadius = '4px';
+    select.innerHTML = '<option value="straight">прямые линии</option><option value="compact">компактно</option>';
+    select.value = currentPlacement();
+    select.addEventListener('change', () => {
+      localStorage.setItem(PLACEMENT_KEY, select.value);
+      onChange(select.value);
+    });
+    label.appendChild(select);
+    nav.appendChild(label);
+  }
+
   window.addEventListener('DOMContentLoaded', async () => {
     renderTrail(updateTrail());
     document.body.appendChild(tip);
     document.querySelectorAll('.diagram').forEach(setupPanZoom);
-    mermaid.initialize({
-      startOnLoad: false,
-      securityLevel: 'loose',
-      layout: 'elk',
-      // NETWORK_SIMPLEX packs nodes noticeably tighter than BRANDES_KOEPF on
-      // large graphs (less empty space between layers)
-      elk: { nodePlacementStrategy: 'NETWORK_SIMPLEX' },
-      flowchart: { useMaxWidth: false, htmlLabels: true },
-      maxTextSize: 2000000,
-      maxEdges: 5000,
+    mermaid.initialize(mermaidConfig(currentPlacement()));
+
+    // original source of every plain (non-grouped) diagram, captured before
+    // the first render replaces its <pre> with an <svg> — needed to redraw
+    // from scratch when the placement setting changes later. Diagrams still
+    // waiting on their <details> to open are captured too but never touched
+    // by rerenderPlain (still a <pre>, so it just picks up the new config
+    // whenever it does render).
+    const plainCode = new Map();
+    document.querySelectorAll('.diagram:not([data-groups="true"])').forEach(d => {
+      const pre = d.querySelector('pre.mermaid, pre.mermaid-lazy');
+      if (pre) plainCode.set(d, pre.textContent);
     });
+    function rerenderPlain(d) {
+      return queueRender(async () => {
+        const old = d.querySelector('.inner svg');
+        if (!old) return; // not rendered yet (lazy) — nothing to redo
+        const inner = d.querySelector('.inner');
+        const pre = document.createElement('pre');
+        pre.className = 'mermaid';
+        pre.textContent = plainCode.get(d);
+        old.replaceWith(pre);
+        const prevTransform = inner.style.transform;
+        inner.style.transform = 'none';
+        try {
+          await mermaid.run({ nodes: [pre] });
+        } catch (e) {
+          console.error('mermaid render (placement change):', e);
+          return;
+        } finally {
+          inner.style.transform = prevTransform;
+        }
+        setupSvg(d.querySelector('svg'));
+      });
+    }
+
     try {
       await queueRender(() => mermaid.run({ querySelector: '.mermaid' }));
     } catch (e) {
       console.error('mermaid render:', e);
     }
+    const groupRerenders = [];
     document.querySelectorAll('.diagram[data-groups="true"]').forEach(d => {
-      const wire = setupGroupedDiagram(d);
-      if (wire) wire(d.querySelector('svg'));
+      const g = setupGroupedDiagram(d);
+      if (g) { g.wire(d.querySelector('svg')); groupRerenders.push(g.rerender); }
     });
     document.querySelectorAll('.diagram:not([data-groups="true"]) svg').forEach(el => setupSvg(el));
+
+    buildPlacementControl(async placement => {
+      mermaid.initialize(mermaidConfig(placement));
+      for (const d of plainCode.keys()) await rerenderPlain(d);
+      for (const r of groupRerenders) await r();
+    });
 
     // diagrams inside <details> render lazily on open: hidden elements
     // measure text incorrectly, so they carry class "mermaid-lazy" until then

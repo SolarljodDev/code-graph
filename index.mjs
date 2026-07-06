@@ -849,9 +849,6 @@ const CLASSDEFS = [
   'classDef gvar fill:#fef9c3,stroke:#ca8a04,color:#713f12',
   'classDef gvarhot fill:#fde047,stroke:#a16207,stroke-width:2.5px,color:#713f12',
   'classDef gvarminor fill:#fefce8,stroke:#ddd6a3,color:#8a7a2f',
-  'classDef gvolatile fill:#fef3c7,stroke:#dc2626,stroke-width:2.5px,color:#713f12',
-  'classDef gvolatilehot fill:#fecaca,stroke:#991b1b,stroke-width:3.5px,color:#7f1d1d',
-  'classDef gvolatileminor fill:#fef8f6,stroke:#e5b4ae,color:#9a6a63',
   'classDef ghost fill:#f4f4f5,stroke:#a1a1aa,color:#52525b,stroke-dasharray:5 4',
   'classDef periph fill:#e0e7ff,stroke:#4338ca,color:#312e81',
   'classDef periphhot fill:#c7d2fe,stroke:#3730a3,stroke-width:2.5px,color:#1e1b4b',
@@ -866,10 +863,6 @@ const CLASSDEFS = [
 function fnClass(fn) {
   return fn.isISR ? 'isr' : fn.isEntry ? 'entry' : 'fn';
 }
-function varClass(v) {
-  return v.isVolatile ? 'gvolatile' : 'gvar';
-}
-
 const truncate = (s, n) => (s.length > n ? s.slice(0, n - 1).replace(/\s+\S*$/, '') + '…' : s);
 // full HTML-label escape (labels may contain <, >, & from source text/comments)
 const escLabel = s => String(s)
@@ -892,19 +885,18 @@ function varNodeLine(v, { ghost = false, withFile = false, withType = false, tie
   if (withType && v.typeText) sub.push(esc(v.typeText));
   if (v.isStatic) sub.push('static');
   if ((withFile || ghost) && v.file) sub.push(esc(v.file));
-  let cls = ghost || v.isExternal ? 'ghost' : varClass(v);
-  let nameCls = '';
+  let cls = ghost || v.isExternal ? 'ghost' : 'gvar';
+  const nameClasses = [];
   if (tiered && !ghost && !v.isExternal) {
     const tier = varTier(v);
-    if (tier === 'hot') {
-      cls = v.isVolatile ? 'gvolatilehot' : 'gvarhot';
-      nameCls = " class='vhot'";
-    } else if (tier === 'minor') {
-      // still tinted red for volatile (recognizable as an ISR channel) but
-      // faded like any other single-user var, not the full saturated style
-      cls = v.isVolatile ? 'gvolatileminor' : 'gvarminor';
-    }
+    if (tier === 'hot') { cls = 'gvarhot'; nameClasses.push('vhot'); }
+    else if (tier === 'minor') cls = 'gvarminor';
   }
+  // volatile-ness is a font color on the name itself, not a separate box
+  // style — keeps the tier (hot/normal/minor) as the only thing driving the
+  // box color, instead of a 3x2 matrix of box variants
+  if (v.isVolatile && !ghost && !v.isExternal) nameClasses.push('vvolatile');
+  const nameCls = nameClasses.length ? ` class='${nameClasses.join(' ')}'` : '';
   let label = `${cap(kind)}<b${nameCls}>${esc(v.name)}</b>`;
   if (sub.length) label += `<br><small>${sub.join(' · ')}</small>`;
   return `${varId(v.key)}[("${label}")]:::${cls}`;
@@ -914,44 +906,33 @@ function extNodeLine(name) {
   return `${extId(name)}["${cap('ext')}<b>${esc(name)}</b>"]:::ghost`;
 }
 
-// A bundle of variables that all share the same writers/readers is really
-// just "several variables in one barrel", so it's rendered in the same
-// cylinder shape and color as a single variable node (see varNodeLine)
-// rather than a generic grey placeholder — volatile-ness and the size tier
-// (hot/normal/minor, same 3-way split varTier uses for how often a variable
-// is touched, but keyed here on how many variables this one barrel hides)
-// pick the class, so a barrel folding away a lot of variables reads as
-// visually heavier exactly like a heavily-used single variable would.
+// A bundle of variables grouped into one barrel is rendered in the same
+// cylinder shape as a single variable node (see varNodeLine) rather than a
+// generic grey placeholder — the size tier (hot/normal/minor, same 3-way
+// split varTier uses for how often a variable is touched, but keyed here on
+// how many variables this one barrel hides) picks the box color, so a barrel
+// folding away a lot of variables reads as visually heavier exactly like a
+// heavily-used single variable would. Volatile-ness is a font color on each
+// name, not a separate box variant.
 //
-// Fewer than 3 members is small enough to just always show in full — no
-// fold/unfold control at all (kind: 'static', folded directly into the
-// diagram's base lines by the caller). 3 or more still starts collapsed to a
-// one-line summary and expands in place into that same node, now holding the
-// full alphabetical name list plus its own "свернуть" line — clicking the
-// barrel again folds it back. The node's id and the edges into it never
-// change between states, so opening or closing one never reflows anything
-// else on the diagram.
+// Always shows the full alphabetical name list — no fold/unfold control.
+// A barrel's node id and edges never depend on how many names are in the
+// label, so there was never a layout reason to hide it behind a click; it
+// only ever added an extra step to see what's actually in the box.
 function varListGroup(id, header, vars, edges, tier = 'normal') {
-  const names = vars.map(v => esc(v.name)).sort((x, y) => x.localeCompare(y));
-  const anyVolatile = vars.some(v => v.isVolatile);
-  let cls = anyVolatile ? 'gvolatile' : 'gvar';
-  if (tier === 'hot') cls = anyVolatile ? 'gvolatilehot' : 'gvarhot';
-  else if (tier === 'minor') cls = anyVolatile ? 'gvolatileminor' : 'gvarminor';
+  const names = vars
+    .map(v => ({ v, name: esc(v.name) }))
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map(({ v, name }) => {
+      const nameCls = v.isVolatile ? " class='vvolatile'" : '';
+      return `<b${nameCls}>${name}</b>`;
+    });
+  let cls = 'gvar';
+  if (tier === 'hot') cls = 'gvarhot';
+  else if (tier === 'minor') cls = 'gvarminor';
   const prefix = header ? `${header}<br>` : '';
-  const cyl = inner => `${id}[("${prefix}${inner}")]:::${cls}`;
-
-  if (vars.length < 3) {
-    const line = cyl(names.map(n => `<b>${n}</b>`).join('<br>'));
-    return { id, kind: 'static', line, edges };
-  }
-
-  // plain Unicode triangles, not HTML entity codes: mermaid has its own
-  // internal "#NNN;" unicode-escape convention for label text and blindly
-  // converts any such substring it finds — including inside "&#9656;",
-  // leaving the leading "&" behind as stray literal text
-  const phLine = cyl(`<small>${vars.length} перем.</small><br><b>▶ развернуть</b>`);
-  const fullLine = cyl(names.map(n => `<b>${n}</b>`).join('<br>') + '<br><b>▾ свернуть</b>');
-  return { id, kind: 'list', phLine, fullLine, edges };
+  const line = `${id}[("${prefix}${names.join('<br>')}")]:::${cls}`;
+  return { line, edges };
 }
 
 // peripheral instance node (register block reached via `X->field`, never
@@ -988,11 +969,25 @@ function accessEdgeRawBothStyled(fnSide, otherSide, mode, direct) {
   if (mode === 'rw') return [`${fnSide} ${direct ? '<-->' : '<-.->'} ${otherSide}`];
   return [`${otherSide} ${direct ? '-->' : '-.->'} ${fnSide}`];
 }
-function accessEdgeStyled(fnKey, varKey, mode, direct) {
-  return accessEdgeRawBothStyled(fnId(fnKey), varId(varKey), mode, direct);
-}
 function periphAccessEdgeStyled(fnKey, periphName, mode, direct) {
   return accessEdgeRawBothStyled(fnId(fnKey), periphId(periphName), mode, direct);
+}
+
+// Level 0's variable edges used to pick --> vs <-- based on read/write mode,
+// but that direction is exactly what fed the layered layout's rank
+// assignment — a written var got ranked like a callee (after its entry), a
+// read var like a caller (before it). Since every var shown at level 0 is
+// (by construction) both written by some entry and read by a different one,
+// there's no single "direction" that's actually true for the whole edge set
+// — so the arrowhead was never meaningful here anyway, just noisy. Plain,
+// undirected connectors (solid if the entry accesses it directly, dashed if
+// only somewhere down its call tree); which endpoint is written first is
+// still decided once per bundle (see bundleDownstream), just to keep a
+// bundle shared by several entries from being pulled toward all of them at
+// once — it says nothing about read vs write.
+function accessLink(fnKey, targetId, direct, downstream) {
+  const line = direct ? '---' : '-.-';
+  return downstream ? [`${fnId(fnKey)} ${line} ${targetId}`] : [`${targetId} ${line} ${fnId(fnKey)}`];
 }
 
 const callEdge = (fromKey, toKey) => `${fnId(fromKey)} -.-> ${fnId(toKey)}`;
@@ -1004,8 +999,9 @@ const armEdge = (fnKey, periphName) => `${fnId(fnKey)} -.->|"взводит"| ${
 // as a different kind of arrow than any data or setup edge
 const triggerEdge = (periphName, fnKey) => `${periphId(periphName)} ==>|"прерывание"| ${fnId(fnKey)}`;
 
-function mermaidFlow(lines, direction = 'LR') {
-  return ['flowchart ' + direction, ...CLASSDEFS.map(l => '  ' + l), ...lines.map(l => '  ' + l)].join('\n');
+function mermaidFlow(lines, direction = 'LR', { layout } = {}) {
+  const front = layout ? [`---`, `config:`, `  layout: ${layout}`, `---`] : [];
+  return [...front, 'flowchart ' + direction, ...CLASSDEFS.map(l => '  ' + l), ...lines.map(l => '  ' + l)].join('\n');
 }
 
 // Overview: which vars are interesting enough to show at whole-program level
@@ -1289,8 +1285,7 @@ function buildFileDiagram(f) {
       const header = `${cap('группа')}<b>${esc(gr.label)}</b>`;
       const edges = [...gr.collapsed].map(e => e.replace(/GID/g, id));
       const vlg = varListGroup(id, header, vars, edges, sizeTier(vars.length, varGroupSizes));
-      if (vlg.kind === 'static') baseLines.push(vlg.line, ...vlg.edges);
-      else groupList.push({ ...vlg, label: gr.label, count });
+      baseLines.push(vlg.line, ...vlg.edges);
       continue;
     }
 
@@ -1403,21 +1398,15 @@ function buildLevel0Diagram() {
       accs.some(e2 => e2 !== e1 && varInfo.get(e2.key).get(vk).r));
   });
 
-  // group vars that share the exact same writers+readers into one bundle —
-  // that signature is exactly what determines the edges a var would draw, so
-  // bundling by it never merges two vars that "look similar" but differ
-  const bundleMap = new Map(); // sigKey -> { writers:[entryKey], readers:[entryKey], vars:[varKey] }
+  // group vars by which entries are involved at all — not by the exact
+  // writers-vs-readers split. Two vars touched by the same {A, B} pair land
+  // in one barrel whether it's "A writes, B reads" or "both read and write",
+  // instead of splintering into a separate barrel per distinct combination.
+  const bundleMap = new Map(); // sigKey -> { involved:[entryKey], vars:[varKey] }
   for (const vk of showVars) {
-    const writers = [], readers = [];
-    for (const e of entries) {
-      const a = varInfo.get(e.key).get(vk);
-      if (!a) continue;
-      if (a.w) writers.push(e.key);
-      if (a.r) readers.push(e.key);
-    }
-    writers.sort(); readers.sort();
-    const sig = writers.join(',') + '=>' + readers.join(',');
-    if (!bundleMap.has(sig)) bundleMap.set(sig, { writers, readers, vars: [] });
+    const involved = entries.filter(e => varInfo.get(e.key).has(vk)).map(e => e.key).sort();
+    const sig = involved.join(',');
+    if (!bundleMap.has(sig)) bundleMap.set(sig, { involved, vars: [] });
     bundleMap.get(sig).vars.push(vk);
   }
   let bundles = [...bundleMap.values()];
@@ -1457,20 +1446,36 @@ function buildLevel0Diagram() {
   for (const e of entries) baseLines.push(fnNodeLine(e));
   for (const p of periphList) baseLines.push(periphNodeLine(p));
 
+  // A bundle can be shared by both "mostly writing" and "mostly reading"
+  // entries at once — there's no single true direction for the edge set as
+  // a whole. Deciding it once per bundle (majority of involved entries that
+  // write vs read it) keeps every edge into that bundle pointing the same
+  // way, so it isn't pulled toward opposite sides of the diagram by its own
+  // different entries.
+  function bundleDownstream(b) {
+    let w = 0, r = 0;
+    for (const ek of b.involved) {
+      if (b.vars.some(vk => varInfo.get(ek).get(vk)?.w)) w++;
+      if (b.vars.some(vk => varInfo.get(ek).get(vk)?.r)) r++;
+    }
+    return w >= r;
+  }
+
   const singletons = bundles.filter(b => b.vars.length === 1);
   const multi = bundles.filter(b => b.vars.length >= 2);
   for (const b of singletons) {
     baseLines.push(varNodeLine(varDefs.get(b.vars[0]), { withType: true, withFile: true, tiered: true }));
   }
+  for (const b of singletons) {
+    const vk = b.vars[0];
+    const downstream = bundleDownstream(b);
+    for (const ek of b.involved) {
+      const a = varInfo.get(ek).get(vk);
+      baseLines.push(...accessLink(ek, varId(vk), a.direct, downstream));
+    }
+  }
 
   for (const e of entries) {
-    for (const b of singletons) {
-      const vk = b.vars[0];
-      const a = varInfo.get(e.key).get(vk);
-      if (!a) continue;
-      const mode = a.r && a.w ? 'rw' : a.w ? 'w' : 'r';
-      baseLines.push(...accessEdgeStyled(e.key, vk, mode, a.direct));
-    }
     const pAcc = periphInfo.get(e.key);
     for (const p of periphList) {
       const a = pAcc.get(p.name);
@@ -1489,34 +1494,42 @@ function buildLevel0Diagram() {
     }
   }
 
-  // Each bundle is rendered as ONE node whose label toggles in place between
-  // a short summary and the full alphabetical list of its variable names —
-  // never exploded into one node per variable. That keeps the edges (and
-  // every other node's layout) identical in both states, so expanding never
-  // shrinks unrelated boxes, and clicking again simply collapses it back.
-  const groups = [];
+  // Each bundle is one node holding the full alphabetical list of its
+  // variable names, never exploded into one node per variable — every member
+  // still connects through the same one edge per involved entry.
+  //
+  // Bundle ids (bnd_0, bnd_1, ...) aren't real entities in graph-data.js —
+  // extraNodes carries just enough for this page's hover/click highlighting
+  // and tooltip to recognize them too (see PAGE_EXTRA_NODES in viewer.js).
   let gi = 0;
+  const extraNodes = {};
   const multiSizes = multi.map(b => b.vars.length);
   for (const b of multi) {
     const id = `bnd_${gi++}`;
+    const downstream = bundleDownstream(b);
     const edges = [];
-    const entryDir = new Map(); // entryKey -> {w, r}
-    for (const ek of b.writers) entryDir.set(ek, { ...(entryDir.get(ek) || {}), w: true });
-    for (const ek of b.readers) entryDir.set(ek, { ...(entryDir.get(ek) || {}), r: true });
-    for (const [ek, d] of entryDir) {
+    for (const ek of b.involved) {
       const allDirect = b.vars.every(vk => (varInfo.get(ek).get(vk) || {}).direct);
-      const mode = d.w && d.r ? 'rw' : d.w ? 'w' : 'r';
-      edges.push(...accessEdgeRawBothStyled(fnId(ek), id, mode, allDirect));
+      edges.push(...accessLink(ek, id, allDirect, downstream));
     }
     const vars = b.vars.map(vk => varDefs.get(vk));
     const vlg = varListGroup(id, '', vars, edges, sizeTier(vars.length, multiSizes));
-    if (vlg.kind === 'static') baseLines.push(vlg.line, ...vlg.edges);
-    else groups.push(vlg);
+    baseLines.push(vlg.line, ...vlg.edges);
+    extraNodes[id] = {
+      label: `${vars.length} перем.`, kind: 'gvar',
+      desc: vars.map(v => v.name).sort().join(', '),
+    };
   }
 
   const note = [varCapNote, periphCapNote].filter(Boolean).join('; ');
-  if (!groups.length) return { code: mermaidFlow(baseLines, 'LR'), groups: null, note };
-  return { baseLines, classDefs: CLASSDEFS, groups, note };
+  // elk.mrtree was tried here (main as root, branching outward instead of a
+  // strict left-to-right rank order) but this graph isn't a tree — several
+  // entries share the same bundle/peripheral — so mrtree drew every edge
+  // that didn't fit its spanning tree as a special squiggly "feedback edge"
+  // marker, which looked broken rather than better. Back to the plain
+  // layered algorithm; a real radial layout isn't exposed by Mermaid's ELK
+  // integration (see the "why is main always on the left" question).
+  return { code: mermaidFlow(baseLines, 'LR'), groups: null, note, extraNodes };
 }
 
 function buildFunctionDiagram(fn) {
@@ -1618,9 +1631,10 @@ const CSS = `
     text-transform: uppercase; font-weight: 400; }
   svg .label small { opacity: .62; }
   svg b.vhot { font-size: 18px; }
-  svg g.node.gvarminor, svg g.node.gvolatileminor { opacity: .55; }
-  svg.fade g.node.gvarminor, svg.fade g.node.gvolatileminor { opacity: .13; }
-  svg g.node.gvarminor .label, svg g.node.gvolatileminor .label { font-size: 11px; }
+  svg b.vvolatile { color: #dc2626; }
+  svg g.node.gvarminor { opacity: .55; }
+  svg.fade g.node.gvarminor { opacity: .13; }
+  svg g.node.gvarminor .label { font-size: 11px; }
   .diagram.panning { cursor: grabbing; }
   .diagram.panning svg g.node { cursor: grabbing; }
   .trailbar { font-size: 0.85rem; color: #52525b; margin: 0 0 14px; }
@@ -1642,16 +1656,17 @@ const LEGEND = `
 
 const LEGEND0 = `
 <div class="legend">
-  <span>точка входа <b>&rarr;</b> переменная/периферия = <b>запись</b>, обратная стрелка = <b>чтение</b>, <b>&harr;</b> = обе</span>
-  <span>сплошная связь — точка входа обращается сама, пунктир — где-то внутри вызовов</span>
+  <span>точка входа <b>&mdash;</b> переменная — связь без стрелки: эти данные всегда идут в обе стороны между разными точками входа (иначе переменная не попала бы на этот уровень), указывать направление незачем</span>
+  <span>точка входа <b>&rarr;</b> периферия = <b>запись</b>, обратная стрелка = <b>чтение</b>, <b>&harr;</b> = обе</span>
+  <span>сплошная линия — точка входа обращается сама (в своём теле), пунктирная — где-то внутри функций, которые она вызывает</span>
   <span><span class="chip" style="background:#e0e7ff;border-color:#4338ca"></span>&#11039; периферия (регистры вида <code>X-&gt;поле</code>)</span>
   <span><b>&#8943;&gt;</b> «взводит» — вызов NVIC_EnableIRQ на эту периферию</span>
   <span><b>=&gt;</b> «прерывание» — периферия вызывает обработчик по её имени</span>
-  <span>цилиндр с числом внутри — несколько переменных с одинаковыми писателями/читателями, свёрнутые в один жгут (чем их больше, тем жирнее обводка); клик по нему показывает/скрывает список имён</span>
+  <span>цилиндр с несколькими именами — переменные, связанные с одним и тем же набором точек входа, собранные в один жгут</span>
   <span class="muted">наведите курсор — подсветятся связи; клик — закрепить подсветку; двойной клик — перейти; клик по пустому месту — снять</span>
 </div>`;
 
-function htmlPage({ title, rel, path, body, cfgLinks }) {
+function htmlPage({ title, rel, path, body, cfgLinks, extraNodes }) {
   return `<!doctype html>
 <html lang="ru">
 <head>
@@ -1666,6 +1681,7 @@ window.PAGE_REL = ${JSON.stringify(rel)};
 window.PAGE_PATH = ${JSON.stringify(path)};
 window.PAGE_TITLE = ${JSON.stringify(title)};
 ${cfgLinks ? `window.CFG_LINKS = ${JSON.stringify(cfgLinks)};` : ''}
+${extraNodes ? `window.PAGE_EXTRA_NODES = ${JSON.stringify(extraNodes)};` : ''}
 </script>
 <nav><span class="title">code graph</span><a href="${rel}index.html">обзор</a></nav>
 <main>
@@ -1698,14 +1714,11 @@ function diagramBlock(code, { lazy = false } = {}) {
 // in a hidden JSON blob alongside it.
 function groupedDiagramBlock(fileDiagram) {
   const { baseLines, classDefs, groups } = fileDiagram;
-  const collapsedLines = [...baseLines, ...groups.flatMap(g =>
-    g.kind === 'list' ? [g.phLine, ...g.edges] : [g.phLine, ...g.collapsedEdges])];
+  const collapsedLines = [...baseLines, ...groups.flatMap(g => [g.phLine, ...g.collapsedEdges])];
   const code = mermaidFlow(collapsedLines, 'LR');
   const payload = {
     baseLines, classDefs,
-    groups: groups.map(g => g.kind === 'list'
-      ? { id: g.id, kind: 'list', phLine: g.phLine, fullLine: g.fullLine, edges: g.edges }
-      : { id: g.id, phLine: g.phLine, realLines: g.realLines, collapsedEdges: g.collapsedEdges, expandedEdges: g.expandedEdges }),
+    groups: groups.map(g => ({ id: g.id, phLine: g.phLine, realLines: g.realLines, collapsedEdges: g.collapsedEdges, expandedEdges: g.expandedEdges })),
   };
   return `<div class="diagram-wrap">
 <div class="diagram" data-groups="true" tabindex="-1">
@@ -1815,7 +1828,7 @@ fs.copyFileSync(path.join(here, 'viewer.js'), path.join(outDir, 'app.js'));
   }).join('\n');
 
   const level0 = buildLevel0Diagram();
-  const level0Diagram = level0 ? (level0.groups ? groupedDiagramBlock(level0) : diagramBlock(level0.code)) : '';
+  const level0Diagram = level0 ? diagramBlock(level0.code) : '';
   const body = `
 <h1>Обзор программы</h1>
 <p class="muted">Источник: ${roots.map(r => escapeHtml(path.resolve(r))).join(', ')} —
@@ -1853,7 +1866,7 @@ ${diagramBlock(buildIncludeDiagram(), { lazy: true })}
 <table><tr><th>Переменная</th><th>Тип</th><th>Описание</th><th>Определена в</th><th>Функций</th><th>Пишут</th><th>Читают</th></tr>${varRows}</table>`;
 
   fs.writeFileSync(path.join(outDir, 'index.html'),
-    htmlPage({ title: 'Код-граф — обзор', rel: '', path: 'index.html', body }));
+    htmlPage({ title: 'Код-граф — обзор', rel: '', path: 'index.html', body, extraNodes: level0 ? level0.extraNodes : undefined }));
 }
 
 // per-file pages
