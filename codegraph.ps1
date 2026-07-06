@@ -22,7 +22,7 @@ $ToolHome = Join-Path $env:LOCALAPPDATA "code-graph"
 $RepoUrl = "https://github.com/SolarljodDev/code-graph.git"
 
 function Search-CommonDirs($exeName) {
-    $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, "$env:LOCALAPPDATA\Programs") |
+    $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, "$env:LOCALAPPDATA\Programs", "$env:LOCALAPPDATA\node-portable") |
         Where-Object { $_ -and (Test-Path $_) }
     foreach ($root in $roots) {
         $found = Get-ChildItem -Path $root -Filter $exeName -Recurse -Depth 3 -File -ErrorAction SilentlyContinue |
