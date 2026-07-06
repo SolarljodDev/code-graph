@@ -901,21 +901,39 @@ function extNodeLine(name) {
   return `${extId(name)}["${cap('ext')}<b>${esc(name)}</b>"]:::ghost`;
 }
 
-// A variable-only "list" group: collapsed to a single clickable summary node
-// (the whole node acts as the "expand" button); expanded, that same content
-// node grows to hold the full alphabetical name list and gets a small
-// dedicated "свернуть" button node wired next to it. The content node's id
-// and the edges into it never change between states, so opening or closing
-// one never reflows anything else — and while expanded, clicking the content
-// node itself is left free to behave like a normal node (locks the hover
-// highlight) since the button is what collapses it.
+// A bundle of variables that all share the same writers/readers is really
+// just "several variables in one barrel", so it's rendered in the same
+// cylinder shape as a single variable node (see varNodeLine) rather than a
+// generic rectangle placeholder, with names bolded the same way too.
+//
+// Fewer than 3 members is small enough to just always show in full — no
+// fold/unfold control at all (kind: 'static', folded directly into the
+// diagram's base lines by the caller). 3 or more still starts collapsed to a
+// one-line summary, expanding into that same content node (now holding the
+// full alphabetical name list) plus a small dedicated "свернуть" button node
+// wired next to it. The content node's id and the edges into it never change
+// between states, so opening or closing one never reflows anything else —
+// and while expanded, clicking the content node itself is left free to
+// behave like a normal node (locks the hover highlight) since the button is
+// what collapses it.
 function varListGroup(id, header, vars, edges) {
-  const btnId = `${id}_btn`;
   const names = vars.map(v => esc(v.name)).sort((x, y) => x.localeCompare(y));
-  const phLine = `${id}["${header}<br><small>${vars.length} перем.</small><br><b>&#9656; развернуть</b>"]:::ghost`;
+  const cyl = inner => `${id}[("${header}${inner}")]:::ghost`;
+
+  if (vars.length < 3) {
+    const line = cyl(names.map(n => `<br><b>${n}</b>`).join(''));
+    return { id, kind: 'static', line, edges };
+  }
+
+  const btnId = `${id}_btn`;
+  // plain Unicode triangles, not HTML entity codes: mermaid has its own
+  // internal "#NNN;" unicode-escape convention for label text and blindly
+  // converts any such substring it finds — including inside "&#9656;",
+  // leaving the leading "&" behind as stray literal text
+  const phLine = cyl(`<br><small>${vars.length} перем.</small><br><b>▶ развернуть</b>`);
   const fullLines = [
-    `${id}["${header}${names.map(n => `<br>${n}`).join('')}"]:::ghost`,
-    `${btnId}["&#9662; свернуть"]:::ghostbtn`,
+    cyl(names.map(n => `<br><b>${n}</b>`).join('')),
+    `${btnId}["▾ свернуть"]:::ghostbtn`,
     `${id} --- ${btnId}`,
   ];
   return { id, btnId, kind: 'list', phLine, fullLines, edges };
@@ -1251,7 +1269,9 @@ function buildFileDiagram(f) {
       const vars = [...gr.varMembers.values()];
       const header = `${cap('группа')}<b>${esc(gr.label)}</b>`;
       const edges = [...gr.collapsed].map(e => e.replace(/GID/g, id));
-      groupList.push({ ...varListGroup(id, header, vars, edges), label: gr.label, count });
+      const vlg = varListGroup(id, header, vars, edges);
+      if (vlg.kind === 'static') baseLines.push(vlg.line, ...vlg.edges);
+      else groupList.push({ ...vlg, label: gr.label, count });
       continue;
     }
 
@@ -1472,7 +1492,9 @@ function buildLevel0Diagram() {
     const readerNames = b.readers.map(k => funcs.get(k)?.name || k).join(', ') || '—';
     const header = `${cap('канал данных')}<b>${esc(writerNames)} &rarr; ${esc(readerNames)}</b>`;
     const vars = b.vars.map(vk => varDefs.get(vk));
-    groups.push(varListGroup(id, header, vars, edges));
+    const vlg = varListGroup(id, header, vars, edges);
+    if (vlg.kind === 'static') baseLines.push(vlg.line, ...vlg.edges);
+    else groups.push(vlg);
   }
 
   const note = [varCapNote, periphCapNote].filter(Boolean).join('; ');
