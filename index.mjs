@@ -1575,12 +1575,25 @@ const CSS = `
   main { max-width: 1600px; margin: 0 auto; padding: 16px 20px 60px; }
   h1 { font-size: 1.4rem; } h2 { font-size: 1.1rem; margin-top: 2em; }
   .sig { font-family: Consolas, monospace; background: #eef2f7; padding: 6px 10px; border-radius: 6px; display: inline-block; }
+  .diagram-wrap { position: relative; }
   .diagram { background: #fff; border: 1px solid #e4e4e7; border-radius: 8px; overflow: auto; position: relative;
-    max-height: 78vh; user-select: none; -webkit-user-select: none; }
+    max-height: 78vh; user-select: none; -webkit-user-select: none; outline: none; }
   .diagram .inner { transform-origin: 0 0; width: max-content; padding: 12px; }
   .zoombar { position: sticky; top: 6px; left: 6px; z-index: 5; display: inline-flex; gap: 4px; margin: 6px; }
   .zoombar button { border: 1px solid #d4d4d8; background: #fff; border-radius: 6px; width: 30px; height: 30px; cursor: pointer; font-size: 15px; }
   .zoombar button:hover { background: #f4f4f5; }
+  /* lives outside .diagram (sibling in .diagram-wrap), positioned relative to
+     the wrap's own box — independent of the diagram's own scroll/zoom state,
+     since a scaled-down .inner doesn't shrink .diagram's scrollable extent */
+  .maxbtn { position: absolute; bottom: 6px; right: 6px; z-index: 6;
+    border: 1px solid #d4d4d8; background: #fff; border-radius: 6px; width: 30px; height: 30px;
+    cursor: pointer; font-size: 15px; transition: transform .15s; }
+  .maxbtn:hover { background: #f4f4f5; }
+  .maxbtn.active { transform: rotate(180deg); }
+  .diagram.maximized { position: fixed; inset: 0; z-index: 1000; max-height: none;
+    width: 100vw; height: 100vh; border-radius: 0; }
+  .diagram-wrap:has(.diagram.maximized) .maxbtn { position: fixed; z-index: 1001; }
+  body.diagram-maximized { overflow: hidden; }
   .legend { display: flex; gap: 14px; flex-wrap: wrap; margin: 10px 0 16px; font-size: 0.85rem; color: #52525b; align-items: center; }
   .chip { display: inline-block; width: 14px; height: 14px; border-radius: 4px; vertical-align: -2px; margin-right: 5px; border: 1.5px solid; }
   table { border-collapse: collapse; margin-top: 8px; font-size: 0.9rem; }
@@ -1590,7 +1603,7 @@ const CSS = `
   td a:hover { text-decoration: underline; }
   .muted { color: #a1a1aa; }
   details summary { cursor: pointer; font-size: 1.1rem; font-weight: 600; margin-top: 2em; }
-  .tip { position: fixed; z-index: 50; max-width: 420px; background: #1e293b; color: #f1f5f9;
+  .tip { position: fixed; z-index: 1100; max-width: 420px; background: #1e293b; color: #f1f5f9;
     padding: 8px 12px; border-radius: 8px; font-size: 12.5px; pointer-events: none;
     display: none; line-height: 1.5; box-shadow: 0 6px 20px rgba(0,0,0,.3); }
   .tip .k { opacity: .65; font-size: 11.5px; }
@@ -1667,12 +1680,15 @@ ${body}
 
 // lazy: rendered on <details> open (hidden diagrams measure text incorrectly)
 function diagramBlock(code, { lazy = false } = {}) {
-  return `<div class="diagram">
+  return `<div class="diagram-wrap">
+<div class="diagram" tabindex="-1">
 <div class="zoombar">
   <button onclick="zoom(this, 1.25)">+</button>
   <button onclick="zoom(this, 0.8)">&minus;</button>
 </div>
 <div class="inner"><pre class="${lazy ? 'mermaid-lazy' : 'mermaid'}">${escapeHtml(code)}</pre></div>
+</div>
+<button class="maxbtn" onclick="toggleMaximize(this)" title="На весь экран (F)">&#9974;</button>
 </div>`;
 }
 
@@ -1691,13 +1707,16 @@ function groupedDiagramBlock(fileDiagram) {
       ? { id: g.id, kind: 'list', phLine: g.phLine, fullLine: g.fullLine, edges: g.edges }
       : { id: g.id, phLine: g.phLine, realLines: g.realLines, collapsedEdges: g.collapsedEdges, expandedEdges: g.expandedEdges }),
   };
-  return `<div class="diagram" data-groups="true">
+  return `<div class="diagram-wrap">
+<div class="diagram" data-groups="true" tabindex="-1">
 <div class="zoombar">
   <button onclick="zoom(this, 1.25)">+</button>
   <button onclick="zoom(this, 0.8)">&minus;</button>
 </div>
 <div class="inner"><pre class="mermaid">${escapeHtml(code)}</pre></div>
 <script type="application/json" class="group-data">${JSON.stringify(payload)}</script>
+</div>
+<button class="maxbtn" onclick="toggleMaximize(this)" title="На весь экран (F)">&#9974;</button>
 </div>`;
 }
 

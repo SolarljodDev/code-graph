@@ -97,7 +97,106 @@
     // belt-and-braces: some browsers fire a native dragstart for SVG content
     // even with user-select:none and preventDefault() on pointerdown
     diagram.addEventListener('dragstart', ev => ev.preventDefault());
+
+    // focus follows any interaction with this diagram (click on a node,
+    // drag-pan, or the maximize button) so the F/Home/Escape shortcuts below
+    // know which diagram they apply to
+    diagram.addEventListener('mousedown', () => diagram.focus({ preventScroll: true }));
   }
+
+  // --- maximize to the full browser window (not the Fullscreen API — the
+  // tab strip and everything above it stays visible) + Home-to-fit-selection ---
+
+  function setMaximized(diagram, on) {
+    diagram.classList.toggle('maximized', on);
+    document.body.classList.toggle('diagram-maximized', on);
+    const btn = diagram.parentElement.querySelector('.maxbtn');
+    if (btn) {
+      btn.classList.toggle('active', on);
+      btn.title = on ? 'Свернуть (Esc)' : 'На весь экран (F)';
+    }
+  }
+
+  // bounding box (in unscaled .inner content coordinates) enclosing a set of
+  // elements, found via their on-screen rects so nested SVG/HTML transforms
+  // never need to be untangled by hand
+  function contentBox(diagram, els) {
+    const inner = diagram.querySelector('.inner');
+    if (!inner) return null;
+    const innerRect = inner.getBoundingClientRect();
+    const z = parseFloat(inner.dataset.z || '1');
+    let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+    for (const el of els) {
+      const r = el.getBoundingClientRect();
+      if (!r.width && !r.height) continue;
+      x1 = Math.min(x1, (r.left - innerRect.left) / z);
+      y1 = Math.min(y1, (r.top - innerRect.top) / z);
+      x2 = Math.max(x2, (r.right - innerRect.left) / z);
+      y2 = Math.max(y2, (r.bottom - innerRect.top) / z);
+    }
+    if (!isFinite(x1)) return null;
+    return { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
+  }
+
+  // the currently pinned/hovered selection (nodes+edges carrying .hl), or
+  // null if nothing is highlighted right now
+  function selectionBox(diagram) {
+    const svg = diagram.querySelector('svg');
+    if (!svg) return null;
+    const els = svg.querySelectorAll('.hl');
+    return els.length ? contentBox(diagram, els) : null;
+  }
+
+  function wholeBox(diagram) {
+    const svg = diagram.querySelector('svg');
+    return svg ? contentBox(diagram, [svg]) : null;
+  }
+
+  function fitToView(diagram, box) {
+    const inner = diagram.querySelector('.inner');
+    if (!inner || !box || box.w <= 0 || box.h <= 0) return;
+    const margin = 0.92; // small breathing room around the fitted box
+    const z2 = Math.min(8, Math.max(0.08,
+      Math.min(diagram.clientWidth / box.w, diagram.clientHeight / box.h) * margin));
+    inner.dataset.z = z2;
+    inner.style.transform = 'scale(' + z2 + ')';
+    const ox = inner.offsetLeft, oy = inner.offsetTop;
+    diagram.scrollLeft = ox + (box.x + box.w / 2) * z2 - diagram.clientWidth / 2;
+    diagram.scrollTop = oy + (box.y + box.h / 2) * z2 - diagram.clientHeight / 2;
+  }
+
+  // Home: fit the current selection if there is one, else fit everything
+  function homeFit(diagram) {
+    fitToView(diagram, selectionBox(diagram) || wholeBox(diagram));
+  }
+
+  window.toggleMaximize = function (btn) {
+    const diagram = btn.parentElement.querySelector('.diagram');
+    setMaximized(diagram, !diagram.classList.contains('maximized'));
+    homeFit(diagram);
+    // the button lives outside .diagram, so a native click doesn't leave
+    // focus on it the way clicking inside the diagram would — force it so
+    // Escape/F/Home immediately recognize this diagram as active
+    diagram.focus({ preventScroll: true });
+  };
+
+  // F/Home/Escape only act on a diagram that was clicked into or otherwise
+  // holds focus, so typing elsewhere on the page never triggers them
+  document.addEventListener('keydown', ev => {
+    const active = document.activeElement;
+    const diagram = active && active.closest && active.closest('.diagram');
+    if (!diagram) return;
+    if (ev.key === 'Escape') {
+      if (diagram.classList.contains('maximized')) { ev.preventDefault(); setMaximized(diagram, false); }
+    } else if (ev.key === 'f' || ev.key === 'F') {
+      ev.preventDefault();
+      setMaximized(diagram, !diagram.classList.contains('maximized'));
+      homeFit(diagram);
+    } else if (ev.key === 'Home') {
+      ev.preventDefault();
+      homeFit(diagram);
+    }
+  });
 
   const KIND_LABEL = {
     fn: 'функция', entry: 'точка входа', isr: 'обработчик прерывания',
