@@ -110,6 +110,7 @@ function cleanComment(text) {
      .replace(/^\s*\/\/+/, '').replace(/^\s*\*+(?!\/)/, '').trim(),
   ).filter(l => l && !/^[=\-_~*#+.\s]+$/.test(l));
   return lines.join(' ').replace(/\s+/g, ' ')
+    .replace(/^[@\\]fn\s+\S+\s*/i, '')
     .replace(/^[@\\]brief\s*/i, '').trim();
 }
 
@@ -265,12 +266,30 @@ function analyzeFunction(funcNode) {
   }
 
   const calls = new Set();
+  // raw first-argument text of calls that arm an NVIC interrupt line, e.g.
+  // "DMA1_Channel2_IRQn" from NVIC_EnableIRQ(DMA1_Channel2_IRQn)
+  const armCalls = new Set();
+  // identifiers used as the base of an arrow access (`X->field`) and never
+  // otherwise declared in the scanned sources — the CMSIS/HAL convention for
+  // a peripheral register block (`#define DMA1_Channel2 ((...*)DMA1_Channel2_BASE)`
+  // lives in a vendor header we don't parse, so these names never resolve to
+  // a real variable; that absence is itself the signal that flags them as
+  // peripheral candidates in pass 2, not a naming-convention guess
+  const derefNames = new Set();
   const access = new Map(); // name -> { r, w }
+  const NVIC_ARM_RE = /^(HAL_|LL_)?NVIC_EnableIRQ$/;
   if (body) {
     walkTree(body, n => {
       if (n.type === 'call_expression') {
         const fn = n.childForFieldName('function');
-        if (fn && fn.type === 'identifier') calls.add(fn.text);
+        if (fn && fn.type === 'identifier') {
+          calls.add(fn.text);
+          if (NVIC_ARM_RE.test(fn.text)) {
+            const args = n.childForFieldName('arguments');
+            const first = args ? args.namedChildren[0] : null;
+            if (first && first.type === 'identifier') armCalls.add(first.text);
+          }
+        }
         return;
       }
       if (n.type !== 'identifier') return;
@@ -281,6 +300,10 @@ function analyzeFunction(funcNode) {
       if (p && (p.type.endsWith('_declarator')) && sameNode(p.childForFieldName('declarator'), n)) return;
       const name = n.text;
       if (locals.has(name)) return;
+      if (p && p.type === 'field_expression' && p.childForFieldName('operator')?.text === '->'
+          && sameNode(p.childForFieldName('argument'), n)) {
+        derefNames.add(name);
+      }
       const mode = classifyAccess(n);
       const cur = access.get(name) || { r: false, w: false };
       if (mode.includes('r')) cur.r = true;
@@ -292,7 +315,7 @@ function analyzeFunction(funcNode) {
   const typeNode = funcNode.childForFieldName('type');
   const signature = `${typeNode ? typeNode.text + ' ' : ''}${declarator ? declarator.text : ''}`
     .replace(/\s+/g, ' ');
-  return { calls, access, signature };
+  return { calls, armCalls, derefNames, access, signature };
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +617,19 @@ const varDefs = new Map();   // varKey -> var record
 const varByName = new Map(); // name -> [varKey]
 const externNames = new Set();
 
+// Peripheral instances: names used as `X->field` that never resolve to a real
+// variable (see derefNames above), plus names named in NVIC_EnableIRQ(X_IRQn)
+// calls. keyed by the bare instance name (e.g. "DMA1_Channel2", "USART1").
+const peripherals = new Map();
+function periph(name) {
+  if (!peripherals.has(name)) {
+    peripherals.set(name, {
+      name, readers: new Set(), writers: new Set(), armers: new Set(), isrTargets: new Set(),
+    });
+  }
+  return peripherals.get(name);
+}
+
 for (const f of fileRecords) {
   for (const v of f.vars.defs) {
     const key = v.isStatic ? `${v.name}@${f.basename}` : v.name;
@@ -628,6 +664,8 @@ for (const f of fileRecords) {
       extCalls: new Set(),   // bare names
       callers: new Set(),    // funcKeys, filled below
       access: new Map(),     // varKey -> 'r' | 'w' | 'rw'
+      periphAccess: new Map(), // peripheral name -> 'r' | 'w' | 'rw'
+      arms: new Set(),         // peripheral names this function directly NVIC_EnableIRQ's
     };
     funcs.set(key, rec);
   }
@@ -691,8 +729,28 @@ for (const f of fileRecords) {
         rec.access.set(key, prev && prev !== m ? 'rw' : (m || 'r'));
         if (mode.r) v.readers.add(rec.key);
         if (mode.w) v.writers.add(rec.key);
+        continue;
       }
-      // anything else: macro / enum constant / register alias -> ignore
+      if (fn.derefNames.has(name)) {
+        // never resolved to a real var/func/extern, but seen as `name->field`:
+        // a peripheral register block from a vendor header we didn't parse
+        const p = periph(name);
+        const m = (mode.r ? 'r' : '') + (mode.w ? 'w' : '');
+        const prev = rec.periphAccess.get(name);
+        rec.periphAccess.set(name, prev && prev !== m ? 'rw' : (m || 'r'));
+        if (mode.r) p.readers.add(rec.key);
+        if (mode.w) p.writers.add(rec.key);
+        continue;
+      }
+      // anything else: macro / enum constant -> ignore
+    }
+
+    for (const irqRaw of fn.armCalls) {
+      const name = irqRaw.replace(/_IRQn$/, '');
+      if (!name) continue;
+      const p = periph(name);
+      p.armers.add(rec.key);
+      rec.arms.add(name);
     }
   }
 }
@@ -704,6 +762,61 @@ for (const fn of funcs.values()) {
   }
 }
 
+// A peripheral's name matches the IRQ-handler naming convention when the
+// handler's base name (with the _IRQHandler/_Handler/_ISR suffix and ISR_
+// prefix stripped) contains the peripheral name as a whole underscore-
+// delimited segment or run — this also covers shared vectors that name
+// several peripherals at once (e.g. TIM1_UP_TIM10_IRQHandler matches both
+// TIM1 and TIM10). A peripheral node is never created from this match alone —
+// only real register access or an NVIC_EnableIRQ call brings one into being
+// (see `periph()` above) — this step only adds the trigger edge to it.
+function isrBaseName(name) {
+  return name.replace(/^ISR_/, '').replace(/(_IRQHandler|_Handler|_ISR)$/, '');
+}
+for (const fn of funcs.values()) {
+  if (!fn.isISR) continue;
+  const base = isrBaseName(fn.name);
+  if (!base) continue;
+  for (const p of peripherals.values()) {
+    if (base === p.name || base.startsWith(p.name + '_') || base.endsWith('_' + p.name)
+        || base.includes('_' + p.name + '_')) {
+      p.isrTargets.add(fn.key);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Importance of globals: how many distinct functions use the variable, with a
+// bonus for crossing file boundaries (a var shared by 3 files carries more
+// architecture than one passed between 3 neighbors) and for volatile (ISR
+// channels matter even with few users). Used to size/tint nodes in overview
+// diagrams: top ~20% render bold, single-user vars render small and dim.
+// ---------------------------------------------------------------------------
+
+for (const v of varDefs.values()) {
+  const users = new Set([...v.readers, ...v.writers]);
+  const files = new Set([...users].map(k => funcs.get(k)?.file).filter(Boolean));
+  v.users = users.size;
+  v.score = users.size + Math.max(0, files.size - 1) + (v.isVolatile ? 2 : 0);
+}
+const varScores = [...varDefs.values()].filter(v => !v.isExternal)
+  .map(v => v.score).sort((a, b) => a - b);
+const hotCut = varScores.length
+  ? Math.max(4, varScores[Math.min(varScores.length - 1, Math.floor(varScores.length * 0.8))])
+  : Infinity;
+
+function varTier(v) {
+  if (v.isExternal) return 'normal';
+  if (v.score >= hotCut && v.users >= 3) return 'hot';
+  // volatile still dims when it's genuinely single-use (e.g. a flag only
+  // ever touched inside one ISR) — being volatile shifts the score (+2
+  // bonus above) but must not by itself exempt a var from looking minor,
+  // or every volatile var ends up rendered identically important
+  if (v.users <= 1) return 'minor';
+  return 'normal';
+}
+const TIER_LABELS = { hot: 'часто используемые', normal: 'переменные файла', minor: 'редко используемые' };
+
 // ---------------------------------------------------------------------------
 // Mermaid emission
 // ---------------------------------------------------------------------------
@@ -712,6 +825,7 @@ const sanitize = s => s.replace(/[^A-Za-z0-9_]/g, '_');
 const fnId = key => 'f_' + sanitize(key);
 const varId = key => 'v_' + sanitize(key);
 const extId = name => 'x_' + sanitize(name);
+const periphId = name => 'p_' + sanitize(name);
 const esc = s => String(s).replace(/"/g, "'");
 
 const CLASSDEFS = [
@@ -719,8 +833,14 @@ const CLASSDEFS = [
   'classDef entry fill:#dcfce7,stroke:#16a34a,color:#14532d',
   'classDef isr fill:#fee2e2,stroke:#dc2626,color:#7f1d1d',
   'classDef gvar fill:#fef9c3,stroke:#ca8a04,color:#713f12',
+  'classDef gvarhot fill:#fde047,stroke:#a16207,stroke-width:2.5px,color:#713f12',
+  'classDef gvarminor fill:#fefce8,stroke:#ddd6a3,color:#8a7a2f',
   'classDef gvolatile fill:#fef3c7,stroke:#dc2626,stroke-width:2.5px,color:#713f12',
+  'classDef gvolatilehot fill:#fecaca,stroke:#991b1b,stroke-width:3.5px,color:#7f1d1d',
+  'classDef gvolatileminor fill:#fef8f6,stroke:#e5b4ae,color:#9a6a63',
   'classDef ghost fill:#f4f4f5,stroke:#a1a1aa,color:#52525b,stroke-dasharray:5 4',
+  'classDef periph fill:#e0e7ff,stroke:#4338ca,color:#312e81',
+  'classDef periphhot fill:#c7d2fe,stroke:#3730a3,stroke-width:2.5px,color:#1e1b4b',
   'classDef focus stroke-width:3.5px',
   'classDef cfgstmt fill:#f8fafc,stroke:#94a3b8,color:#0f172a',
   'classDef cfgcall fill:#dbeafe,stroke:#2563eb,color:#1e3a5f',
@@ -752,15 +872,27 @@ function fnNodeLine(fn, { ghost = false, focus = false, withFile = false } = {})
   return `${fnId(fn.key)}["${label}"]:::${cls}${focus ? `\nclass ${fnId(fn.key)} focus` : ''}`;
 }
 
-function varNodeLine(v, { ghost = false, withFile = false, withType = false } = {}) {
+function varNodeLine(v, { ghost = false, withFile = false, withType = false, tiered = false } = {}) {
   const kind = v.isExternal ? 'ext var' : v.isVolatile ? 'volatile' : 'var';
   const sub = [];
   if (withType && v.typeText) sub.push(esc(v.typeText));
   if (v.isStatic) sub.push('static');
   if ((withFile || ghost) && v.file) sub.push(esc(v.file));
-  let label = `${cap(kind)}<b>${esc(v.name)}</b>`;
+  let cls = ghost || v.isExternal ? 'ghost' : varClass(v);
+  let nameCls = '';
+  if (tiered && !ghost && !v.isExternal) {
+    const tier = varTier(v);
+    if (tier === 'hot') {
+      cls = v.isVolatile ? 'gvolatilehot' : 'gvarhot';
+      nameCls = " class='vhot'";
+    } else if (tier === 'minor') {
+      // still tinted red for volatile (recognizable as an ISR channel) but
+      // faded like any other single-user var, not the full saturated style
+      cls = v.isVolatile ? 'gvolatileminor' : 'gvarminor';
+    }
+  }
+  let label = `${cap(kind)}<b${nameCls}>${esc(v.name)}</b>`;
   if (sub.length) label += `<br><small>${sub.join(' · ')}</small>`;
-  const cls = ghost || v.isExternal ? 'ghost' : varClass(v);
   return `${varId(v.key)}[("${label}")]:::${cls}`;
 }
 
@@ -768,15 +900,55 @@ function extNodeLine(name) {
   return `${extId(name)}["${cap('ext')}<b>${esc(name)}</b>"]:::ghost`;
 }
 
+// peripheral instance node (register block reached via `X->field`, never
+// itself defined in the scanned sources — see derefNames/periph() above).
+// Rendered as a hexagon to read as "hardware", not data. "hot" = it both
+// receives register writes from some entry point AND fires an ISR whose name
+// matches it — the two-way signature of an interrupt-driven feedback loop.
+function periphNodeLine(p) {
+  const hot = p.isrTargets.size > 0 && (p.readers.size + p.writers.size) > 0;
+  const label = `${cap('периферия')}<b>${esc(p.name)}</b>`;
+  return `${periphId(p.name)}{{"${label}"}}:::${hot ? 'periphhot' : 'periph'}`;
+}
+
+// base primitive: both sides are already-final id strings, no wrapping
+function accessEdgeRawBoth(fnSide, varSide, mode) {
+  if (mode === 'w') return [`${fnSide} --> ${varSide}`];
+  if (mode === 'rw') return [`${fnSide} <--> ${varSide}`];
+  return [`${varSide} --> ${fnSide}`];
+}
 function accessEdges(fnKey, varKey, mode) {
-  const f = fnId(fnKey), v = varId(varKey);
-  if (mode === 'w') return [`${f} --> ${v}`];
-  if (mode === 'rw') return [`${f} <--> ${v}`];
-  return [`${v} --> ${f}`];
+  return accessEdgeRawBoth(fnId(fnKey), varId(varKey), mode);
+}
+// like accessEdges, but the var side is a literal node id (for edges pointing
+// at a collapsed group placeholder instead of a real var node)
+function accessEdgeRaw(fnKey, targetId, mode) {
+  return accessEdgeRawBoth(fnId(fnKey), targetId, mode);
+}
+
+// like accessEdgeRawBoth, but dashes the link when `direct` is false — used
+// on level 0, where an entry point's access can be direct (in its own body)
+// or only somewhere down its call tree
+function accessEdgeRawBothStyled(fnSide, otherSide, mode, direct) {
+  if (mode === 'w') return [`${fnSide} ${direct ? '-->' : '-.->'} ${otherSide}`];
+  if (mode === 'rw') return [`${fnSide} ${direct ? '<-->' : '<-.->'} ${otherSide}`];
+  return [`${otherSide} ${direct ? '-->' : '-.->'} ${fnSide}`];
+}
+function accessEdgeStyled(fnKey, varKey, mode, direct) {
+  return accessEdgeRawBothStyled(fnId(fnKey), varId(varKey), mode, direct);
+}
+function periphAccessEdgeStyled(fnKey, periphName, mode, direct) {
+  return accessEdgeRawBothStyled(fnId(fnKey), periphId(periphName), mode, direct);
 }
 
 const callEdge = (fromKey, toKey) => `${fnId(fromKey)} -.-> ${fnId(toKey)}`;
 const extCallEdge = (fromKey, name) => `${fnId(fromKey)} -.-> ${extId(name)}`;
+// code explicitly arms the interrupt line (NVIC_EnableIRQ) — a one-time setup
+// action, not a data flow, so it always renders dotted regardless of depth
+const armEdge = (fnKey, periphName) => `${fnId(fnKey)} -.->|"взводит"| ${periphId(periphName)}`;
+// the peripheral's hardware event vector calls the handler — thick, to read
+// as a different kind of arrow than any data or setup edge
+const triggerEdge = (periphName, fnKey) => `${periphId(periphName)} ==>|"прерывание"| ${fnId(fnKey)}`;
 
 function mermaidFlow(lines, direction = 'LR') {
   return ['flowchart ' + direction, ...CLASSDEFS.map(l => '  ' + l), ...lines.map(l => '  ' + l)].join('\n');
@@ -789,10 +961,10 @@ function overviewVars() {
   );
 }
 
-function buildOverviewDiagram(rel) {
+function buildOverviewDiagram() {
   const vars = overviewVars();
   const nodeCount = funcs.size + vars.length;
-  if (nodeCount > 130) return buildAggregateDiagram(rel);
+  if (nodeCount > 130) return buildAggregateDiagram();
 
   const lines = [];
   const shownVars = new Set(vars.map(v => v.key));
@@ -804,7 +976,7 @@ function buildOverviewDiagram(rel) {
     if (fnsHere.length === 0 && varsHere.length === 0) continue;
     if (multiFile) lines.push(`subgraph sg_${sanitize(f.basename)}["${esc(f.basename)}"]`);
     for (const fn of fnsHere) lines.push((multiFile ? '  ' : '') + fnNodeLine(fn));
-    for (const v of varsHere) lines.push((multiFile ? '  ' : '') + varNodeLine(v));
+    for (const v of varsHere) lines.push((multiFile ? '  ' : '') + varNodeLine(v, { tiered: true }));
     if (multiFile) lines.push('end');
   }
   for (const v of vars.filter(v => v.isExternal)) lines.push(varNodeLine(v));
@@ -815,13 +987,10 @@ function buildOverviewDiagram(rel) {
       if (shownVars.has(varKey)) lines.push(...accessEdges(fn.key, varKey, mode));
     }
   }
-  for (const fn of funcs.values()) {
-    lines.push(`click ${fnId(fn.key)} "${rel}functions/${pageName(fn.key)}.html"`);
-  }
   return mermaidFlow(lines, 'LR');
 }
 
-function buildAggregateDiagram(rel) {
+function buildAggregateDiagram() {
   // Too many nodes: collapse to file level
   const lines = [];
   const fileOf = new Map();
@@ -845,7 +1014,6 @@ function buildAggregateDiagram(rel) {
   for (const f of fileRecords) {
     if (f.funcs.length === 0 && f.vars.defs.length === 0) continue;
     lines.push(`file_${sanitize(f.basename)}["${cap('file')}<b>${esc(f.basename)}</b><br><small>функций: ${f.funcs.length} · глобалов: ${f.vars.defs.length}</small>"]:::fn`);
-    lines.push(`click file_${sanitize(f.basename)} "${rel}files/${sanitize(f.basename)}.html"`);
   }
   for (const [k, n] of callAgg) {
     const [a, b] = k.split('|');
@@ -875,17 +1043,23 @@ function buildIncludeDiagram() {
   return mermaidFlow(lines, 'LR');
 }
 
-function buildFileDiagram(f, rel) {
-  const lines = [];
+// Large files (many own functions/globals, or many cross-file neighbors) can
+// blow past what ELK's layout can lay out in a readable time. Instead of
+// dropping information, the excess is folded into small grey placeholder
+// nodes — one per neighboring file (so "everything from uart.c" is one box,
+// "everything from tim.c" is another), plus one per own-variable importance
+// tier if even the file's own functions+globals are too many. Each box
+// expands in place on click (viewer.js recomposes the mermaid source with
+// that group's real nodes swapped in) — nothing is ever silently omitted,
+// it's just collapsed until asked for.
+const FILE_DIAGRAM_FULL_MAX = 150;   // own + neighbors fits: show it all directly
+const FILE_DIAGRAM_OWN_MAX = 150;    // own funcs+vars alone fits: only group neighbors
+
+function buildFileDiagram(f) {
   const fnsHere = [...funcs.values()].filter(fn => fn.file === f.basename);
   const fnKeysHere = new Set(fnsHere.map(fn => fn.key));
   const varsHere = [...varDefs.values()].filter(v => v.file === f.basename);
   const varKeysHere = new Set(varsHere.map(v => v.key));
-
-  lines.push(`subgraph sg_this["${esc(f.basename)}"]`);
-  for (const fn of fnsHere) lines.push('  ' + fnNodeLine(fn));
-  for (const v of varsHere) lines.push('  ' + varNodeLine(v, { withType: true }));
-  lines.push('end');
 
   // ghosts: everything one step outside this file
   const ghostFns = new Map();
@@ -908,45 +1082,161 @@ function buildFileDiagram(f, rel) {
       if (!fnKeysHere.has(u) && funcs.has(u)) ghostFns.set(u, funcs.get(u));
     }
   }
-  for (const g of ghostFns.values()) lines.push(fnNodeLine(g, { ghost: true, withFile: true }));
-  for (const g of ghostVars.values()) lines.push(varNodeLine(g, { ghost: true, withFile: true }));
-  for (const ec of extCalls) lines.push(extNodeLine(ec));
+
+  const ownCount = fnsHere.length + varsHere.length;
+  const fullCount = ownCount + ghostFns.size + ghostVars.size + extCalls.size;
+
+  if (fullCount <= FILE_DIAGRAM_FULL_MAX) {
+    // small enough: the old flat rendering, no grouping needed at all
+    const lines = [];
+    lines.push(`subgraph sg_this["${esc(f.basename)}"]`);
+    for (const fn of fnsHere) lines.push('  ' + fnNodeLine(fn));
+    for (const v of varsHere) lines.push('  ' + varNodeLine(v, { withType: true }));
+    lines.push('end');
+    for (const g of ghostFns.values()) lines.push(fnNodeLine(g, { ghost: true, withFile: true }));
+    for (const g of ghostVars.values()) lines.push(varNodeLine(g, { ghost: true, withFile: true }));
+    for (const ec of extCalls) lines.push(extNodeLine(ec));
+    const shownFns = new Set([...fnKeysHere, ...ghostFns.keys()]);
+    const shownVars = new Set([...varKeysHere, ...ghostVars.keys()]);
+    const edgeSeen = new Set();
+    const pushEdge = e => { if (!edgeSeen.has(e)) { edgeSeen.add(e); lines.push(e); } };
+    for (const fnKey of shownFns) {
+      const fn = funcs.get(fnKey);
+      for (const calleeKey of fn.calls) {
+        if (shownFns.has(calleeKey) && (fnKeysHere.has(fnKey) || fnKeysHere.has(calleeKey))) {
+          pushEdge(callEdge(fnKey, calleeKey));
+        }
+      }
+      if (fnKeysHere.has(fnKey)) {
+        for (const ec of fn.extCalls) pushEdge(extCallEdge(fnKey, ec));
+      }
+      for (const [varKey, mode] of fn.access) {
+        if (shownVars.has(varKey) && (fnKeysHere.has(fnKey) || varKeysHere.has(varKey))) {
+          accessEdges(fnKey, varKey, mode).forEach(pushEdge);
+        }
+      }
+    }
+    return { code: mermaidFlow(lines, 'LR'), groups: null };
+  }
+
+  if (fnsHere.length > FILE_DIAGRAM_OWN_MAX * 2) {
+    return null; // pathological: even the file's own functions alone are unreadable
+  }
+
+  // --- grouped rendering ---
+  const collapseVars = ownCount > FILE_DIAGRAM_OWN_MAX; // own alone too big: fold own vars into tier groups too
+
+  const baseLines = [];
+  baseLines.push(`subgraph sg_this["${esc(f.basename)}"]`);
+  for (const fn of fnsHere) baseLines.push('  ' + fnNodeLine(fn));
+  if (!collapseVars) for (const v of varsHere) baseLines.push('  ' + varNodeLine(v, { withType: true }));
+  baseLines.push('end');
+
+  // groupKey -> { label, fnMembers: Map, varMembers: Map, collapsed: Set<string>, expanded: Set<string> }
+  const groups = new Map();
+  const group = (key, label) => {
+    if (!groups.has(key)) groups.set(key, { label, fnMembers: new Map(), varMembers: new Map(), collapsed: new Set(), expanded: new Set() });
+    return groups.get(key);
+  };
 
   const shownFns = new Set([...fnKeysHere, ...ghostFns.keys()]);
-  const shownVars = new Set([...varKeysHere, ...ghostVars.keys()]);
-  const edgeSeen = new Set();
-  const pushEdge = e => { if (!edgeSeen.has(e)) { edgeSeen.add(e); lines.push(e); } };
-
   for (const fnKey of shownFns) {
     const fn = funcs.get(fnKey);
+    const isOwn = fnKeysHere.has(fnKey);
     for (const calleeKey of fn.calls) {
-      if (shownFns.has(calleeKey) && (fnKeysHere.has(fnKey) || fnKeysHere.has(calleeKey))) {
-        pushEdge(callEdge(fnKey, calleeKey));
+      const calleeIsHere = fnKeysHere.has(calleeKey);
+      if (isOwn === calleeIsHere) continue; // both own (already in baseLines) or both foreign (never shown)
+      if (isOwn) {
+        const g = ghostFns.get(calleeKey);
+        if (!g) continue;
+        const gr = group(g.file || '__unknown__', g.file || 'без файла');
+        gr.fnMembers.set(calleeKey, g);
+        gr.collapsed.add(`${fnId(fnKey)} -.-> GID`);
+        gr.expanded.add(callEdge(fnKey, calleeKey));
+      } else {
+        const g = ghostFns.get(fnKey);
+        if (!g) continue;
+        const gr = group(g.file || '__unknown__', g.file || 'без файла');
+        gr.fnMembers.set(fnKey, g);
+        gr.collapsed.add(`GID -.-> ${fnId(calleeKey)}`);
+        gr.expanded.add(callEdge(fnKey, calleeKey));
       }
     }
-    if (fnKeysHere.has(fnKey)) {
-      for (const ec of fn.extCalls) pushEdge(extCallEdge(fnKey, ec));
+    if (isOwn) {
+      for (const ec of fn.extCalls) {
+        const gr = group('__lib__', 'библиотеки / макросы');
+        gr.fnMembers.set('ext:' + ec, { __ext: ec });
+        gr.collapsed.add(`${fnId(fnKey)} -.-> GID`);
+        gr.expanded.add(extCallEdge(fnKey, ec));
+      }
     }
     for (const [varKey, mode] of fn.access) {
-      if (shownVars.has(varKey) && (fnKeysHere.has(fnKey) || varKeysHere.has(varKey))) {
-        accessEdges(fnKey, varKey, mode).forEach(pushEdge);
+      const varIsOwn = varKeysHere.has(varKey);
+      if (isOwn && varIsOwn && !collapseVars) continue; // own fn <-> own var, both shown directly
+
+      if (varIsOwn) {
+        // own var, own file's own vars are only ever grouped when collapseVars
+        if (!collapseVars) {
+          // ghost fn <-> our own var (own var shown directly, group the ghost side)
+          const g = ghostFns.get(fnKey);
+          if (!g) continue;
+          const gr = group(g.file || '__unknown__', g.file || 'без файла');
+          gr.fnMembers.set(fnKey, g);
+          gr.collapsed.add(accessEdgeRawBoth('GID', varId(varKey), mode)[0]);
+          accessEdges(fnKey, varKey, mode).forEach(e => gr.expanded.add(e));
+        } else if (isOwn) {
+          const v = varDefs.get(varKey);
+          const gr = group('tier:' + varTier(v), TIER_LABELS[varTier(v)]);
+          gr.varMembers.set(varKey, v);
+          gr.collapsed.add(accessEdgeRaw(fnKey, 'GID', mode)[0]);
+          accessEdges(fnKey, varKey, mode).forEach(e => gr.expanded.add(e));
+        }
+        // else: ghost fn <-> own var, and the own var is ALSO folded into a
+        // tier group — a group-to-group edge; skipped (rare double-collapse,
+        // not worth the extra bookkeeping of two placeholder ids at once)
+      } else {
+        const v = varDefs.get(varKey);
+        if (!v) continue;
+        const key = v.file || (v.isExternal ? '__extern__' : '__unknown__');
+        const label = v.file || (v.isExternal ? 'внешние объявления (extern)' : 'без файла');
+        const gr = group(key, label);
+        gr.varMembers.set(varKey, v);
+        gr.collapsed.add(accessEdgeRaw(fnKey, 'GID', mode)[0]);
+        accessEdges(fnKey, varKey, mode).forEach(e => gr.expanded.add(e));
       }
     }
   }
 
-  for (const fnKey of shownFns) {
-    lines.push(`click ${fnId(fnKey)} "${rel}functions/${pageName(fnKey)}.html"`);
+  const groupList = [];
+  let gi = 0;
+  for (const [, gr] of groups) {
+    const id = `grp_${sanitize(f.basename)}_${gi++}`;
+    const count = gr.fnMembers.size + gr.varMembers.size;
+    if (!count) continue;
+    const realLines = [];
+    for (const [k, g] of gr.fnMembers) realLines.push(g.__ext ? extNodeLine(g.__ext) : fnNodeLine(g, { ghost: true, withFile: true }));
+    for (const v of gr.varMembers.values()) realLines.push(varNodeLine(v, { ghost: v.file !== f.basename, withFile: true, withType: true, tiered: v.file === f.basename }));
+    const phLine = `${id}["${cap('группа')}<b>${esc(gr.label)}</b><br><small>${count} узлов — клик, чтобы показать</small>"]:::ghost`;
+    groupList.push({
+      id, label: gr.label, count,
+      phLine,
+      realLines,
+      collapsedEdges: [...gr.collapsed].map(e => e.replace(/GID/g, id)),
+      expandedEdges: [...gr.expanded],
+    });
   }
-  for (const g of ghostVars.values()) {
-    if (g.file) lines.push(`click ${varId(g.key)} "${rel}files/${sanitize(g.file)}.html"`);
-  }
-  return mermaidFlow(lines, 'LR');
+
+  return { code: null, groups: groupList, baseLines, classDefs: CLASSDEFS };
 }
 
 // Flowchart of the function's own control flow (branches, loops, calls in order)
-function buildCfgDiagram(fn, rel) {
+// Returns { code, links } — links maps CFG node id -> root-relative href for
+// double-click navigation (ids like "c3" are only unique within this one
+// diagram, so they travel with the page as window.CFG_LINKS, not graph-data.js).
+function buildCfgDiagram(fn) {
   if (!fn.cfg) return null;
   const lines = [];
+  const links = {};
   for (const n of fn.cfg.nodes) {
     const label = n.label.split('\n').map(escLabel).join('<br>');
     switch (n.kind) {
@@ -963,7 +1253,7 @@ function buildCfgDiagram(fn, rel) {
       const cands = functionsByName.get(cname);
       if (cands && cands.length) {
         const target = cands.find(c => c.basename === fn.file) || cands[0];
-        lines.push(`click ${n.id} "${rel}functions/${pageName(funcKey(cname, target.basename))}.html"`);
+        links[n.id] = `functions/${pageName(funcKey(cname, target.basename))}.html`;
         break;
       }
     }
@@ -971,18 +1261,26 @@ function buildCfgDiagram(fn, rel) {
   for (const e of fn.cfg.edges) {
     lines.push(e.label ? `${e.from} -->|"${escLabel(e.label)}"| ${e.to}` : `${e.from} --> ${e.to}`);
   }
-  return mermaidFlow(lines, 'TB');
+  return { code: mermaidFlow(lines, 'TB'), links };
 }
 
-// Level 0: entry points (main + ISRs) and the globals they exchange data
-// through — directly (solid) or somewhere inside their call trees (dashed)
-function buildLevel0Diagram(rel) {
+// Level 0: entry points (main + ISRs), the peripherals they arm/drive, the
+// hardware trigger back into ISRs, and the globals they exchange data through
+// — directly (solid) or somewhere inside their call trees (dashed). Variables
+// sharing the exact same set of writer/reader entry points are bundled into
+// one collapsible "data channel" node instead of one node each, so a dozen
+// buffers that all flow main -> DMA1_Channel2_IRQHandler read as a single
+// thick edge instead of a dozen parallel ones.
+function buildLevel0Diagram() {
   const entries = [...funcs.values()].filter(f => f.isEntry || f.isISR);
   if (entries.length === 0) return null;
 
-  const info = new Map(); // entryKey -> Map(varKey -> {r, w, direct})
+  const varInfo = new Map();    // entryKey -> Map(varKey -> {r, w, direct})
+  const periphInfo = new Map(); // entryKey -> Map(periphName -> {r, w, direct})
+  const armInfo = new Map();    // entryKey -> Set(periphName) directly or via call tree
+
   for (const e of entries) {
-    const acc = new Map();
+    const vAcc = new Map(), pAcc = new Map(), aAcc = new Set();
     const seen = new Set([e.key]);
     const queue = [e.key];
     while (queue.length) {
@@ -991,51 +1289,162 @@ function buildLevel0Diagram(rel) {
       if (!f) continue;
       const direct = k === e.key;
       for (const [vk, m] of f.access) {
-        const cur = acc.get(vk) || { r: false, w: false, direct: false };
+        const cur = vAcc.get(vk) || { r: false, w: false, direct: false };
         if (m.includes('r')) cur.r = true;
         if (m.includes('w')) cur.w = true;
         if (direct) cur.direct = true;
-        acc.set(vk, cur);
+        vAcc.set(vk, cur);
       }
+      for (const [pk, m] of f.periphAccess) {
+        const cur = pAcc.get(pk) || { r: false, w: false, direct: false };
+        if (m.includes('r')) cur.r = true;
+        if (m.includes('w')) cur.w = true;
+        if (direct) cur.direct = true;
+        pAcc.set(pk, cur);
+      }
+      for (const pk of f.arms) aAcc.add(pk);
       for (const c of f.calls) if (!seen.has(c)) { seen.add(c); queue.push(c); }
     }
-    info.set(e.key, acc);
+    varInfo.set(e.key, vAcc);
+    periphInfo.set(e.key, pAcc);
+    armInfo.set(e.key, aAcc);
   }
 
-  // show vars that connect >=2 entries, plus volatile ones (ISR channels)
-  const touchCount = new Map();
-  for (const acc of info.values()) {
-    for (const vk of acc.keys()) touchCount.set(vk, (touchCount.get(vk) || 0) + 1);
+  // --- variables: level 0 is about *exchange* between entry points, so show
+  // a var only when one entry tree writes it and a different one reads it.
+  // Vars local to a single call tree stay on their file/function pages.
+  const allVarKeys = new Set();
+  for (const acc of varInfo.values()) for (const vk of acc.keys()) allVarKeys.add(vk);
+  const showVars = [...allVarKeys].filter(vk => {
+    if (!varDefs.has(vk)) return false;
+    const accs = entries.filter(e => varInfo.get(e.key).has(vk));
+    return accs.some(e1 => varInfo.get(e1.key).get(vk).w &&
+      accs.some(e2 => e2 !== e1 && varInfo.get(e2.key).get(vk).r));
+  });
+
+  // group vars that share the exact same writers+readers into one bundle —
+  // that signature is exactly what determines the edges a var would draw, so
+  // bundling by it never merges two vars that "look similar" but differ
+  const bundleMap = new Map(); // sigKey -> { writers:[entryKey], readers:[entryKey], vars:[varKey] }
+  for (const vk of showVars) {
+    const writers = [], readers = [];
+    for (const e of entries) {
+      const a = varInfo.get(e.key).get(vk);
+      if (!a) continue;
+      if (a.w) writers.push(e.key);
+      if (a.r) readers.push(e.key);
+    }
+    writers.sort(); readers.sort();
+    const sig = writers.join(',') + '=>' + readers.join(',');
+    if (!bundleMap.has(sig)) bundleMap.set(sig, { writers, readers, vars: [] });
+    bundleMap.get(sig).vars.push(vk);
   }
-  const show = new Set();
-  for (const [vk, n] of touchCount) {
-    const v = varDefs.get(vk);
-    if (v && (n >= 2 || v.isVolatile)) show.add(vk);
+  let bundles = [...bundleMap.values()];
+
+  const LEVEL0_MAX_UNITS = 50;
+  let varCapNote = '';
+  if (bundles.length > LEVEL0_MAX_UNITS) {
+    const total = bundles.length;
+    const bundleScore = b => b.vars.reduce((s, vk) => s + (varDefs.get(vk)?.score || 0), 0);
+    bundles.sort((a, b) => bundleScore(b) - bundleScore(a));
+    bundles = bundles.slice(0, LEVEL0_MAX_UNITS);
+    varCapNote = `показаны ${LEVEL0_MAX_UNITS} самых используемых каналов данных из ${total}`;
   }
 
-  const lines = [];
-  for (const e of entries) lines.push(fnNodeLine(e));
-  for (const vk of show) lines.push(varNodeLine(varDefs.get(vk), { withType: true, withFile: true }));
-
-  let edgeIdx = 0;
-  const dashedIdx = [];
+  // --- peripherals: show everything any entry's call tree drives, arms, or
+  // that fires into an entry by name match
+  const usedPeriphs = new Set();
   for (const e of entries) {
-    for (const [vk, a] of info.get(e.key)) {
-      if (!show.has(vk)) continue;
+    for (const pk of periphInfo.get(e.key).keys()) usedPeriphs.add(pk);
+    for (const pk of armInfo.get(e.key)) usedPeriphs.add(pk);
+  }
+  for (const p of peripherals.values()) if (p.isrTargets.size) usedPeriphs.add(p.name);
+
+  const LEVEL0_MAX_PERIPHS = 40;
+  let periphList = [...usedPeriphs].map(n => peripherals.get(n)).filter(Boolean);
+  let periphCapNote = '';
+  if (periphList.length > LEVEL0_MAX_PERIPHS) {
+    const total = periphList.length;
+    const periphScore = p => p.readers.size + p.writers.size + p.armers.size + p.isrTargets.size;
+    periphList.sort((a, b) => periphScore(b) - periphScore(a));
+    periphList = periphList.slice(0, LEVEL0_MAX_PERIPHS);
+    periphCapNote = `показаны ${LEVEL0_MAX_PERIPHS} самых задействованных узлов периферии из ${total}`;
+  }
+
+  // --- assemble ---
+  const baseLines = [];
+  for (const e of entries) baseLines.push(fnNodeLine(e));
+  for (const p of periphList) baseLines.push(periphNodeLine(p));
+
+  const singletons = bundles.filter(b => b.vars.length === 1);
+  const multi = bundles.filter(b => b.vars.length >= 2);
+  for (const b of singletons) {
+    baseLines.push(varNodeLine(varDefs.get(b.vars[0]), { withType: true, withFile: true, tiered: true }));
+  }
+
+  for (const e of entries) {
+    for (const b of singletons) {
+      const vk = b.vars[0];
+      const a = varInfo.get(e.key).get(vk);
+      if (!a) continue;
       const mode = a.r && a.w ? 'rw' : a.w ? 'w' : 'r';
-      for (const line of accessEdges(e.key, vk, mode)) {
-        lines.push(line);
-        if (!a.direct) dashedIdx.push(edgeIdx);
-        edgeIdx++;
-      }
+      baseLines.push(...accessEdgeStyled(e.key, vk, mode, a.direct));
+    }
+    const pAcc = periphInfo.get(e.key);
+    for (const p of periphList) {
+      const a = pAcc.get(p.name);
+      if (!a) continue;
+      const mode = a.r && a.w ? 'rw' : a.w ? 'w' : 'r';
+      baseLines.push(...periphAccessEdgeStyled(e.key, p.name, mode, a.direct));
+    }
+    const aAcc = armInfo.get(e.key);
+    for (const p of periphList) {
+      if (aAcc.has(p.name)) baseLines.push(armEdge(e.key, p.name));
     }
   }
-  if (dashedIdx.length) lines.push(`linkStyle ${dashedIdx.join(',')} stroke-dasharray:5,opacity:0.55`);
-  for (const e of entries) lines.push(`click ${fnId(e.key)} "${rel}functions/${pageName(e.key)}.html"`);
-  return mermaidFlow(lines, 'LR');
+  for (const p of periphList) {
+    for (const isrKey of p.isrTargets) {
+      if (funcs.has(isrKey)) baseLines.push(triggerEdge(p.name, isrKey));
+    }
+  }
+
+  const groups = [];
+  let gi = 0;
+  for (const b of multi) {
+    const id = `bnd_${gi++}`;
+    const realLines = b.vars.map(vk =>
+      varNodeLine(varDefs.get(vk), { withType: true, withFile: true, tiered: true }));
+    const collapsedEdges = [];
+    const expandedEdges = [];
+    const entryDir = new Map(); // entryKey -> {w, r}
+    for (const ek of b.writers) entryDir.set(ek, { ...(entryDir.get(ek) || {}), w: true });
+    for (const ek of b.readers) entryDir.set(ek, { ...(entryDir.get(ek) || {}), r: true });
+    for (const [ek, d] of entryDir) {
+      const allDirect = b.vars.every(vk => (varInfo.get(ek).get(vk) || {}).direct);
+      const mode = d.w && d.r ? 'rw' : d.w ? 'w' : 'r';
+      collapsedEdges.push(...accessEdgeRawBothStyled(fnId(ek), id, mode, allDirect));
+    }
+    for (const vk of b.vars) {
+      for (const e of entries) {
+        const a = varInfo.get(e.key).get(vk);
+        if (!a) continue;
+        const mode = a.r && a.w ? 'rw' : a.w ? 'w' : 'r';
+        expandedEdges.push(...accessEdgeStyled(e.key, vk, mode, a.direct));
+      }
+    }
+    const writerNames = b.writers.map(k => funcs.get(k)?.name || k).join(', ') || '—';
+    const readerNames = b.readers.map(k => funcs.get(k)?.name || k).join(', ') || '—';
+    const phLine = `${id}["${cap('канал данных')}<b>${esc(writerNames)} &rarr; ${esc(readerNames)}</b>` +
+      `<br><small>${b.vars.length} перем. — клик, чтобы показать</small>"]:::ghost`;
+    groups.push({ id, phLine, realLines, collapsedEdges, expandedEdges });
+  }
+
+  const note = [varCapNote, periphCapNote].filter(Boolean).join('; ');
+  if (!groups.length) return { code: mermaidFlow(baseLines, 'LR'), groups: null, note };
+  return { baseLines, classDefs: CLASSDEFS, groups, note };
 }
 
-function buildFunctionDiagram(fn, rel) {
+function buildFunctionDiagram(fn) {
   const lines = [];
   lines.push(fnNodeLine(fn, { focus: true }));
   const shown = new Set([fn.key]);
@@ -1066,9 +1475,6 @@ function buildFunctionDiagram(fn, rel) {
     lines.push(varNodeLine(v, { withFile: v.file !== fn.file, withType: true }));
     lines.push(...accessEdges(fn.key, varKey, mode));
   }
-  for (const key of shown) {
-    lines.push(`click ${fnId(key)} "${rel}functions/${pageName(key)}.html"`);
-  }
   return mermaidFlow(lines, 'LR');
 }
 
@@ -1094,7 +1500,8 @@ const CSS = `
   main { max-width: 1600px; margin: 0 auto; padding: 16px 20px 60px; }
   h1 { font-size: 1.4rem; } h2 { font-size: 1.1rem; margin-top: 2em; }
   .sig { font-family: Consolas, monospace; background: #eef2f7; padding: 6px 10px; border-radius: 6px; display: inline-block; }
-  .diagram { background: #fff; border: 1px solid #e4e4e7; border-radius: 8px; overflow: auto; position: relative; }
+  .diagram { background: #fff; border: 1px solid #e4e4e7; border-radius: 8px; overflow: auto; position: relative;
+    max-height: 78vh; user-select: none; -webkit-user-select: none; }
   .diagram .inner { transform-origin: 0 0; width: max-content; padding: 12px; }
   .zoombar { position: sticky; top: 6px; left: 6px; z-index: 5; display: inline-flex; gap: 4px; margin: 6px; }
   .zoombar button { border: 1px solid #d4d4d8; background: #fff; border-radius: 6px; width: 30px; height: 30px; cursor: pointer; font-size: 15px; }
@@ -1122,6 +1529,17 @@ const CSS = `
   svg .cap { opacity: .42; font-size: 9px; letter-spacing: .5px; margin-right: 6px;
     text-transform: uppercase; font-weight: 400; }
   svg .label small { opacity: .62; }
+  svg b.vhot { font-size: 18px; }
+  svg g.node.gvarminor, svg g.node.gvolatileminor { opacity: .55; }
+  svg.fade g.node.gvarminor, svg.fade g.node.gvolatileminor { opacity: .13; }
+  svg g.node.gvarminor .label, svg g.node.gvolatileminor .label { font-size: 11px; }
+  .diagram.panning { cursor: grabbing; }
+  .diagram.panning svg g.node { cursor: grabbing; }
+  .trailbar { font-size: 0.85rem; color: #52525b; margin: 0 0 14px; }
+  .trailbar a { color: #2563eb; text-decoration: none; }
+  .trailbar a:hover { text-decoration: underline; }
+  .trailbar .sep { margin: 0 6px; color: #a1a1aa; }
+  .trailbar .cur { color: #18181b; font-weight: 600; }
 `;
 
 const LEGEND = `
@@ -1131,10 +1549,21 @@ const LEGEND = `
   <span><b>&harr;</b> = чтение + запись</span>
   <span><b>&#8943;&gt;</b> (пунктир) = вызов, передача управления</span>
   <span><span class="chip" style="background:#f4f4f5;border-color:#a1a1aa;border-style:dashed"></span>из другого файла / внешнее</span>
-  <span class="muted">наведите курсор на элемент — подсветятся его связи и появится описание</span>
+  <span class="muted">наведите курсор — подсветятся связи; клик — закрепить подсветку; двойной клик — перейти; клик по пустому месту — снять</span>
 </div>`;
 
-function htmlPage({ title, rel, body }) {
+const LEGEND0 = `
+<div class="legend">
+  <span>точка входа <b>&rarr;</b> переменная/периферия = <b>запись</b>, обратная стрелка = <b>чтение</b>, <b>&harr;</b> = обе</span>
+  <span>сплошная связь — точка входа обращается сама, пунктир — где-то внутри вызовов</span>
+  <span><span class="chip" style="background:#e0e7ff;border-color:#4338ca"></span>&#11039; периферия (регистры вида <code>X-&gt;поле</code>)</span>
+  <span><b>&#8943;&gt;</b> «взводит» — вызов NVIC_EnableIRQ на эту периферию</span>
+  <span><b>=&gt;</b> «прерывание» — периферия вызывает обработчик по её имени</span>
+  <span>серый блок «канал данных» — несколько переменных с одинаковыми писателями/читателями, свёрнутые в один жгут; клик разворачивает</span>
+  <span class="muted">наведите курсор — подсветятся связи; клик — закрепить подсветку; двойной клик — перейти; клик по пустому месту — снять</span>
+</div>`;
+
+function htmlPage({ title, rel, path, body, cfgLinks }) {
   return `<!doctype html>
 <html lang="ru">
 <head>
@@ -1144,6 +1573,12 @@ function htmlPage({ title, rel, body }) {
 <style>${CSS}</style>
 </head>
 <body>
+<script>
+window.PAGE_REL = ${JSON.stringify(rel)};
+window.PAGE_PATH = ${JSON.stringify(path)};
+window.PAGE_TITLE = ${JSON.stringify(title)};
+${cfgLinks ? `window.CFG_LINKS = ${JSON.stringify(cfgLinks)};` : ''}
+</script>
 <nav><span class="title">code graph</span><a href="${rel}index.html">обзор</a></nav>
 <main>
 ${body}
@@ -1163,6 +1598,29 @@ function diagramBlock(code, { lazy = false } = {}) {
   <button onclick="zoom(this, 0.8)">&minus;</button>
 </div>
 <div class="inner"><pre class="${lazy ? 'mermaid-lazy' : 'mermaid'}">${escapeHtml(code)}</pre></div>
+</div>`;
+}
+
+// A file diagram with grouped placeholders: rendered fully collapsed up
+// front (fast), with the data needed to expand any one group in place
+// (viewer.js recomposes the mermaid source and re-runs mermaid on it) parked
+// in a hidden JSON blob alongside it.
+function groupedDiagramBlock(fileDiagram) {
+  const { baseLines, classDefs, groups } = fileDiagram;
+  const collapsedLines = [...baseLines, ...groups.flatMap(g => [g.phLine, ...g.collapsedEdges])];
+  const code = mermaidFlow(collapsedLines, 'LR');
+  const payload = {
+    baseLines, classDefs,
+    groups: groups.map(({ id, phLine, realLines, collapsedEdges, expandedEdges }) =>
+      ({ id, phLine, realLines, collapsedEdges, expandedEdges })),
+  };
+  return `<div class="diagram" data-groups="true">
+<div class="zoombar">
+  <button onclick="zoom(this, 1.25)">+</button>
+  <button onclick="zoom(this, 0.8)">&minus;</button>
+</div>
+<div class="inner"><pre class="mermaid">${escapeHtml(code)}</pre></div>
+<script type="application/json" class="group-data">${JSON.stringify(payload)}</script>
 </div>`;
 }
 
@@ -1202,6 +1660,7 @@ fs.copyFileSync(path.join(here, 'viewer.js'), path.join(outDir, 'app.js'));
     nodes[fnId(fn.key)] = {
       label: fn.name, kind: fn.isISR ? 'isr' : fn.isEntry ? 'entry' : 'fn',
       file: fn.file, sig: fn.signature, desc: fn.desc || undefined,
+      href: `functions/${pageName(fn.key)}.html`,
     };
     for (const ec of fn.extCalls) {
       nodes[extId(ec)] = nodes[extId(ec)] || { label: ec, kind: 'extfn' };
@@ -1213,12 +1672,23 @@ fs.copyFileSync(path.join(here, 'viewer.js'), path.join(outDir, 'app.js'));
       kind: v.isExternal ? 'extvar' : v.isVolatile ? 'gvolatile' : 'gvar',
       file: v.file || undefined, type: v.typeText || undefined,
       static: v.isStatic || undefined, volatile: v.isVolatile || undefined,
-      desc: v.desc || undefined,
+      desc: v.desc || undefined, users: v.users || undefined,
       writers: [...v.writers].map(fnName), readers: [...v.readers].map(fnName),
+      href: v.file ? `files/${sanitize(v.file)}.html` : undefined,
     };
   }
   for (const f of fileRecords) {
-    nodes[`file_${sanitize(f.basename)}`] = { label: f.basename, kind: 'file', desc: f.filePath };
+    nodes[`file_${sanitize(f.basename)}`] = {
+      label: f.basename, kind: 'file', desc: f.filePath,
+      href: `files/${sanitize(f.basename)}.html`,
+    };
+  }
+  for (const p of peripherals.values()) {
+    nodes[periphId(p.name)] = {
+      label: p.name, kind: 'periph',
+      writers: [...p.writers].map(fnName), readers: [...p.readers].map(fnName),
+      armers: [...p.armers].map(fnName), isrTargets: [...p.isrTargets].map(fnName),
+    };
   }
   fs.writeFileSync(path.join(outDir, 'graph-data.js'),
     `window.GRAPH = ${JSON.stringify({ nodes })};\n`);
@@ -1236,32 +1706,41 @@ fs.copyFileSync(path.join(here, 'viewer.js'), path.join(outDir, 'app.js'));
     `<td><a href="files/${sanitize(fn.file)}.html">${escapeHtml(fn.file)}</a></td>` +
     `<td>${fn.callers.size}</td><td>${fn.calls.size + fn.extCalls.size}</td><td>${fn.access.size}</td></tr>`).join('\n');
 
-  const varRows = [...varDefs.values()].sort((a, b) => a.name.localeCompare(b.name)).map(v => {
+  const varRows = [...varDefs.values()]
+    .sort((a, b) => (b.score - a.score) || a.name.localeCompare(b.name)).map(v => {
     const users = keys => [...keys].map(k =>
       `<a href="functions/${pageName(k)}.html">${escapeHtml(funcs.get(k)?.name || k)}</a>`).join(', ') || '<span class="muted">—</span>';
     return `<tr><td>${escapeHtml(v.name)}${v.isVolatile ? ' <b style="color:#dc2626">volatile</b>' : ''}${v.isStatic ? ' <span class="muted">static</span>' : ''}</td>` +
       `<td class="muted">${escapeHtml(v.typeText)}</td>` +
       `<td>${escapeHtml(v.desc || '')}</td>` +
       `<td>${v.file ? `<a href="files/${sanitize(v.file)}.html">${escapeHtml(v.file)}</a>` : '<span class="muted">внешняя</span>'}</td>` +
+      `<td>${v.users}</td>` +
       `<td>${users(v.writers)}</td><td>${users(v.readers)}</td></tr>`;
   }).join('\n');
 
-  const level0 = buildLevel0Diagram('');
+  const level0 = buildLevel0Diagram();
+  const level0Diagram = level0 ? (level0.groups ? groupedDiagramBlock(level0) : diagramBlock(level0.code)) : '';
   const body = `
 <h1>Обзор программы</h1>
 <p class="muted">Источник: ${roots.map(r => escapeHtml(path.resolve(r))).join(', ')} —
 файлов: ${fileRecords.length}, функций: ${funcs.size}, глобальных переменных: ${varDefs.size}</p>
 ${LEGEND}
 ${level0 ? `
-<h2>Уровень 0 — точки входа и обмен через глобальные переменные</h2>
-<p class="muted">main и обработчики прерываний. Сплошная связь — функция обращается к переменной сама,
-пунктирная — где-то внутри её вызовов. Клик по функции — спуск на уровень ниже (связи + блок-схема алгоритма).</p>
-${diagramBlock(level0)}
+<h2>Уровень 0 — точки входа, периферия и обмен данными</h2>
+<p class="muted">main и обработчики прерываний; шестиугольники — периферия (регистровые блоки вида <code>X-&gt;поле</code>),
+серые блоки — переменные с одинаковыми писателями/читателями, свёрнутые в один жгут (клик разворачивает).
+Сплошная связь — точка входа обращается сама, пунктирная — где-то внутри её вызовов;
+пунктир с подписью «взводит» — вызов NVIC_EnableIRQ; жирная стрелка «прерывание» — периферия вызывает обработчик по имени.
+Двойной клик по функции — спуск на уровень ниже (связи + блок-схема алгоритма).${level0.note ? ` Здесь ${level0.note}.` : ''}</p>
+${LEGEND0}
+${level0Diagram}
 
 <details>
 <summary>Полная карта — все функции и переменные</summary>
-${diagramBlock(buildOverviewDiagram(''), { lazy: true })}
-</details>` : diagramBlock(buildOverviewDiagram(''))}
+<p class="muted">Яркие крупные переменные — «шины» программы (много читателей/писателей, часто из разных файлов);
+бледные — используются одной функцией. Колесо мыши — масштаб, зажатая левая кнопка на пустом месте — перетаскивание.</p>
+${diagramBlock(buildOverviewDiagram(), { lazy: true })}
+</details>` : diagramBlock(buildOverviewDiagram())}
 
 <details>
 <summary>Граф include (файлы)</summary>
@@ -1274,26 +1753,37 @@ ${diagramBlock(buildIncludeDiagram(), { lazy: true })}
 <h2>Функции</h2>
 <table><tr><th>Функция</th><th>Описание</th><th>Файл</th><th>Вызывается</th><th>Вызывает</th><th>Глобалов</th></tr>${funcRows}</table>
 
-<h2>Глобальные переменные</h2>
-<table><tr><th>Переменная</th><th>Тип</th><th>Описание</th><th>Определена в</th><th>Пишут</th><th>Читают</th></tr>${varRows}</table>`;
+<h2>Глобальные переменные <span class="muted" style="font-weight:400;font-size:0.75em">— по убыванию использования</span></h2>
+<table><tr><th>Переменная</th><th>Тип</th><th>Описание</th><th>Определена в</th><th>Функций</th><th>Пишут</th><th>Читают</th></tr>${varRows}</table>`;
 
-  fs.writeFileSync(path.join(outDir, 'index.html'), htmlPage({ title: 'Код-граф — обзор', rel: '', body }));
+  fs.writeFileSync(path.join(outDir, 'index.html'),
+    htmlPage({ title: 'Код-граф — обзор', rel: '', path: 'index.html', body }));
 }
 
 // per-file pages
 for (const f of fileRecords) {
   const fnsHere = [...funcs.values()].filter(fn => fn.file === f.basename);
+  const fileDiagram = buildFileDiagram(f);
+  let diagramSection;
+  if (!fileDiagram) {
+    diagramSection = `<p class="muted">Файл слишком велик для общей схемы связей (${fnsHere.length} функций) — см. список ниже, у каждой функции есть собственная страница со схемой.</p>`;
+  } else if (fileDiagram.groups) {
+    diagramSection = `<p class="muted">Файл слишком велик, чтобы показать всё сразу — связи с ${fileDiagram.groups.length} внешними группами и/или переменными файла свёрнуты в серые блоки; клик по блоку разворачивает его на месте, ничего не убрано насовсем.</p>
+${groupedDiagramBlock(fileDiagram)}`;
+  } else {
+    diagramSection = diagramBlock(fileDiagram.code);
+  }
   const body = `
 <h1>${escapeHtml(f.basename)}</h1>
 <p class="muted">${escapeHtml(f.filePath)}</p>
 ${LEGEND}
-${diagramBlock(buildFileDiagram(f, '../'))}
+${diagramSection}
 <h2>Функции этого файла</h2>
 ${fnsHere.length ? '<ul>' + fnsHere.map(fn =>
     `<li><a href="../functions/${pageName(fn.key)}.html">${escapeHtml(fn.name)}</a> <span class="sig">${escapeHtml(fn.signature)}</span>${fn.desc ? ` — ${escapeHtml(fn.desc)}` : ''}</li>`).join('\n') + '</ul>'
     : '<p class="muted">нет</p>'}`;
   fs.writeFileSync(path.join(filesDir, `${sanitize(f.basename)}.html`),
-    htmlPage({ title: f.basename, rel: '../', body }));
+    htmlPage({ title: f.basename, rel: '../', path: `files/${sanitize(f.basename)}.html`, body }));
 }
 
 // per-function pages
@@ -1303,20 +1793,20 @@ for (const fn of funcs.values()) {
     const modeText = { r: 'читает', w: 'пишет', rw: 'читает + пишет' }[mode];
     return `<li><b>${escapeHtml(v.name)}</b> — ${modeText}${v.isVolatile ? ' <b style="color:#dc2626">volatile</b>' : ''}${v.file ? ` <span class="muted">(${escapeHtml(v.file)})</span>` : ' <span class="muted">(внешняя)</span>'}${v.desc ? ` — ${escapeHtml(v.desc)}` : ''}</li>`;
   }).join('\n');
-  const cfgCode = buildCfgDiagram(fn, '../');
+  const cfg = buildCfgDiagram(fn);
   const body = `
 <h1>${escapeHtml(fn.name)}${fn.isISR ? ' <span style="color:#dc2626;font-size:0.8em">обработчик прерывания</span>' : ''}</h1>
 <p><span class="sig">${escapeHtml(fn.signature)}</span> &nbsp; в файле <a href="../files/${sanitize(fn.file)}.html">${escapeHtml(fn.file)}</a></p>
 ${fn.desc ? `<p>${escapeHtml(fn.desc)}</p>` : ''}
 ${LEGEND}
-${cfgCode ? `<h2>Алгоритм</h2>
-<p class="muted">Порядок выполнения: ромбы — условия и циклы, синие блоки — вызовы (кликабельны), «да/нет» — ветви.</p>
-${diagramBlock(cfgCode)}` : ''}
+${cfg ? `<h2>Алгоритм</h2>
+<p class="muted">Порядок выполнения: ромбы — условия и циклы, синие блоки — вызовы (двойной клик — перейти), «да/нет» — ветви.</p>
+${diagramBlock(cfg.code)}` : ''}
 <h2>Связи</h2>
-${diagramBlock(buildFunctionDiagram(fn, '../'))}
+${diagramBlock(buildFunctionDiagram(fn))}
 ${varList ? `<h2>Глобальные переменные функции</h2><ul>${varList}</ul>` : ''}`;
   fs.writeFileSync(path.join(funcsDir, `${pageName(fn.key)}.html`),
-    htmlPage({ title: fn.name, rel: '../', body }));
+    htmlPage({ title: fn.name, rel: '../', path: `functions/${pageName(fn.key)}.html`, body, cfgLinks: cfg ? cfg.links : undefined }));
 }
 
 // ---------------------------------------------------------------------------
