@@ -6,6 +6,20 @@
 (function () {
   'use strict';
 
+  // mermaid + the ELK layout engine keep some state (id counters, layout
+  // workers) global to the page rather than scoped per diagram, so two
+  // mermaid.run() calls in flight at once — e.g. expanding two bochkas back
+  // to back before the first finishes — can corrupt each other's node-size
+  // measurement, leaving a node stuck at its pre-layout default size with
+  // text that no longer fits. Every mermaid.run() on the page is funneled
+  // through this queue so only one is ever running at a time.
+  let renderQueue = Promise.resolve();
+  function queueRender(task) {
+    const run = renderQueue.then(task, task);
+    renderQueue = run.catch(() => {});
+    return run;
+  }
+
   // Zoom the diagram so that the container point (cx, cy) stays fixed:
   // convert it to content coordinates at the old scale, rescale, then scroll
   // the container so the same content point is back under (cx, cy).
@@ -348,20 +362,36 @@
       });
     }
 
-    async function rerender() {
-      const inner = diagram.querySelector('.inner');
-      const old = inner.querySelector('svg, pre');
-      const pre = document.createElement('pre');
-      pre.className = 'mermaid';
-      pre.textContent = compose();
-      old.replaceWith(pre);
-      try {
-        await mermaid.run({ nodes: [pre] });
-      } catch (e) {
-        console.error('mermaid render (group expand):', e);
-        return;
-      }
-      wire(diagram.querySelector('svg'));
+    function rerender() {
+      // the DOM swap (which node is "old") must happen inside the queued
+      // turn too, not just the mermaid.run() call — otherwise a second
+      // click queued while the first is still pending would rip the first
+      // click's <pre> out of the document mid-render
+      return queueRender(async () => {
+        const inner = diagram.querySelector('.inner');
+        const old = inner.querySelector('svg, pre');
+        const pre = document.createElement('pre');
+        pre.className = 'mermaid';
+        pre.textContent = compose();
+        old.replaceWith(pre);
+        // mermaid measures every html label with getBoundingClientRect(),
+        // which reports post-CSS-transform screen pixels — if .inner is
+        // currently zoomed (scroll-wheel/buttons set its transform: scale),
+        // that scale leaks into every node's measured size for this render,
+        // not just the one being toggled. Render at true scale, then
+        // restore whatever zoom was active.
+        const prevTransform = inner.style.transform;
+        inner.style.transform = 'none';
+        try {
+          await mermaid.run({ nodes: [pre] });
+        } catch (e) {
+          console.error('mermaid render (group expand):', e);
+          return;
+        } finally {
+          inner.style.transform = prevTransform;
+        }
+        wire(diagram.querySelector('svg'));
+      });
     }
 
     // the first pass is already-rendered (fully collapsed) by the normal
@@ -415,7 +445,7 @@
       maxEdges: 5000,
     });
     try {
-      await mermaid.run({ querySelector: '.mermaid' });
+      await queueRender(() => mermaid.run({ querySelector: '.mermaid' }));
     } catch (e) {
       console.error('mermaid render:', e);
     }
@@ -437,7 +467,7 @@
           el.classList.add('mermaid');
         }
         try {
-          await mermaid.run({ nodes: lazies });
+          await queueRender(() => mermaid.run({ nodes: lazies }));
         } catch (e) {
           console.error('mermaid render (lazy):', e);
         }
