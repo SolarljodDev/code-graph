@@ -817,6 +817,20 @@ function varTier(v) {
 }
 const TIER_LABELS = { hot: 'часто используемые', normal: 'переменные файла', minor: 'редко используемые' };
 
+// Same hot/normal/minor 3-way split as varTier, but for "how big is this
+// count relative to its peers" instead of "how often is this var touched" —
+// used to size/tint a collapsed variable-bundle node by how many variables
+// it hides, the same way a single variable gets sized by its usage.
+function sizeTier(n, allSizes) {
+  const sizes = allSizes.filter(x => x >= 2).sort((a, b) => a - b);
+  const cut = sizes.length
+    ? Math.max(4, sizes[Math.min(sizes.length - 1, Math.floor(sizes.length * 0.8))])
+    : Infinity;
+  if (n >= cut) return 'hot';
+  if (n <= 2) return 'minor';
+  return 'normal';
+}
+
 // ---------------------------------------------------------------------------
 // Mermaid emission
 // ---------------------------------------------------------------------------
@@ -839,7 +853,6 @@ const CLASSDEFS = [
   'classDef gvolatilehot fill:#fecaca,stroke:#991b1b,stroke-width:3.5px,color:#7f1d1d',
   'classDef gvolatileminor fill:#fef8f6,stroke:#e5b4ae,color:#9a6a63',
   'classDef ghost fill:#f4f4f5,stroke:#a1a1aa,color:#52525b,stroke-dasharray:5 4',
-  'classDef ghostbtn fill:#e4e4e7,stroke:#71717a,color:#27272a,font-weight:600',
   'classDef periph fill:#e0e7ff,stroke:#4338ca,color:#312e81',
   'classDef periphhot fill:#c7d2fe,stroke:#3730a3,stroke-width:2.5px,color:#1e1b4b',
   'classDef focus stroke-width:3.5px',
@@ -903,40 +916,42 @@ function extNodeLine(name) {
 
 // A bundle of variables that all share the same writers/readers is really
 // just "several variables in one barrel", so it's rendered in the same
-// cylinder shape as a single variable node (see varNodeLine) rather than a
-// generic rectangle placeholder, with names bolded the same way too.
+// cylinder shape and color as a single variable node (see varNodeLine)
+// rather than a generic grey placeholder — volatile-ness and the size tier
+// (hot/normal/minor, same 3-way split varTier uses for how often a variable
+// is touched, but keyed here on how many variables this one barrel hides)
+// pick the class, so a barrel folding away a lot of variables reads as
+// visually heavier exactly like a heavily-used single variable would.
 //
 // Fewer than 3 members is small enough to just always show in full — no
 // fold/unfold control at all (kind: 'static', folded directly into the
 // diagram's base lines by the caller). 3 or more still starts collapsed to a
-// one-line summary, expanding into that same content node (now holding the
-// full alphabetical name list) plus a small dedicated "свернуть" button node
-// wired next to it. The content node's id and the edges into it never change
-// between states, so opening or closing one never reflows anything else —
-// and while expanded, clicking the content node itself is left free to
-// behave like a normal node (locks the hover highlight) since the button is
-// what collapses it.
-function varListGroup(id, header, vars, edges) {
+// one-line summary and expands in place into that same node, now holding the
+// full alphabetical name list plus its own "свернуть" line — clicking the
+// barrel again folds it back. The node's id and the edges into it never
+// change between states, so opening or closing one never reflows anything
+// else on the diagram.
+function varListGroup(id, header, vars, edges, tier = 'normal') {
   const names = vars.map(v => esc(v.name)).sort((x, y) => x.localeCompare(y));
-  const cyl = inner => `${id}[("${header}${inner}")]:::ghost`;
+  const anyVolatile = vars.some(v => v.isVolatile);
+  let cls = anyVolatile ? 'gvolatile' : 'gvar';
+  if (tier === 'hot') cls = anyVolatile ? 'gvolatilehot' : 'gvarhot';
+  else if (tier === 'minor') cls = anyVolatile ? 'gvolatileminor' : 'gvarminor';
+  const prefix = header ? `${header}<br>` : '';
+  const cyl = inner => `${id}[("${prefix}${inner}")]:::${cls}`;
 
   if (vars.length < 3) {
-    const line = cyl(names.map(n => `<br><b>${n}</b>`).join(''));
+    const line = cyl(names.map(n => `<b>${n}</b>`).join('<br>'));
     return { id, kind: 'static', line, edges };
   }
 
-  const btnId = `${id}_btn`;
   // plain Unicode triangles, not HTML entity codes: mermaid has its own
   // internal "#NNN;" unicode-escape convention for label text and blindly
   // converts any such substring it finds — including inside "&#9656;",
   // leaving the leading "&" behind as stray literal text
-  const phLine = cyl(`<br><small>${vars.length} перем.</small><br><b>▶ развернуть</b>`);
-  const fullLines = [
-    cyl(names.map(n => `<br><b>${n}</b>`).join('')),
-    `${btnId}["▾ свернуть"]:::ghostbtn`,
-    `${id} --- ${btnId}`,
-  ];
-  return { id, btnId, kind: 'list', phLine, fullLines, edges };
+  const phLine = cyl(`<small>${vars.length} перем.</small><br><b>▶ развернуть</b>`);
+  const fullLine = cyl(names.map(n => `<b>${n}</b>`).join('<br>') + '<br><b>▾ свернуть</b>');
+  return { id, kind: 'list', phLine, fullLine, edges };
 }
 
 // peripheral instance node (register block reached via `X->field`, never
@@ -1258,6 +1273,10 @@ function buildFileDiagram(f) {
   // whose label toggles between a short summary and the full alphabetical
   // name list, with the very same edges in both states, so nothing else in
   // the diagram ever has to re-layout when one is opened or closed.
+  const varGroupSizes = [...groups.values()]
+    .filter(gr => gr.varMembers.size && !gr.fnMembers.size)
+    .map(gr => gr.varMembers.size);
+
   const groupList = [];
   let gi = 0;
   for (const [, gr] of groups) {
@@ -1269,7 +1288,7 @@ function buildFileDiagram(f) {
       const vars = [...gr.varMembers.values()];
       const header = `${cap('группа')}<b>${esc(gr.label)}</b>`;
       const edges = [...gr.collapsed].map(e => e.replace(/GID/g, id));
-      const vlg = varListGroup(id, header, vars, edges);
+      const vlg = varListGroup(id, header, vars, edges, sizeTier(vars.length, varGroupSizes));
       if (vlg.kind === 'static') baseLines.push(vlg.line, ...vlg.edges);
       else groupList.push({ ...vlg, label: gr.label, count });
       continue;
@@ -1477,6 +1496,7 @@ function buildLevel0Diagram() {
   // shrinks unrelated boxes, and clicking again simply collapses it back.
   const groups = [];
   let gi = 0;
+  const multiSizes = multi.map(b => b.vars.length);
   for (const b of multi) {
     const id = `bnd_${gi++}`;
     const edges = [];
@@ -1488,11 +1508,8 @@ function buildLevel0Diagram() {
       const mode = d.w && d.r ? 'rw' : d.w ? 'w' : 'r';
       edges.push(...accessEdgeRawBothStyled(fnId(ek), id, mode, allDirect));
     }
-    const writerNames = b.writers.map(k => funcs.get(k)?.name || k).join(', ') || '—';
-    const readerNames = b.readers.map(k => funcs.get(k)?.name || k).join(', ') || '—';
-    const header = `${cap('канал данных')}<b>${esc(writerNames)} &rarr; ${esc(readerNames)}</b>`;
     const vars = b.vars.map(vk => varDefs.get(vk));
-    const vlg = varListGroup(id, header, vars, edges);
+    const vlg = varListGroup(id, '', vars, edges, sizeTier(vars.length, multiSizes));
     if (vlg.kind === 'static') baseLines.push(vlg.line, ...vlg.edges);
     else groups.push(vlg);
   }
@@ -1617,7 +1634,7 @@ const LEGEND0 = `
   <span><span class="chip" style="background:#e0e7ff;border-color:#4338ca"></span>&#11039; периферия (регистры вида <code>X-&gt;поле</code>)</span>
   <span><b>&#8943;&gt;</b> «взводит» — вызов NVIC_EnableIRQ на эту периферию</span>
   <span><b>=&gt;</b> «прерывание» — периферия вызывает обработчик по её имени</span>
-  <span>серый блок «канал данных» — несколько переменных с одинаковыми писателями/читателями, свёрнутые в один жгут; клик показывает/скрывает список имён</span>
+  <span>цилиндр с числом внутри — несколько переменных с одинаковыми писателями/читателями, свёрнутые в один жгут (чем их больше, тем жирнее обводка); клик по нему показывает/скрывает список имён</span>
   <span class="muted">наведите курсор — подсветятся связи; клик — закрепить подсветку; двойной клик — перейти; клик по пустому месту — снять</span>
 </div>`;
 
@@ -1671,7 +1688,7 @@ function groupedDiagramBlock(fileDiagram) {
   const payload = {
     baseLines, classDefs,
     groups: groups.map(g => g.kind === 'list'
-      ? { id: g.id, btnId: g.btnId, kind: 'list', phLine: g.phLine, fullLines: g.fullLines, edges: g.edges }
+      ? { id: g.id, kind: 'list', phLine: g.phLine, fullLine: g.fullLine, edges: g.edges }
       : { id: g.id, phLine: g.phLine, realLines: g.realLines, collapsedEdges: g.collapsedEdges, expandedEdges: g.expandedEdges }),
   };
   return `<div class="diagram" data-groups="true">
