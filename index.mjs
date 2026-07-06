@@ -1048,10 +1048,12 @@ function buildIncludeDiagram() {
 // dropping information, the excess is folded into small grey placeholder
 // nodes — one per neighboring file (so "everything from uart.c" is one box,
 // "everything from tim.c" is another), plus one per own-variable importance
-// tier if even the file's own functions+globals are too many. Each box
-// expands in place on click (viewer.js recomposes the mermaid source with
-// that group's real nodes swapped in) — nothing is ever silently omitted,
-// it's just collapsed until asked for.
+// tier if even the file's own functions+globals are too many. Function
+// groups expand in place on click (viewer.js recomposes the mermaid source
+// with that group's real nodes swapped in) — nothing is ever silently
+// omitted, it's just collapsed until asked for. Variable-only groups never
+// explode into one node per variable; they stay a single node whose label
+// toggles between a summary and the full alphabetical name list.
 const FILE_DIAGRAM_FULL_MAX = 150;   // own + neighbors fits: show it all directly
 const FILE_DIAGRAM_OWN_MAX = 150;    // own funcs+vars alone fits: only group neighbors
 
@@ -1133,11 +1135,17 @@ function buildFileDiagram(f) {
   baseLines.push('end');
 
   // groupKey -> { label, fnMembers: Map, varMembers: Map, collapsed: Set<string>, expanded: Set<string> }
+  // fn and var members are always kept in separate group keys (fn:.../var:...)
+  // even when they'd otherwise share the same neighboring-file label, so a
+  // group is never a mix of the two — see groupList below, which renders
+  // variable-only groups very differently from function ones.
   const groups = new Map();
   const group = (key, label) => {
     if (!groups.has(key)) groups.set(key, { label, fnMembers: new Map(), varMembers: new Map(), collapsed: new Set(), expanded: new Set() });
     return groups.get(key);
   };
+  const fnGroupKey = file => 'fn:' + (file || '__unknown__');
+  const varGroupKey = key => 'var:' + key;
 
   const shownFns = new Set([...fnKeysHere, ...ghostFns.keys()]);
   for (const fnKey of shownFns) {
@@ -1149,14 +1157,14 @@ function buildFileDiagram(f) {
       if (isOwn) {
         const g = ghostFns.get(calleeKey);
         if (!g) continue;
-        const gr = group(g.file || '__unknown__', g.file || 'без файла');
+        const gr = group(fnGroupKey(g.file), g.file || 'без файла');
         gr.fnMembers.set(calleeKey, g);
         gr.collapsed.add(`${fnId(fnKey)} -.-> GID`);
         gr.expanded.add(callEdge(fnKey, calleeKey));
       } else {
         const g = ghostFns.get(fnKey);
         if (!g) continue;
-        const gr = group(g.file || '__unknown__', g.file || 'без файла');
+        const gr = group(fnGroupKey(g.file), g.file || 'без файла');
         gr.fnMembers.set(fnKey, g);
         gr.collapsed.add(`GID -.-> ${fnId(calleeKey)}`);
         gr.expanded.add(callEdge(fnKey, calleeKey));
@@ -1164,7 +1172,7 @@ function buildFileDiagram(f) {
     }
     if (isOwn) {
       for (const ec of fn.extCalls) {
-        const gr = group('__lib__', 'библиотеки / макросы');
+        const gr = group('fn:__lib__', 'библиотеки / макросы');
         gr.fnMembers.set('ext:' + ec, { __ext: ec });
         gr.collapsed.add(`${fnId(fnKey)} -.-> GID`);
         gr.expanded.add(extCallEdge(fnKey, ec));
@@ -1180,16 +1188,15 @@ function buildFileDiagram(f) {
           // ghost fn <-> our own var (own var shown directly, group the ghost side)
           const g = ghostFns.get(fnKey);
           if (!g) continue;
-          const gr = group(g.file || '__unknown__', g.file || 'без файла');
+          const gr = group(fnGroupKey(g.file), g.file || 'без файла');
           gr.fnMembers.set(fnKey, g);
           gr.collapsed.add(accessEdgeRawBoth('GID', varId(varKey), mode)[0]);
           accessEdges(fnKey, varKey, mode).forEach(e => gr.expanded.add(e));
         } else if (isOwn) {
           const v = varDefs.get(varKey);
-          const gr = group('tier:' + varTier(v), TIER_LABELS[varTier(v)]);
+          const gr = group(varGroupKey('tier:' + varTier(v)), TIER_LABELS[varTier(v)]);
           gr.varMembers.set(varKey, v);
           gr.collapsed.add(accessEdgeRaw(fnKey, 'GID', mode)[0]);
-          accessEdges(fnKey, varKey, mode).forEach(e => gr.expanded.add(e));
         }
         // else: ghost fn <-> own var, and the own var is ALSO folded into a
         // tier group — a group-to-group edge; skipped (rare double-collapse,
@@ -1199,20 +1206,40 @@ function buildFileDiagram(f) {
         if (!v) continue;
         const key = v.file || (v.isExternal ? '__extern__' : '__unknown__');
         const label = v.file || (v.isExternal ? 'внешние объявления (extern)' : 'без файла');
-        const gr = group(key, label);
+        const gr = group(varGroupKey(key), label);
         gr.varMembers.set(varKey, v);
         gr.collapsed.add(accessEdgeRaw(fnKey, 'GID', mode)[0]);
-        accessEdges(fnKey, varKey, mode).forEach(e => gr.expanded.add(e));
       }
     }
   }
 
+  // Function groups still expand in place into their real (ghost) nodes —
+  // useful, since each one is independently navigable. Variable-only groups
+  // never explode into one node per variable: they render as a single node
+  // whose label toggles between a short summary and the full alphabetical
+  // name list, with the very same edges in both states, so nothing else in
+  // the diagram ever has to re-layout when one is opened or closed.
   const groupList = [];
   let gi = 0;
   for (const [, gr] of groups) {
     const id = `grp_${sanitize(f.basename)}_${gi++}`;
     const count = gr.fnMembers.size + gr.varMembers.size;
     if (!count) continue;
+
+    if (gr.varMembers.size && !gr.fnMembers.size) {
+      const vars = [...gr.varMembers.values()];
+      const header = `${cap('группа')}<b>${esc(gr.label)}</b>`;
+      const names = vars.map(v => esc(v.name)).sort((x, y) => x.localeCompare(y));
+      const phLine = `${id}["${header}<br><small>${count} перем. — клик, чтобы показать</small>"]:::ghost`;
+      const fullLine = `${id}["${header}${names.map(n => `<br>${n}`).join('')}<br><small>клик — свернуть</small>"]:::ghost`;
+      groupList.push({
+        id, label: gr.label, count, kind: 'list',
+        phLine, fullLine,
+        edges: [...gr.collapsed].map(e => e.replace(/GID/g, id)),
+      });
+      continue;
+    }
+
     const realLines = [];
     for (const [k, g] of gr.fnMembers) realLines.push(g.__ext ? extNodeLine(g.__ext) : fnNodeLine(g, { ghost: true, withFile: true }));
     for (const v of gr.varMembers.values()) realLines.push(varNodeLine(v, { ghost: v.file !== f.basename, withFile: true, withType: true, tiered: v.file === f.basename }));
@@ -1408,35 +1435,31 @@ function buildLevel0Diagram() {
     }
   }
 
+  // Each bundle is rendered as ONE node whose label toggles in place between
+  // a short summary and the full alphabetical list of its variable names —
+  // never exploded into one node per variable. That keeps the edges (and
+  // every other node's layout) identical in both states, so expanding never
+  // shrinks unrelated boxes, and clicking again simply collapses it back.
   const groups = [];
   let gi = 0;
   for (const b of multi) {
     const id = `bnd_${gi++}`;
-    const realLines = b.vars.map(vk =>
-      varNodeLine(varDefs.get(vk), { withType: true, withFile: true, tiered: true }));
-    const collapsedEdges = [];
-    const expandedEdges = [];
+    const edges = [];
     const entryDir = new Map(); // entryKey -> {w, r}
     for (const ek of b.writers) entryDir.set(ek, { ...(entryDir.get(ek) || {}), w: true });
     for (const ek of b.readers) entryDir.set(ek, { ...(entryDir.get(ek) || {}), r: true });
     for (const [ek, d] of entryDir) {
       const allDirect = b.vars.every(vk => (varInfo.get(ek).get(vk) || {}).direct);
       const mode = d.w && d.r ? 'rw' : d.w ? 'w' : 'r';
-      collapsedEdges.push(...accessEdgeRawBothStyled(fnId(ek), id, mode, allDirect));
-    }
-    for (const vk of b.vars) {
-      for (const e of entries) {
-        const a = varInfo.get(e.key).get(vk);
-        if (!a) continue;
-        const mode = a.r && a.w ? 'rw' : a.w ? 'w' : 'r';
-        expandedEdges.push(...accessEdgeStyled(e.key, vk, mode, a.direct));
-      }
+      edges.push(...accessEdgeRawBothStyled(fnId(ek), id, mode, allDirect));
     }
     const writerNames = b.writers.map(k => funcs.get(k)?.name || k).join(', ') || '—';
     const readerNames = b.readers.map(k => funcs.get(k)?.name || k).join(', ') || '—';
-    const phLine = `${id}["${cap('канал данных')}<b>${esc(writerNames)} &rarr; ${esc(readerNames)}</b>` +
-      `<br><small>${b.vars.length} перем. — клик, чтобы показать</small>"]:::ghost`;
-    groups.push({ id, phLine, realLines, collapsedEdges, expandedEdges });
+    const header = `${cap('канал данных')}<b>${esc(writerNames)} &rarr; ${esc(readerNames)}</b>`;
+    const names = b.vars.map(vk => esc(varDefs.get(vk).name)).sort((x, y) => x.localeCompare(y));
+    const phLine = `${id}["${header}<br><small>${b.vars.length} перем. — клик, чтобы показать</small>"]:::ghost`;
+    const fullLine = `${id}["${header}${names.map(n => `<br>${n}`).join('')}<br><small>клик — свернуть</small>"]:::ghost`;
+    groups.push({ id, kind: 'list', phLine, fullLine, edges });
   }
 
   const note = [varCapNote, periphCapNote].filter(Boolean).join('; ');
@@ -1559,7 +1582,7 @@ const LEGEND0 = `
   <span><span class="chip" style="background:#e0e7ff;border-color:#4338ca"></span>&#11039; периферия (регистры вида <code>X-&gt;поле</code>)</span>
   <span><b>&#8943;&gt;</b> «взводит» — вызов NVIC_EnableIRQ на эту периферию</span>
   <span><b>=&gt;</b> «прерывание» — периферия вызывает обработчик по её имени</span>
-  <span>серый блок «канал данных» — несколько переменных с одинаковыми писателями/читателями, свёрнутые в один жгут; клик разворачивает</span>
+  <span>серый блок «канал данных» — несколько переменных с одинаковыми писателями/читателями, свёрнутые в один жгут; клик показывает/скрывает список имён</span>
   <span class="muted">наведите курсор — подсветятся связи; клик — закрепить подсветку; двойной клик — перейти; клик по пустому месту — снять</span>
 </div>`;
 
@@ -1607,12 +1630,14 @@ function diagramBlock(code, { lazy = false } = {}) {
 // in a hidden JSON blob alongside it.
 function groupedDiagramBlock(fileDiagram) {
   const { baseLines, classDefs, groups } = fileDiagram;
-  const collapsedLines = [...baseLines, ...groups.flatMap(g => [g.phLine, ...g.collapsedEdges])];
+  const collapsedLines = [...baseLines, ...groups.flatMap(g =>
+    g.kind === 'list' ? [g.phLine, ...g.edges] : [g.phLine, ...g.collapsedEdges])];
   const code = mermaidFlow(collapsedLines, 'LR');
   const payload = {
     baseLines, classDefs,
-    groups: groups.map(({ id, phLine, realLines, collapsedEdges, expandedEdges }) =>
-      ({ id, phLine, realLines, collapsedEdges, expandedEdges })),
+    groups: groups.map(g => g.kind === 'list'
+      ? { id: g.id, kind: 'list', phLine: g.phLine, fullLine: g.fullLine, edges: g.edges }
+      : { id: g.id, phLine: g.phLine, realLines: g.realLines, collapsedEdges: g.collapsedEdges, expandedEdges: g.expandedEdges }),
   };
   return `<div class="diagram" data-groups="true">
 <div class="zoombar">

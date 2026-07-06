@@ -311,8 +311,15 @@
     function compose() {
       const parts = ['flowchart LR', ...data.classDefs.map(c => '  ' + c), ...data.baseLines];
       for (const g of data.groups) {
-        if (expanded.has(g.id)) parts.push(...g.realLines, ...g.expandedEdges);
-        else parts.push(g.phLine, ...g.collapsedEdges);
+        if (g.kind === 'list') {
+          // same node id and the same edges either way — only its own label
+          // text changes, so opening/closing one never reflows anything else
+          parts.push(expanded.has(g.id) ? g.fullLine : g.phLine, ...g.edges);
+        } else if (expanded.has(g.id)) {
+          parts.push(...g.realLines, ...g.expandedEdges);
+        } else {
+          parts.push(g.phLine, ...g.collapsedEdges);
+        }
       }
       return parts.join('\n');
     }
@@ -322,8 +329,15 @@
       setupSvg(svg, {
         extraKeys: groupById.keys(),
         onNodeClick(key) {
-          if (!groupById.has(key) || expanded.has(key)) return false;
-          expanded.add(key);
+          const g = groupById.get(key);
+          if (!g) return false;
+          if (g.kind === 'list') {
+            if (expanded.has(key)) expanded.delete(key);
+            else expanded.add(key);
+          } else {
+            if (expanded.has(key)) return false; // function groups only ever expand forward
+            expanded.add(key);
+          }
           rerender();
           return true;
         },
