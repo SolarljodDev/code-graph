@@ -20,22 +20,39 @@
     return run;
   }
 
+  // Position within a diagram is tracked as an explicit translate + scale on
+  // .inner rather than via native scrollLeft/scrollTop: scrollLeft/scrollTop
+  // can never go negative, so centering content that's smaller than the
+  // viewport (e.g. a tall, narrow graph scaled down to fit) used to clamp to
+  // 0 and leave it flush against the left/top edge instead of centered.
+  // A translate has no such floor, so centering and panning both just work.
+  function getTransform(inner) {
+    return {
+      z: parseFloat(inner.dataset.z || '1'),
+      tx: parseFloat(inner.dataset.tx || '0'),
+      ty: parseFloat(inner.dataset.ty || '0'),
+    };
+  }
+  function setTransform(inner, z, tx, ty) {
+    inner.dataset.z = z;
+    inner.dataset.tx = tx;
+    inner.dataset.ty = ty;
+    inner.style.transform = 'translate(' + tx + 'px,' + ty + 'px) scale(' + z + ')';
+  }
+
   // Zoom the diagram so that the container point (cx, cy) stays fixed:
-  // convert it to content coordinates at the old scale, rescale, then scroll
-  // the container so the same content point is back under (cx, cy).
+  // convert it to content coordinates at the old scale, rescale, then
+  // translate so the same content point is back under (cx, cy).
   function applyZoom(diagram, factor, cx, cy) {
     const inner = diagram.querySelector('.inner');
     if (!inner) return;
-    const z = parseFloat(inner.dataset.z || '1');
+    const { z, tx, ty } = getTransform(inner);
     const z2 = Math.min(8, Math.max(0.08, z * factor));
     if (z2 === z) return;
     const ox = inner.offsetLeft, oy = inner.offsetTop; // zoombar sits above .inner
-    const px = (diagram.scrollLeft + cx - ox) / z;
-    const py = (diagram.scrollTop + cy - oy) / z;
-    inner.dataset.z = z2;
-    inner.style.transform = 'scale(' + z2 + ')';
-    diagram.scrollLeft = px * z2 + ox - cx;
-    diagram.scrollTop = py * z2 + oy - cy;
+    const px = (cx - ox - tx) / z;
+    const py = (cy - oy - ty) / z;
+    setTransform(inner, z2, cx - ox - px * z2, cy - oy - py * z2);
   }
 
   window.zoom = function (btn, factor) {
@@ -64,7 +81,14 @@
       // otherwise a press-drag that happens to start over an SVG text node
       // paints a selection instead of (or as well as) panning
       ev.preventDefault();
-      drag = { x: ev.clientX, y: ev.clientY, sl: diagram.scrollLeft, st: diagram.scrollTop, moved: false, id: ev.pointerId };
+      // preventDefault() above suppresses the compatibility mousedown event
+      // this pointerdown would otherwise trigger, so the mousedown-based
+      // focus listener below never fires for clicks on empty background —
+      // focus here directly so F/Home/Escape still target this diagram
+      diagram.focus({ preventScroll: true });
+      const inner = diagram.querySelector('.inner');
+      const { tx, ty } = getTransform(inner);
+      drag = { x: ev.clientX, y: ev.clientY, tx, ty, moved: false, id: ev.pointerId };
     });
     diagram.addEventListener('pointermove', ev => {
       if (!drag) return;
@@ -75,8 +99,9 @@
         diagram.setPointerCapture(drag.id);
         diagram.classList.add('panning');
       }
-      diagram.scrollLeft = drag.sl - dx;
-      diagram.scrollTop = drag.st - dy;
+      const inner = diagram.querySelector('.inner');
+      const { z } = getTransform(inner);
+      setTransform(inner, z, drag.tx + dx, drag.ty + dy);
     });
     const endDrag = () => {
       if (!drag) return;
@@ -158,11 +183,10 @@
     const margin = 0.92; // small breathing room around the fitted box
     const z2 = Math.min(8, Math.max(0.08,
       Math.min(diagram.clientWidth / box.w, diagram.clientHeight / box.h) * margin));
-    inner.dataset.z = z2;
-    inner.style.transform = 'scale(' + z2 + ')';
     const ox = inner.offsetLeft, oy = inner.offsetTop;
-    diagram.scrollLeft = ox + (box.x + box.w / 2) * z2 - diagram.clientWidth / 2;
-    diagram.scrollTop = oy + (box.y + box.h / 2) * z2 - diagram.clientHeight / 2;
+    const tx = diagram.clientWidth / 2 - ox - (box.x + box.w / 2) * z2;
+    const ty = diagram.clientHeight / 2 - oy - (box.y + box.h / 2) * z2;
+    setTransform(inner, z2, tx, ty);
   }
 
   // Home: fit the current selection if there is one, else fit everything

@@ -1576,7 +1576,7 @@ const CSS = `
   h1 { font-size: 1.4rem; } h2 { font-size: 1.1rem; margin-top: 2em; }
   .sig { font-family: Consolas, monospace; background: #eef2f7; padding: 6px 10px; border-radius: 6px; display: inline-block; }
   .diagram-wrap { position: relative; }
-  .diagram { background: #fff; border: 1px solid #e4e4e7; border-radius: 8px; overflow: auto; position: relative;
+  .diagram { background: #fff; border: 1px solid #e4e4e7; border-radius: 8px; overflow: hidden; position: relative;
     max-height: 78vh; user-select: none; -webkit-user-select: none; outline: none; }
   .diagram .inner { transform-origin: 0 0; width: max-content; padding: 12px; }
   .zoombar { position: sticky; top: 6px; left: 6px; z-index: 5; display: inline-flex; gap: 4px; margin: 6px; }
