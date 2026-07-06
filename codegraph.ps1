@@ -75,7 +75,14 @@ function Ensure-Tool {
         git clone --depth 1 $RepoUrl $ToolHome | Out-Null
     } else {
         Write-Host "Updating code-graph ..."
-        git -C $ToolHome pull --ff-only 2>$null | Out-Null
+        try {
+            # discard drift left behind by "npm install" (e.g. package-lock.json rewrites)
+            # so a fast-forward pull never conflicts with it
+            git -C $ToolHome reset --hard HEAD | Out-Null
+            git -C $ToolHome pull --ff-only | Out-Null
+        } catch {
+            Write-Host "  (update skipped: $($_.Exception.Message))"
+        }
     }
 
     # cheap no-op when already up to date; picks up newly added dependencies after git pull
