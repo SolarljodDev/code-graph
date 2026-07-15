@@ -1120,8 +1120,9 @@
     const toolbar = diagram.parentElement.querySelector('.diagram-toolbar');
     const rawDotScript = diagram.querySelector('script.test-raw-dot');
     if (!toolbar || !rawDotScript) return;
-    const rawDot = JSON.parse(rawDotScript.textContent);
+    const rawDot = JSON.parse(rawDotScript.textContent); // { withVars, noVars }
     const engineSelect = toolbar.querySelector('.gv-engine-select');
+    const varsCheckbox = toolbar.querySelector('.gv-vars-toggle');
     const modeSel = toolbar.querySelector('.test-mode-select');
     const modelSel = toolbar.querySelector('.test-model-select');
     const seedInput = toolbar.querySelector('.test-seed-input');
@@ -1140,21 +1141,38 @@
     }
 
     async function renderCustom() {
-      const graphviz = await loadGraphvizWasm();
-      let dotText = rawDot.replace(/len=[\d.]+/g, `len=${lenInput.value}`);
-      const extra = [`start=${seedInput.value}`];
-      if (modeSel.value) extra.push(`mode=${modeSel.value}`);
-      if (modelSel.value) extra.push(`model=${modelSel.value}`);
-      dotText = dotText.replace(/graph \[([^\]]*)\]/, (m, inner) => `graph [${inner}, ${extra.join(', ')}]`);
-      const svgText = graphviz.layout(dotText, 'svg', 'neato');
-      const doc = new DOMParser().parseFromString(svgText, 'image/svg+xml');
-      const next = document.importNode(doc.documentElement, true);
-      const inner = diagram.querySelector('.inner');
-      inner.querySelector('svg').replaceWith(next);
-      setupGraphvizSvg(next);
+      try {
+        const graphviz = await loadGraphvizWasm();
+        // honor the vars checkbox — otherwise every test-control change re-drew
+        // the *with-vars* raw dot regardless of its current state, so
+        // variables silently came back the moment you touched a slider
+        const base = (!varsCheckbox || varsCheckbox.checked) ? rawDot.withVars : rawDot.noVars;
+        let dotText = base.replace(/len=[\d.]+/g, `len=${lenInput.value}`);
+        const extra = [`start=${seedInput.value}`];
+        if (modeSel.value) extra.push(`mode=${modeSel.value}`);
+        if (modelSel.value) extra.push(`model=${modelSel.value}`);
+        dotText = dotText.replace(/graph \[([^\]]*)\]/, (m, inner) => `graph [${inner}, ${extra.join(', ')}]`);
+        const svgText = graphviz.layout(dotText, 'svg', 'neato');
+        const doc = new DOMParser().parseFromString(svgText, 'image/svg+xml');
+        const next = document.importNode(doc.documentElement, true);
+        const inner = diagram.querySelector('.inner');
+        inner.querySelector('svg').replaceWith(next);
+        setupGraphvizSvg(next);
+      } catch (e) {
+        console.error('neato mode tester: render failed:', e);
+      }
     }
 
     controls.forEach(el => el.addEventListener('change', renderCustom));
+    // wireDiagramToolbar's own listener (attached first, so it runs first on
+    // the same event) already swapped to the pre-baked vars/no-vars SVG for
+    // whatever engine is active; re-running our own render after it, but
+    // only while the test controls are actually live (current engine has a
+    // preset), keeps a custom mode/model/seed/len combo from being silently
+    // discarded by that swap
+    if (varsCheckbox) {
+      varsCheckbox.addEventListener('change', () => { if (!modeSel.disabled) renderCustom(); });
+    }
     // engine dropdown swaps to a pre-baked SVG on its own (setupEngineSwitchable);
     // this only keeps the test controls' displayed values honest about what
     // that pre-baked render's parameters actually were

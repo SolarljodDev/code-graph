@@ -1367,7 +1367,10 @@ async function renderDotAll(coreNodeLines, coreEdgeLines, varNodeLines = [], var
   // wireNeatoModeTester in viewer.js. Gated on an env var so normal builds
   // don't carry this; drop this line (and the matching HTML/JS) once done.
   const testRawDot = process.env.TEST_NEATO_MODES
-    ? build([...coreNodeLines, ...varNodeLines], [...coreEdgeLines, ...varEdgeLines], 'neato')
+    ? {
+      withVars: build([...coreNodeLines, ...varNodeLines], [...coreEdgeLines, ...varEdgeLines], 'neato'),
+      noVars: build(coreNodeLines, coreEdgeLines, 'neato'),
+    }
     : undefined;
   return { svgs, hasVars, testRawDot };
 }
