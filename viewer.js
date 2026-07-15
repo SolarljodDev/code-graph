@@ -1011,10 +1011,14 @@
     // DOM visibility flip on the one shared SVG.
     let curEngine = diagram.dataset.curEngine;
     let showVars = true;
+    let cyclicOnly = false;
     setupGraphvizSvg(diagram.querySelector('svg'));
 
+    // key order matches how index.mjs's buildLevel0Diagram actually names
+    // the extra variants: "<engine>", "<engine>_novars", "<engine>_cyclic",
+    // "<engine>_cyclic_novars" — cyclic segment always comes before novars
     function swap() {
-      const key = showVars ? curEngine : curEngine + '_novars';
+      const key = curEngine + (cyclicOnly ? '_cyclic' : '') + (showVars ? '' : '_novars');
       const inner = diagram.querySelector('.inner');
       const old = inner.querySelector('svg');
       const doc = new DOMParser().parseFromString(svgs[key] || svgs[curEngine], 'image/svg+xml');
@@ -1033,7 +1037,12 @@
       showVars = show;
       swap();
     }
-    return { switchTo, setVarsVisible };
+    function setCyclicOnly(on) {
+      if (cyclicOnly === on) return;
+      cyclicOnly = on;
+      swap();
+    }
+    return { switchTo, setVarsVisible, setCyclicOnly };
   }
 
   // Explorer-style navigation history: every page visited extends the trail;
@@ -1100,6 +1109,17 @@
       storageSet(varsKey, checkbox.checked ? '1' : '0');
       switcher.setVarsVisible(checkbox.checked);
     });
+
+    const cyclicCheckbox = toolbar.querySelector('.gv-cyclic-toggle');
+    if (!cyclicCheckbox || !switcher.setCyclicOnly) return;
+    const cyclicKey = 'cg_cyclic_' + id;
+    const savedCyclic = storageGet(cyclicKey);
+    cyclicCheckbox.checked = savedCyclic === '1';
+    switcher.setCyclicOnly(cyclicCheckbox.checked);
+    cyclicCheckbox.addEventListener('change', () => {
+      storageSet(cyclicKey, cyclicCheckbox.checked ? '1' : '0');
+      switcher.setCyclicOnly(cyclicCheckbox.checked);
+    });
   }
 
   // TEMPORARY: lets mode/model/seed/len be freely combined and re-laid-out
@@ -1120,9 +1140,10 @@
     const toolbar = diagram.parentElement.querySelector('.diagram-toolbar');
     const rawDotScript = diagram.querySelector('script.test-raw-dot');
     if (!toolbar || !rawDotScript) return;
-    const rawDot = JSON.parse(rawDotScript.textContent); // { withVars, noVars }
+    const rawDot = JSON.parse(rawDotScript.textContent); // { all: {withVars, noVars}, cyclic: {withVars, noVars} }
     const engineSelect = toolbar.querySelector('.gv-engine-select');
     const varsCheckbox = toolbar.querySelector('.gv-vars-toggle');
+    const cyclicCheckbox = toolbar.querySelector('.gv-cyclic-toggle');
     const modeSel = toolbar.querySelector('.test-mode-select');
     const modelSel = toolbar.querySelector('.test-model-select');
     const seedInput = toolbar.querySelector('.test-seed-input');
@@ -1143,10 +1164,12 @@
     async function renderCustom() {
       try {
         const graphviz = await loadGraphvizWasm();
-        // honor the vars checkbox — otherwise every test-control change re-drew
-        // the *with-vars* raw dot regardless of its current state, so
-        // variables silently came back the moment you touched a slider
-        const base = (!varsCheckbox || varsCheckbox.checked) ? rawDot.withVars : rawDot.noVars;
+        // honor both the vars AND the cyclic-only checkbox — otherwise every
+        // test-control change re-drew the *all, with-vars* raw dot regardless
+        // of either checkbox's current state, so both silently reset the
+        // moment you touched a slider
+        const variant = (cyclicCheckbox && cyclicCheckbox.checked) ? rawDot.cyclic : rawDot.all;
+        const base = (!varsCheckbox || varsCheckbox.checked) ? variant.withVars : variant.noVars;
         let dotText = base.replace(/len=[\d.]+/g, `len=${lenInput.value}`);
         const extra = [`start=${seedInput.value}`];
         if (modeSel.value) extra.push(`mode=${modeSel.value}`);
@@ -1172,6 +1195,9 @@
     // discarded by that swap
     if (varsCheckbox) {
       varsCheckbox.addEventListener('change', () => { if (!modeSel.disabled) renderCustom(); });
+    }
+    if (cyclicCheckbox) {
+      cyclicCheckbox.addEventListener('change', () => { if (!modeSel.disabled) renderCustom(); });
     }
     // engine dropdown swaps to a pre-baked SVG on its own (setupEngineSwitchable);
     // this only keeps the test controls' displayed values honest about what

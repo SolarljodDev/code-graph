@@ -365,7 +365,57 @@ function analyzeFunction(funcNode) {
   const typeNode = funcNode.childForFieldName('type');
   const signature = `${typeNode ? typeNode.text + ' ' : ''}${declarator ? declarator.text : ''}`
     .replace(/\s+/g, ' ');
-  return { calls, armCalls, derefNames, derefFields, access, signature };
+
+  // Names directly called inside this function's own top-level infinite loop
+  // (while(1)/for(;;) sitting as a direct statement of the body — not one
+  // nested inside some other loop/helper). Used to tell apart "runs once at
+  // boot" setup calls (main's clock/GPIO/peripheral init, all made *before*
+  // this loop) from what actually recurs at runtime — see cyclicFuncKeys in
+  // buildLevel0Diagram. Anywhere other than an entry point's own body this is
+  // vestigial (a plain function's while loop doesn't make its own callees
+  // "the runtime loop" — only entries seed cyclic-ness), but detecting it
+  // unconditionally here is simpler than special-casing "is this main".
+  const loopCallNames = new Set();
+  const loopNode = findTopLevelInfiniteLoop(body);
+  if (loopNode) {
+    walkTree(loopNode, n => {
+      if (n.type !== 'call_expression') return;
+      const fn = n.childForFieldName('function');
+      if (fn && fn.type === 'identifier') loopCallNames.add(fn.text);
+    });
+  }
+  // hasLoop is distinct from "loopCallNames is non-empty": a real for(;;)/
+  // while(1) whose body is just `__WFI();`/similar (sleep-until-interrupt,
+  // nothing internal to call) still means "we found the actual runtime loop,
+  // it just calls nothing worth tracking" — buildLevel0Diagram's cyclic seed
+  // must trust that (seed with the empty set) rather than falling back to the
+  // whole call tree, which is reserved for when no loop was found *at all*.
+  const hasLoop = !!loopNode;
+
+  return { calls, armCalls, derefNames, derefFields, derefFlags, access, signature, loopCallNames, hasLoop };
+}
+
+// A while/for statement that never terminates by its own condition — the
+// classic embedded "setup(); for(;;) { ... }" runtime-loop marker. Only
+// direct statements of the given body are checked (findTopLevelInfiniteLoop),
+// so a while(1) buried inside some unrelated helper never counts.
+function isInfiniteLoopCondition(node) {
+  if (!node) return true; // for(;;): no condition at all means "always true"
+  let n = node;
+  while (n.type === 'parenthesized_expression') n = n.namedChildren[0];
+  if (n.type === 'number_literal') return n.text !== '0';
+  if (n.type === 'true') return true;
+  if (n.type === 'identifier') return n.text === 'true' || n.text === 'TRUE';
+  return false;
+}
+function findTopLevelInfiniteLoop(bodyNode) {
+  if (!bodyNode || bodyNode.type !== 'compound_statement') return null;
+  for (const child of bodyNode.namedChildren) {
+    if (child.type === 'while_statement' || child.type === 'for_statement') {
+      if (isInfiniteLoopCondition(child.childForFieldName('condition'))) return child;
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -717,7 +767,10 @@ for (const f of fileRecords) {
       access: new Map(),     // varKey -> 'r' | 'w' | 'rw'
       periphAccess: new Map(), // peripheral name -> 'r' | 'w' | 'rw'
       periphFields: new Map(), // peripheral name -> Map(register -> 'r' | 'w' | 'rw')
+      periphFlags: new Map(),  // peripheral name -> Map(register -> Set(flag name))
       arms: new Set(),         // peripheral names this function directly NVIC_EnableIRQ's
+      loopCalls: new Set(),    // funcKeys called inside this function's own top-level infinite loop
+      hasLoop: fn.hasLoop,     // a top-level while(1)/for(;;) was found, even if loopCalls ends up empty
     };
     funcs.set(key, rec);
   }
@@ -744,6 +797,14 @@ for (const f of fileRecords) {
         if (calleeKey !== rec.key) rec.calls.add(calleeKey);
       } else {
         rec.extCalls.add(calleeName);
+      }
+    }
+    for (const calleeName of fn.loopCallNames) {
+      const candidates = functionsByName.get(calleeName);
+      if (candidates && candidates.length > 0) {
+        const target = candidates.find(c => c.basename === f.basename) || candidates[0];
+        const calleeKey = funcKey(calleeName, target.basename);
+        if (calleeKey !== rec.key) rec.loopCalls.add(calleeKey);
       }
     }
 
@@ -801,6 +862,15 @@ for (const f of fileRecords) {
           for (const [field, fm] of flds) {
             rf.set(field, mergeMode(rf.get(field), fm));
             p.fields.set(field, mergeMode(p.fields.get(field), fm));
+          }
+        }
+        const flagsByField = fn.derefFlags.get(name);
+        if (flagsByField) {
+          let rflag = rec.periphFlags.get(name);
+          if (!rflag) { rflag = new Map(); rec.periphFlags.set(name, rflag); }
+          for (const [field, flags] of flagsByField) {
+            if (!rflag.has(field)) rflag.set(field, new Set());
+            for (const fl of flags) rflag.get(field).add(fl);
           }
         }
         continue;
@@ -1172,11 +1242,26 @@ const dotKindRow = text => `<FONT POINT-SIZE="10">${dotEsc(text)}</FONT>`;
 // style= attribute replaces the inherited one, it doesn't merge with it)
 const GHOST_STYLE = ' style="filled,dashed"';
 
+// every flag name an ISR tests via `X->REG & FLAG` anywhere in its body
+// (see periphFlags/derefFlags) — deduped and capped, since a handler that
+// juggles several sources (e.g. a shared DMA IRQ) can rack up a dozen.
+function isrFlagList(fn, cap = 6) {
+  const all = new Set();
+  for (const regs of fn.periphFlags.values()) for (const flags of regs.values()) for (const f of flags) all.add(f);
+  if (!all.size) return '';
+  const sorted = [...all].sort();
+  const shown = sorted.slice(0, cap);
+  return shown.join(', ') + (sorted.length > cap ? `, +${sorted.length - cap}` : '');
+}
 function dotFnNode(fn, { ghost = false, withFile = false, focus = false } = {}) {
   const kind = fn.isISR ? 'ISR' : fn.isEntry ? 'main' : 'func';
   const rows = [dotKindRow(kind), `<B>${dotEsc(fn.name)}</B>`];
   if (withFile || ghost) rows.push(`<FONT POINT-SIZE="9">${dotEsc(fn.file)}</FONT>`);
   if (fn.desc && !ghost) rows.push(`<FONT POINT-SIZE="9"><I>${dotEsc(truncate(fn.desc, 46))}</I></FONT>`);
+  if (fn.isISR && !ghost) {
+    const flags = isrFlagList(fn);
+    if (flags) rows.push(`<FONT POINT-SIZE="9">флаги: ${dotEsc(flags)}</FONT>`);
+  }
   const cls = ghost ? 'ghost' : fnClass(fn);
   const extra = (ghost ? GHOST_STYLE : '') + (focus ? ' penwidth=3' : '');
   return dotNode(fnId(fn.key), rows, 'box', cls, extra);
@@ -1382,24 +1467,22 @@ async function renderDotAll(coreNodeLines, coreEdgeLines, varNodeLines = [], var
 // one collapsible "data channel" node instead of one node each, so a dozen
 // buffers that all flow main -> DMA1_Channel2_IRQHandler read as a single
 // thick edge instead of a dozen parallel ones.
-async function buildLevel0Diagram() {
-  const entries = [...funcs.values()].filter(f => f.isEntry || f.isISR);
-  if (entries.length === 0) return null;
-
-  const varInfo = new Map();      // entryKey -> Map(varKey -> {r, w, direct})
-  const periphInfo = new Map();   // entryKey -> Map(periphName -> {r, w, direct})
-  const periphFieldInfo = new Map(); // entryKey -> Map(periphName -> Map(register -> mode)), unioned across the whole call tree
-  const armInfo = new Map();      // entryKey -> Set(periphName) directly or via call tree
-
+// One entry's call-tree aggregation (which vars/peripherals/arms it reaches,
+// and whether each is touched *directly* by the entry itself vs somewhere
+// down the tree), seeded by seedFn(entry) — normally just the entry's own
+// calls (the whole tree), but buildLevel0Diagram's "cyclic" variant instead
+// seeds from just what runs inside the entry's own top-level infinite loop,
+// to leave one-time boot/setup calls unvisited entirely. "direct" only ever
+// means "the entry key itself", regardless of seeding — matches the original
+// solid/dashed convention (dotAccessLink et al) untouched.
+function aggregateEntryInfo(entries, seedFn) {
+  const varInfo = new Map(), periphInfo = new Map(), periphFieldInfo = new Map(), armInfo = new Map();
   for (const e of entries) {
     const vAcc = new Map(), pAcc = new Map(), aAcc = new Set(), pFields = new Map();
     const seen = new Set([e.key]);
-    const queue = [e.key];
-    while (queue.length) {
-      const k = queue.shift();
+    function absorb(k, direct) {
       const f = funcs.get(k);
-      if (!f) continue;
-      const direct = k === e.key;
+      if (!f) return;
       for (const [vk, m] of f.access) {
         const cur = vAcc.get(vk) || { r: false, w: false, direct: false };
         if (m.includes('r')) cur.r = true;
@@ -1420,17 +1503,32 @@ async function buildLevel0Diagram() {
         for (const [reg, m] of fields) rf.set(reg, mergeMode(rf.get(reg), m));
       }
       for (const pk of f.arms) aAcc.add(pk);
-      for (const c of f.calls) if (!seen.has(c)) { seen.add(c); queue.push(c); }
+    }
+    absorb(e.key, true);
+    const queue = [];
+    for (const seed of seedFn(e)) if (!seen.has(seed)) { seen.add(seed); queue.push(seed); }
+    while (queue.length) {
+      const k = queue.shift();
+      absorb(k, false);
+      const f = funcs.get(k);
+      if (f) for (const c of f.calls) if (!seen.has(c)) { seen.add(c); queue.push(c); }
     }
     varInfo.set(e.key, vAcc);
     periphInfo.set(e.key, pAcc);
     periphFieldInfo.set(e.key, pFields);
     armInfo.set(e.key, aAcc);
   }
+  return { varInfo, periphInfo, periphFieldInfo, armInfo };
+}
 
-  // --- variables: level 0 is about *exchange* between entry points, so show
-  // a var only when one entry tree writes it and a different one reads it.
-  // Vars local to a single call tree stay on their file/function pages.
+// Builds one Level 0 variant's node/edge lines from an aggregateEntryInfo()
+// result — idPrefix keeps this variant's var-bundle ids (bnd_0, bnd_1, ...)
+// from colliding with the *other* variant's when both sets of extraNodes get
+// merged into one page (same bundle-count coincidence would otherwise mean
+// two totally different variable lists sharing one id and one tooltip).
+function assembleLevel0(entries, info, idPrefix) {
+  const { varInfo, periphInfo, periphFieldInfo, armInfo } = info;
+
   const allVarKeys = new Set();
   for (const acc of varInfo.values()) for (const vk of acc.keys()) allVarKeys.add(vk);
   const showVars = [...allVarKeys].filter(vk => {
@@ -1440,11 +1538,7 @@ async function buildLevel0Diagram() {
       accs.some(e2 => e2 !== e1 && varInfo.get(e2.key).get(vk).r));
   });
 
-  // group vars by which entries are involved at all — not by the exact
-  // writers-vs-readers split. Two vars touched by the same {A, B} pair land
-  // in one barrel whether it's "A writes, B reads" or "both read and write",
-  // instead of splintering into a separate barrel per distinct combination.
-  const bundleMap = new Map(); // sigKey -> { involved:[entryKey], vars:[varKey] }
+  const bundleMap = new Map();
   for (const vk of showVars) {
     const involved = entries.filter(e => varInfo.get(e.key).has(vk)).map(e => e.key).sort();
     const sig = involved.join(',');
@@ -1463,8 +1557,6 @@ async function buildLevel0Diagram() {
     varCapNote = `показаны ${LEVEL0_MAX_UNITS} самых используемых каналов данных из ${total}`;
   }
 
-  // --- peripherals: show everything any entry's call tree drives, arms, or
-  // that fires into an entry by name match
   const usedPeriphs = new Set();
   for (const e of entries) {
     for (const pk of periphInfo.get(e.key).keys()) usedPeriphs.add(pk);
@@ -1483,9 +1575,6 @@ async function buildLevel0Diagram() {
     periphCapNote = `показаны ${LEVEL0_MAX_PERIPHS} самых задействованных узлов периферии из ${total}`;
   }
 
-  // --- assemble --- (core = entries/peripherals, shown regardless of the
-  // "переменные" toggle; var* = variable/bundle nodes and every edge
-  // touching one, entirely omitted — not hidden — from the no-vars render)
   const nodeLines = [];
   const edgeLines = [];
   const varNodeLines = [];
@@ -1493,12 +1582,6 @@ async function buildLevel0Diagram() {
   for (const e of entries) nodeLines.push(dotFnNode(e));
   for (const p of periphList) nodeLines.push(dotPeriphNode(p));
 
-  // A bundle can be shared by both "mostly writing" and "mostly reading"
-  // entries at once — there's no single true direction for the edge set as
-  // a whole. Deciding it once per bundle (majority of involved entries that
-  // write vs read it) keeps every edge into that bundle pointing the same
-  // way, so it isn't pulled toward opposite sides of the diagram by its own
-  // different entries.
   function bundleDownstream(b) {
     let w = 0, r = 0;
     for (const ek of b.involved) {
@@ -1542,18 +1625,11 @@ async function buildLevel0Diagram() {
     }
   }
 
-  // Each bundle is one node holding the full alphabetical list of its
-  // variable names, never exploded into one node per variable — every member
-  // still connects through the same one edge per involved entry.
-  //
-  // Bundle ids (bnd_0, bnd_1, ...) aren't real entities in graph-data.js —
-  // extraNodes carries just enough for this page's hover/click highlighting
-  // and tooltip to recognize them too (see PAGE_EXTRA_NODES in viewer.js).
   let gi = 0;
   const extraNodes = {};
   const multiSizes = multi.map(b => b.vars.length);
   for (const b of multi) {
-    const id = `bnd_${gi++}`;
+    const id = `bnd_${idPrefix}${gi++}`;
     const downstream = bundleDownstream(b);
     const vars = b.vars.map(vk => varDefs.get(vk));
     varNodeLines.push(dotVarBundleNode(id, vars, sizeTier(vars.length, multiSizes)));
@@ -1568,8 +1644,46 @@ async function buildLevel0Diagram() {
   }
 
   const note = [varCapNote, periphCapNote].filter(Boolean).join('; ');
-  const { svgs, hasVars, testRawDot } = await renderDotAll(nodeLines, edgeLines, varNodeLines, varEdgeLines);
-  return { svgs, varsToggle: hasVars, note, extraNodes, testRawDot };
+  return { nodeLines, edgeLines, varNodeLines, varEdgeLines, extraNodes, note };
+}
+
+async function buildLevel0Diagram() {
+  const entries = [...funcs.values()].filter(f => f.isEntry || f.isISR);
+  if (entries.length === 0) return null;
+
+  const allInfo = aggregateEntryInfo(entries, e => [...e.calls]);
+  const all = assembleLevel0(entries, allInfo, 'a');
+  const { svgs, hasVars, testRawDot } = await renderDotAll(all.nodeLines, all.edgeLines, all.varNodeLines, all.varEdgeLines);
+
+  // "cyclic-only": entries whose own top-level infinite loop was found (see
+  // findTopLevelInfiniteLoop) are seeded from *just* that loop's own calls
+  // instead of their whole call tree, so one-time setup (main's clock/GPIO/
+  // peripheral init, all made *before* the loop) is never visited at all —
+  // an entry with no detected loop falls back to its whole tree rather than
+  // silently vanishing. ISRs always use their whole tree: an ISR firing at
+  // all *is* the cyclic/runtime behavior, it has no "setup phase" of its own.
+  const cyclicInfo = aggregateEntryInfo(entries, e => (e.isISR ? [...e.calls] : (e.hasLoop ? [...e.loopCalls] : [...e.calls])));
+  const cyclic = assembleLevel0(entries, cyclicInfo, 'c');
+  const cyclicRender = await renderDotAll(cyclic.nodeLines, cyclic.edgeLines, cyclic.varNodeLines, cyclic.varEdgeLines);
+  for (const [k, v] of Object.entries(cyclicRender.svgs)) svgs[`${k}_cyclic`.replace('_novars_cyclic', '_cyclic_novars')] = v;
+  // "_novars_cyclic" -> "_cyclic_novars": renderDotAll's own keys are
+  // "<engine>"/"<engine>_novars"; appending "_cyclic" after the fact needs to
+  // land the segment in the same order wireDiagramToolbar/setupEngineSwitchable
+  // build it in client-side (<engine>_cyclic_novars, not <engine>_novars_cyclic)
+
+  // TEMPORARY: same shape either way ({withVars, noVars}), just also split by
+  // the cyclic toggle now — see wireNeatoModeTester in viewer.js, which reads
+  // both checkboxes to pick the right one of these four.
+  const combinedTestRawDot = testRawDot ? { all: testRawDot, cyclic: cyclicRender.testRawDot } : undefined;
+
+  return {
+    svgs,
+    varsToggle: hasVars,
+    cyclicToggle: entries.some(e => e.isISR || e.hasLoop),
+    note: [all.note, cyclic.note].filter(Boolean).join('; '),
+    extraNodes: { ...all.extraNodes, ...cyclic.extraNodes },
+    testRawDot: combinedTestRawDot,
+  };
 }
 
 async function buildFunctionDiagram(fn) {
@@ -1813,7 +1927,7 @@ ${body}
 // page-wide nav) since they're properties of this one diagram, not a
 // page-wide setting; varsToggle is only worth showing on diagrams that
 // actually mix in variable nodes (not aggregate/include, which are file-only).
-function diagramBlockSvg(svgs, { defaultEngine = 'neato', varsToggle = true, diagramId = 'gv', focus, testRawDot } = {}) {
+function diagramBlockSvg(svgs, { defaultEngine = 'neato', varsToggle = true, cyclicToggle = false, diagramId = 'gv', focus, testRawDot } = {}) {
   return `<div class="diagram-wrap">
 <div class="diagram" data-engine="graphviz" data-cur-engine="${defaultEngine}" data-diagram-id="${diagramId}"${focus ? ` data-focus="${focus}"` : ''} tabindex="-1">
 <div class="zoombar">
@@ -1825,7 +1939,7 @@ function diagramBlockSvg(svgs, { defaultEngine = 'neato', varsToggle = true, dia
 ${testRawDot ? `<script type="application/json" class="test-raw-dot">${JSON.stringify(testRawDot)}</script>` : ''}
 </div>
 <div class="diagram-toolbar">
-${varsToggle ? '  <label class="gv-ctrl"><input type="checkbox" class="gv-vars-toggle" checked> переменные</label>\n' : ''}  <select class="gv-engine-select">
+${varsToggle ? '  <label class="gv-ctrl"><input type="checkbox" class="gv-vars-toggle" checked> переменные</label>\n' : ''}${cyclicToggle ? '  <label class="gv-ctrl"><input type="checkbox" class="gv-cyclic-toggle"> только цикличное</label>\n' : ''}  <select class="gv-engine-select">
     <option value="neato"${defaultEngine === 'neato' ? ' selected' : ''}>органично</option>
     <option value="dot"${defaultEngine === 'dot' ? ' selected' : ''}>иерархично</option>
     <option value="fdp"${defaultEngine === 'fdp' ? ' selected' : ''}>силовое</option>
@@ -1967,7 +2081,7 @@ fs.copyFileSync(path.join(here, 'viewer.js'), path.join(outDir, 'app.js'));
 
   const level0 = await buildLevel0Diagram();
   const level0Diagram = level0
-    ? diagramBlockSvg(level0.svgs, { diagramId: 'level0', varsToggle: level0.varsToggle, testRawDot: level0.testRawDot })
+    ? diagramBlockSvg(level0.svgs, { diagramId: 'level0', varsToggle: level0.varsToggle, cyclicToggle: level0.cyclicToggle, testRawDot: level0.testRawDot })
     : '';
   const overview = await buildOverviewDiagram();
   const overviewDiagram = diagramBlockSvg(overview.svgs, { diagramId: 'overview', varsToggle: overview.varsToggle });
