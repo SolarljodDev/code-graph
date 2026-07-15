@@ -11,7 +11,7 @@
 
 ## Пайплайн `index.mjs` (один проход, без модулей)
 
-Файл — линейный скрипт 1898 строк, не разбитый на модули; функции выше по файлу — примитивы
+Файл — линейный скрипт ~1800 строк, не разбитый на модули; функции выше по файлу — примитивы
 (обход AST, работа со строками), ниже — стадии, которые используют накопленное состояние.
 Порядок выполнения:
 
@@ -25,13 +25,28 @@
    Результат копится в module-level `Map`ах: `funcs`, `varDefs`, `peripherals`, `fileRecords`.
 3. **Score/tier** (`varTier`, `sizeTier`, `fnClass`, `varClass`) — на основе накопленных
    связей считается важность переменной (кол-во читателей/писателей) для визуальных tier'ов.
-4. **Build diagrams** (`build*Diagram` — overview/aggregate/include/file/level0/function/cfg) —
-   каждая функция берёт срез из `funcs`/`varDefs`/`peripherals` и генерирует mermaid-код;
-   `groupedDiagramBlock` сворачивает то, что не влезает, в кликабельные grey-box группы.
-5. **Render** — `htmlPage`/`diagramBlock` оборачивают diagram-код в HTML; в конце скрипта
+4. **Build diagrams** (`build*Diagram` — overview/aggregate/include/file/level0/function/cfg,
+   все async) — каждая функция берёт срез из `funcs`/`varDefs`/`peripherals` и генерирует DOT
+   через общие эмиттеры (`dotFnNode`/`dotVarNode`/`dotPeriphNode`/`dotFileNode`/`dotEdge`/...,
+   рядом с `buildLevel0Diagram`), затем `renderDotAll` считает раскладку **на сборке** через
+   WASM (`@hpcc-js/wasm-graphviz`) сразу всеми движками из `LEVEL0_ENGINES` (`neato`/`dot`/`fdp`).
+   Все семь типов диаграмм — на graphviz; выбор движка по умолчанию зависит от формы графа, не
+   единый для всех: file/level0/overview — `neato` (хаб-структуры, циклы через периферию, ранговая
+   раскладка сминает их в столбцы), include/function/cfg — `dot` (файлы/вызовы/control-flow —
+   DAG с одной точкой входа или явной иерархией, ранговая раскладка тут как раз к месту).
+   Переключение движка в браузере (`setupEngineSwitchable` в `viewer.js`) — подмена уже
+   готового SVG, не пересчёт. Раньше большие file-диаграммы сворачивались в кликабельные
+   grey-box группы (`groupedDiagramBlock`/`setupGroupedDiagram`) — эта механика убрана вместе
+   с переходом file-диаграмм на graphviz: он не упирается в то же ограничение по размеру, что
+   раньше было у ELK, так что сворачивать стало незачем.
+5. **Render** — `htmlPage`/`diagramBlockSvg` оборачивают diagram-код в HTML; в конце скрипта
    (после определения всех функций) идут три плоских блока без обёртки в function: запись
    `graph-data.js` (per-node metadata для тултипов), `index.html`, по одной странице на файл
    и на функцию в `filesDir`/`funcsDir`.
+
+   mermaid+ELK полностью убраны (были рантаймом в `viewer.js` до перехода всех диаграмм на
+   graphviz): нет ни зависимостей (`mermaid`/`@mermaid-js/layout-elk`/`esbuild`), ни
+   `viewer-entry.mjs`/`dist/`, ни копирования `mermaid-elk.min.js` в сгенерированный сайт.
 
 Всё состояние — module-level переменные, а не передаваемые аргументы; стадии друг за другом
 читают то, что накопили предыдущие. Добавлять новую стадию — значит вставлять код в нужную
@@ -44,11 +59,8 @@
   `index.mjs` при генерации примера в `graph-html/`. Править надо только `viewer.js`;
   `graph-html/app.js` перезатирается при следующей генерации и не должен расходиться с ним.
 - `graph-html/` целиком — закоммиченный **пример вывода** инструмента (сгенерированный сайт),
-  не исходный код. `graph-html/index.html`, `graph-html/graph-data.js`,
-  `graph-html/mermaid-elk.min.js` — всё это артефакты, не редактируются руками.
-- `viewer-entry.mjs` — исходник для esbuild-бандла (mermaid + ELK layout → один IIFE).
-  `dist/mermaid-elk.min.js` — закэшированный результат сборки (`ensureViewerBundle` в
-  `index.mjs`, строки ~1714), пересобирается только когда `viewer-entry.mjs` новее файла в `dist/`.
+  не исходный код. `graph-html/index.html`, `graph-html/graph-data.js` — артефакты, не
+  редактируются руками.
 - `codegraph.ps1`/`codegraph.cmd` — самостоятельный drop-in лаунчер для чужих проектов:
   клонирует этот репозиторий в `%LOCALAPPDATA%\code-graph`, ставит зависимости и запускает
   `node index.mjs`. Он не импортирует ничего из этого репо напрямую — держи в уме, что правки
@@ -60,5 +72,8 @@
   плоский `window.GRAPH.nodes`, ключ — id ноды (`fnId`/`varId`/`periphId`/`file_<name>`),
   значение — всё нужное для тултипа. Если добавляешь новое поле для тултипа, оно должно
   появиться и здесь (в блоке "graph-data.js" в `index.mjs`), и в чтении на стороне `viewer.js`.
-- Каждая HTML-страница самодостаточна: mermaid-код инлайнится в `<script>` на странице,
-  `app.js`/`graph-data.js`/`mermaid-elk.min.js` — единственные общие ассеты между страницами.
+- Каждая HTML-страница самодостаточна: уже готовый SVG инлайнится прямо в разметку
+  (`diagramBlockSvg`), плюс скрытый `<script type="application/json" class="engine-data">` с
+  SVG остальных движков для мгновенного переключения в браузере. `app.js`/`graph-data.js` —
+  общие ассеты между страницами; у graphviz-диаграмм собственного бандла в браузере нет —
+  `@hpcc-js/wasm-graphviz` нужен только на сборке (в Node), не подключается ни на одной странице.

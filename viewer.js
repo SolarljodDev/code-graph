@@ -1,23 +1,28 @@
 /* Runtime for generated pages (copied into the output as app.js).
-   Renders mermaid diagrams with the ELK layout engine, then adds:
+   Every diagram ships as an already-laid-out graphviz SVG, computed at
+   build time (index.mjs) — this file only adds interactivity on top:
+   - pan/zoom/maximize on the pre-rendered SVG;
    - hover highlighting: a node lights up together with every edge from/to it
      and its direct neighbors, everything else fades;
-   - a tooltip near the cursor fed from graph-data.js (window.GRAPH). */
+   - a tooltip near the cursor fed from graph-data.js (window.GRAPH);
+   - per-diagram engine switching (dot/neato/fdp) and a variables toggle,
+     both instant since every engine's SVG is already pre-built. */
 (function () {
   'use strict';
 
-  // mermaid + the ELK layout engine keep some state (id counters, layout
-  // workers) global to the page rather than scoped per diagram, so two
-  // mermaid.run() calls in flight at once — e.g. expanding two bochkas back
-  // to back before the first finishes — can corrupt each other's node-size
-  // measurement, leaving a node stuck at its pre-layout default size with
-  // text that no longer fits. Every mermaid.run() on the page is funneled
-  // through this queue so only one is ever running at a time.
-  let renderQueue = Promise.resolve();
-  function queueRender(task) {
-    const run = renderQueue.then(task, task);
-    renderQueue = run.catch(() => {});
-    return run;
+  // Chrome disables Web Storage for file:// pages by default (this tool's
+  // primary way of being opened — "open index.html in a browser", no server
+  // needed), so localStorage.setItem throws there. A dropdown's change
+  // handler that does `localStorage.setItem(...); onChange(...)` silently
+  // never reaches onChange when that throws — the setting just looks inert.
+  // Falling back to an in-memory Map keeps the current tab's picks working
+  // even when nothing can persist across reloads.
+  const memoryStorage = new Map();
+  function storageGet(key) {
+    try { return localStorage.getItem(key); } catch (e) { return memoryStorage.get(key) ?? null; }
+  }
+  function storageSet(key, value) {
+    try { localStorage.setItem(key, value); } catch (e) { memoryStorage.set(key, String(value)); }
   }
 
   // Position within a diagram is tracked as an explicit translate + scale on
@@ -76,7 +81,7 @@
     let drag = null;
     diagram.addEventListener('pointerdown', ev => {
       if (ev.button !== 0) return;
-      if (ev.target.closest('g.node, .edgePaths, .edgeLabels, .zoombar')) return;
+      if (ev.target.closest('g.node, g.edge, .zoombar')) return;
       // stop the browser's native text/element drag-selection from starting —
       // otherwise a press-drag that happens to start over an SVG text node
       // paints a selection instead of (or as well as) panning
@@ -195,7 +200,10 @@
   }
 
   window.toggleMaximize = function (btn) {
-    const diagram = btn.parentElement.querySelector('.diagram');
+    // btn's own parent is .diagram-toolbar for a graphviz diagram (or
+    // .diagram-wrap directly for a plain one) — .diagram-wrap is the
+    // reliable common ancestor to search from either way
+    const diagram = btn.closest('.diagram-wrap').querySelector('.diagram');
     setMaximized(diagram, !diagram.classList.contains('maximized'));
     homeFit(diagram);
     // the button lives outside .diagram, so a native click doesn't leave
@@ -254,41 +262,12 @@
     return href ? (window.PAGE_REL || '') + href : null;
   }
 
-  // mermaid v11 node ids look like: mermaid-<ts>-flowchart-<ourId>-<n>
-  function nodeKeyFromDomId(domId, known) {
-    if (known.has(domId)) return domId;
-    let m = domId.match(/flowchart-(.+?)-\d+$/);
-    if (m && known.has(m[1])) return m[1];
-    m = domId.match(/^(.+?)-\d+$/);
-    if (m && known.has(m[1])) return m[1];
-    return null;
-  }
-
-  // mermaid v11 edge paths carry data-id="L_<from>_<to>_<n>"; older versions
-  // used LS-/LE- classes. Both endpoint ids may contain underscores, so the
-  // L_ form is resolved against the known node-id list.
-  function edgeEndpoints(el, known) {
-    let from = null, to = null;
-    for (const c of el.classList) {
-      if (c.indexOf('LS-') === 0) from = c.slice(3);
-      if (c.indexOf('LE-') === 0) to = c.slice(3);
-    }
-    if (from && to) return [from, to];
-    const raw = (el.dataset && el.dataset.id) || el.id || '';
-    const id = raw.replace(/^mermaid-\d+-/, '');
-    if (id.indexOf('L_') === 0) {
-      const body = id.slice(2).replace(/_\d+$/, '');
-      for (const a of known) {
-        if (body.indexOf(a + '_') === 0) {
-          const b = body.slice(a.length + 1);
-          if (known.has(b)) return [a, b];
-        }
-      }
-    }
-    return null;
-  }
-
-  const escHtml = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  // also escapes '>' (not just '&'/'<'): needed wherever this feeds a
+  // graphviz HTML-like label=<...> block (setupRelationsDiagram) — a raw
+  // '->' in a function's doc-comment description (common in this codebase)
+  // otherwise corrupts the label's own delimiters and silently breaks that
+  // render. Matches index.mjs's server-side dotEsc, which already does this.
+  const escHtml = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
   const tip = document.createElement('div');
   tip.className = 'tip';
@@ -311,79 +290,92 @@
     return h;
   }
 
+  // Which side of the cursor the tip grows toward: *behind* the direction
+  // the cursor is travelling in — trailing where it came from rather than
+  // sitting ahead of it, which otherwise put the tip directly in the way of
+  // continued movement in that direction. lastMouseX/Y and tipDirX/Y persist
+  // across calls (module-level, not per-diagram) so direction survives
+  // between events; TIP_DIR_THRESHOLD keeps a stray pixel of hand tremor
+  // between two mousemove events from flipping the side back and forth —
+  // direction only updates once actual travel since the last call clears
+  // that threshold, otherwise it keeps the last known direction (sticky
+  // through a momentary pause, and a sane default of down-right/tip-up-left
+  // before any movement has ever been recorded this page load).
+  let lastMouseX = null, lastMouseY = null;
+  let tipDirX = 1, tipDirY = 1;
+  const TIP_DIR_THRESHOLD = 6;
   function moveTip(ev) {
     const pad = 14;
     const r = tip.getBoundingClientRect();
-    let x = ev.clientX + pad, y = ev.clientY + pad;
-    if (x + r.width > window.innerWidth - 8) x = ev.clientX - r.width - pad;
-    if (y + r.height > window.innerHeight - 8) y = ev.clientY - r.height - pad;
+    if (lastMouseX !== null) {
+      const dx = ev.clientX - lastMouseX, dy = ev.clientY - lastMouseY;
+      if (Math.abs(dx) >= TIP_DIR_THRESHOLD) tipDirX = dx > 0 ? 1 : -1;
+      if (Math.abs(dy) >= TIP_DIR_THRESHOLD) tipDirY = dy > 0 ? 1 : -1;
+    }
+    lastMouseX = ev.clientX;
+    lastMouseY = ev.clientY;
+    let x = tipDirX > 0 ? ev.clientX - r.width - pad : ev.clientX + pad;
+    let y = tipDirY > 0 ? ev.clientY - r.height - pad : ev.clientY + pad;
+    // still clamp inside the viewport — the travel direction can still land
+    // the tip off-screen near the window's own edge
+    x = Math.max(8, Math.min(x, window.innerWidth - r.width - 8));
+    y = Math.max(8, Math.min(y, window.innerHeight - r.height - 8));
     tip.style.left = x + 'px';
     tip.style.top = y + 'px';
   }
 
-  function setupSvg(svg, opts) {
-    opts = opts || {};
-    const onNodeClick = opts.onNodeClick; // (key, ev) => true if it handled the click itself
-    const G = nodes();
+  // hoisted out of setupGraphvizSvg so setupRelationsDiagram (a different
+  // node/edge wiring for the same tooltip) can share it instead of
+  // duplicating the info-lookup + render logic
+  function hideTip() { tip.style.display = 'none'; }
+  function showTip(key, ev) {
+    const info = nodes()[key];
+    if (!info) { hideTip(); return; }
+    tip.innerHTML = tipHtml(info);
+    tip.style.display = 'block';
+    moveTip(ev);
+  }
+
+  // Every diagram ships as an already-laid-out graphviz SVG (built at build
+  // time, not rendered in the browser), so node/edge discovery is simple:
+  // our own ids are already the SVG ids, and edges carry their endpoints in
+  // a <title>from-&gt;to</title>.
+  function setupGraphvizSvg(svg) {
     const known = knownKeys();
-    if (opts.extraKeys) for (const k of opts.extraKeys) known.add(k);
-    const nodeEls = new Map(); // graph key -> [dom elements]
+    const nodeEls = new Map();
     svg.querySelectorAll('g.node[id]').forEach(el => {
-      const key = nodeKeyFromDomId(el.id, known);
-      if (!key) return;
-      if (!nodeEls.has(key)) nodeEls.set(key, []);
-      nodeEls.get(key).push(el);
+      if (known.has(el.id)) nodeEls.set(el.id, [el]);
     });
 
-    const paths = Array.from(svg.querySelectorAll('.edgePaths path, path.flowchart-link'));
-    const labels = Array.from(svg.querySelectorAll('.edgeLabels .edgeLabel'));
-    const pairLabels = labels.length === paths.length;
     const edges = [];
-    paths.forEach((el, i) => {
-      const ep = edgeEndpoints(el, known);
-      if (ep) edges.push({ el, labelEl: pairLabels ? labels[i] : null, from: ep[0], to: ep[1] });
+    svg.querySelectorAll('g.edge').forEach(el => {
+      const title = el.querySelector('title');
+      const parts = title ? title.textContent.split('->') : null;
+      if (parts && parts.length === 2 && known.has(parts[0]) && known.has(parts[1])) {
+        edges.push({ el, from: parts[0], to: parts[1] });
+      }
     });
 
-    // null = following the hover; a string = a node/edge click has pinned
-    // the highlight so moving the mouse over other elements does nothing,
-    // until the user clicks empty background to release it. The tooltip is
-    // deliberately NOT part of what's pinned — it always tracks genuine
-    // hover, or it's left behind as a stale box once the cursor moves away.
     let locked = null;
-
-    function hideTip() { tip.style.display = 'none'; }
-
     function clearHighlight() {
       svg.classList.remove('fade');
       svg.querySelectorAll('.hl').forEach(el => el.classList.remove('hl'));
     }
-
-    function showTip(key, ev) {
-      const info = G[key];
-      if (!info) { hideTip(); return; }
-      tip.innerHTML = tipHtml(info);
-      tip.style.display = 'block';
-      moveTip(ev);
-    }
-
     function highlightNode(key) {
       svg.classList.add('fade');
       const on = new Set([key]);
       for (const e of edges) {
         if (e.from === key || e.to === key) {
           e.el.classList.add('hl');
-          if (e.labelEl) e.labelEl.classList.add('hl');
           on.add(e.from);
           on.add(e.to);
         }
       }
       for (const k of on) (nodeEls.get(k) || []).forEach(el => el.classList.add('hl'));
     }
-
     function highlightEdge(e) {
       svg.classList.add('fade');
       e.el.classList.add('hl');
-      if (e.labelEl) e.labelEl.classList.add('hl');
       [e.from, e.to].forEach(k => (nodeEls.get(k) || []).forEach(el => el.classList.add('hl')));
     }
 
@@ -404,8 +396,7 @@
         });
         el.addEventListener('click', ev => {
           ev.stopPropagation();
-          if (onNodeClick && onNodeClick(key, ev)) return; // e.g. a group placeholder expanding in place
-          if (locked === key) { locked = null; clearHighlight(); return; } // click again: unlock
+          if (locked === key) { locked = null; clearHighlight(); return; }
           locked = key;
           clearHighlight();
           highlightNode(key);
@@ -420,7 +411,7 @@
     for (const e of edges) {
       const edgeKey = 'edge:' + e.from + '>' + e.to;
       e.el.addEventListener('mouseenter', () => {
-        hideTip(); // edges carry no tooltip info of their own
+        hideTip();
         if (locked) return;
         clearHighlight();
         highlightEdge(e);
@@ -434,85 +425,615 @@
         highlightEdge(e);
       });
     }
-    // click on empty background (bubbled up, not stopped by a node/edge handler)
     svg.addEventListener('click', () => { if (locked) { locked = null; clearHighlight(); } });
   }
 
-  // A "grouped" file diagram ships fully collapsed (one grey placeholder per
-  // neighboring file / variable-importance tier) plus a hidden JSON blob with
-  // everything needed to expand any single group in place: clicking a
-  // placeholder recomposes the mermaid source with that group's real nodes
-  // swapped in and re-renders — nothing was ever deleted, just folded up.
-  function setupGroupedDiagram(diagram) {
-    const script = diagram.querySelector('script.group-data');
-    if (!script) return null;
-    let data;
-    try { data = JSON.parse(script.textContent); } catch (e) { return null; }
-    const expanded = new Set();
-    const groupByAnyId = new Map();
-    for (const g of data.groups) groupByAnyId.set(g.id, g);
+  // --- function-page "Связи": click a caller/callee to walk the call chain ---
+  //
+  // Unlike every other diagram, this one isn't fixed at build time: the base
+  // 1-hop view (focus + its direct callers/callees, already baked into the
+  // page) can be extended arbitrarily deep by clicking a node, one hop at a
+  // time, independently on the caller side and the callee side. Doing that
+  // against a diagram that already contains every hidden node (laid out once,
+  // up front, with space reserved for all of it) would route edges around
+  // holes for nodes the user never asked to see — so instead every click
+  // rebuilds a dot subgraph containing only what should currently be visible
+  // and re-lays it out with graphviz-wasm.js (lazy-loaded on first use),
+  // giving a clean layout every time instead of a static one with gaps.
+  let gvPromise = null;
+  function loadGraphvizWasm() {
+    if (gvPromise) return gvPromise;
+    gvPromise = new Promise((resolve, reject) => {
+      if (window.GraphvizWasm) { resolve(window.GraphvizWasm); return; }
+      const s = document.createElement('script');
+      s.src = (window.PAGE_REL || '') + 'graphviz-wasm.js';
+      s.onload = () => resolve(window.GraphvizWasm);
+      s.onerror = () => reject(new Error('graphviz-wasm.js failed to load'));
+      document.head.appendChild(s);
+    }).then(w => w.Graphviz.load());
+    return gvPromise;
+  }
 
-    function compose() {
-      const parts = ['flowchart LR', ...data.classDefs.map(c => '  ' + c), ...data.baseLines];
-      for (const g of data.groups) {
-        if (expanded.has(g.id)) parts.push(...g.realLines, ...g.expandedEdges);
-        else parts.push(g.phLine, ...g.collapsedEdges);
+  const relTrunc = (s, n) => (s.length > n ? s.slice(0, n - 1).replace(/\s+\S*$/, '') + '…' : s);
+  const RELKIND = { isr: 'ISR', entry: 'main', fn: 'func' };
+
+  function relFnNodeLine(id, info, sameFile, pos = '') {
+    const rows = [`<FONT POINT-SIZE="10">${escHtml(RELKIND[info.kind] || 'func')}</FONT>`,
+      `<B>${escHtml(info.label)}</B>`];
+    if (info.file && !sameFile) rows.push(`<FONT POINT-SIZE="9">${escHtml(info.file)}</FONT>`);
+    if (info.desc) rows.push(`<FONT POINT-SIZE="9"><I>${escHtml(relTrunc(info.desc, 46))}</I></FONT>`);
+    return `  ${id} [id="${id}"${pos} class="${info.kind}" shape=box label=<${rows.join('<BR/>')}>];`;
+  }
+  function relVarNodeLine(id, info, sameFile, pos = '') {
+    const kindLabel = info.kind === 'extvar' ? 'ext var' : info.kind === 'gvolatile' ? 'volatile' : 'var';
+    const cls = info.kind === 'extvar' ? 'ghost' : 'gvar';
+    const nameColor = info.kind === 'gvolatile' ? ' COLOR="#dc2626"' : '';
+    const rows = [`<FONT POINT-SIZE="10">${escHtml(kindLabel)}</FONT>`, `<B${nameColor}>${escHtml(info.label)}</B>`];
+    const sub = [];
+    if (info.type) sub.push(escHtml(info.type));
+    if (info.static) sub.push('static');
+    if (info.file && !sameFile) sub.push(escHtml(info.file));
+    if (sub.length) rows.push(`<FONT POINT-SIZE="9">${sub.join(' &#183; ')}</FONT>`);
+    return `  ${id} [id="${id}"${pos} class="${cls}" shape=cylinder label=<${rows.join('<BR/>')}>];`;
+  }
+  const REL_MODE_WORD = { r: 'чтение', w: 'запись', rw: 'чтение/запись' };
+  // peripheral block on a function's "Связи" diagram — kept compact (just the
+  // name); the specific registers this function touches go on the edge label
+  // instead (see relPeriphRegLabel), mirroring the build-time dotPeriphRelNode
+  // + periphRegEdgeLabel split so a client re-layout looks identical.
+  function relPeriphNodeLine(id, name, pos = '') {
+    const rows = [`<FONT POINT-SIZE="10">периферия</FONT>`, `<B>${escHtml(name)}</B>`];
+    return `  ${id} [id="${id}"${pos} class="periph" shape=hexagon label=<${rows.join('<BR/>')}>];`;
+  }
+  // one direction for the whole fn<->periph edge, from the register modes
+  function relPeriphMode(regs) {
+    let r = false, w = false;
+    for (const x of regs) { if (x.mode.includes('r')) r = true; if (x.mode.includes('w')) w = true; }
+    return r && w ? 'rw' : w ? 'w' : 'r';
+  }
+  // "CCR: запись\nCNDTR: запись" — \n is graphviz's own line-break escape for
+  // a plain (non-HTML) label, not a literal newline
+  function relPeriphRegLabel(regs, cap = 6) {
+    if (!regs.length) return '';
+    const sorted = [...regs].sort((a, b) => a.reg.localeCompare(b.reg));
+    const shown = sorted.slice(0, cap).map(r => `${r.reg}: ${REL_MODE_WORD[r.mode] || r.mode}`);
+    if (sorted.length > cap) shown.push(`+${sorted.length - cap}`);
+    return shown.join('\\n');
+  }
+  const relCallEdge = (callerId, calleeId) => `  ${callerId} -> ${calleeId} [dir=forward, style=dashed];`;
+  function relAccessEdge(fnIdStr, varIdStr, mode, label = '') {
+    // len: see dotEdge's comment in index.mjs — a labeled edge otherwise gets
+    // no extra room reserved for the text, and a short one can spill it onto
+    // a node. Only engages neato/fdp; dot ignores it.
+    const attrs = label ? ` label="${escHtml(label)}", len=3.5` : '';
+    if (mode === 'w') return `  ${fnIdStr} -> ${varIdStr} [dir=forward${attrs}];`;
+    if (mode === 'rw') return `  ${fnIdStr} -> ${varIdStr} [dir=both${attrs}];`;
+    return `  ${varIdStr} -> ${fnIdStr} [dir=forward${attrs}];`;
+  }
+
+  function setupRelationsDiagram(diagram) {
+    const focusId = diagram.dataset.focus;
+    const G = nodes();
+    if (!focusId || !G[focusId]) return null; // no adjacency data — leave the static SVG alone
+
+    let curEngine = diagram.dataset.curEngine;
+    let showVars = true;
+    let upPath = [];   // chain of caller ids, focus outward
+    let downPath = []; // chain of callee ids, focus outward
+    let rendering = false, pending = false;
+    // Positions (inches, graphviz's own space) from the previous pinned
+    // render, keyed by node id, plus that layout's total graph height (inches)
+    // — both needed to hold already-visible nodes still on the next click
+    // instead of letting the whole diagram reshuffle. Every id present here is
+    // re-emitted next render with pos="x,y!", which nails it in place; only the
+    // freshly-added frontier nodes are free to move. graphviz still shifts the
+    // whole pinned cluster as one rigid block to make room for the newcomers
+    // (relative positions are preserved exactly), so render() pans .inner by
+    // the focus node's before/after delta to cancel that block shift out.
+    // Only meaningful for neato/fdp: dot is rank-based with no notion of
+    // "start from this position", so lastPos is left null (and pinning skipped)
+    // there.
+    let lastPos = null;
+    let lastHeight = 0;
+
+    // dot has no notion of a pinned x,y, but reordering *within* a rank
+    // (dot's crossing-minimization re-deciding top-to-bottom order every
+    // render) turned out to be the actual source of "everything jumps" for
+    // dot — not the rank/column assignment itself, which is already stable
+    // since it's ours (see rankKeyOf: derived from depthOf, not from dot's own
+    // longest-path computation). lastOrder remembers, per rank, the sequence
+    // nodes appeared in last render; buildDot() re-asserts that sequence via
+    // an explicit `{rank=same; ...}` group plus a chain of invisible
+    // (style=invis) ordering edges — the standard graphviz technique for
+    // controlling in-rank order. New nodes are appended after the kept ones.
+    // This is a bias, not a hard guarantee: a real call edge between two
+    // rank-mates (a sibling calling a sibling) imposes its own precedence
+    // that can override an arbitrary requested order — topoOrder() below
+    // resolves that by never requesting an order that contradicts a real
+    // edge in the first place. Measured across 15 real functions / 26 clicks:
+    // 0 unresolved reorders; one deep (29-node) synthetic case needed one
+    // settle-in swap that then held stable, never a repeat reshuffle.
+    let lastOrder = null; // rankKey -> [ids in previous top-to-bottom order]
+
+    // Stable order for one rank's nodes: respects every real edge between two
+    // rank-mates (tail must precede head — otherwise the invisible ordering
+    // edge we're about to add would directly contradict a real one, which is
+    // what let dot override our request in the first place), and among nodes
+    // free of such constraints, prefers preferredOrder (kept-from-last-render
+    // nodes first, in their old sequence, then newly-added ones). Plain Kahn's
+    // algorithm; a cycle (two rank-mates calling each other both ways) is
+    // vanishingly rare for real call graphs, so on one, whatever's left just
+    // gets appended rather than looping forever.
+    function topoOrder(ids, precedenceEdges, preferredOrder) {
+      const prefIndex = new Map(preferredOrder.map((id, i) => [id, i]));
+      const idsSet = new Set(ids);
+      const adj = new Map(ids.map(id => [id, []]));
+      const indeg = new Map(ids.map(id => [id, 0]));
+      for (const [f, t] of precedenceEdges) {
+        if (!idsSet.has(f) || !idsSet.has(t) || f === t) continue;
+        adj.get(f).push(t);
+        indeg.set(t, indeg.get(t) + 1);
       }
-      return parts.join('\n');
-    }
-
-    function wire(svg) {
-      if (!svg) return;
-      setupSvg(svg, {
-        extraKeys: groupByAnyId.keys(),
-        onNodeClick(key) {
-          const g = groupByAnyId.get(key);
-          if (!g) return false;
-          if (expanded.has(key)) return false; // groups only ever expand forward, never fold back
-          expanded.add(key);
-          rerender();
-          return true;
-        },
-      });
-    }
-
-    function rerender() {
-      // the DOM swap (which node is "old") must happen inside the queued
-      // turn too, not just the mermaid.run() call — otherwise a second
-      // click queued while the first is still pending would rip the first
-      // click's <pre> out of the document mid-render
-      return queueRender(async () => {
-        const inner = diagram.querySelector('.inner');
-        const old = inner.querySelector('svg, pre');
-        const pre = document.createElement('pre');
-        pre.className = 'mermaid';
-        pre.textContent = compose();
-        old.replaceWith(pre);
-        // mermaid measures every html label with getBoundingClientRect(),
-        // which reports post-CSS-transform screen pixels — if .inner is
-        // currently zoomed (scroll-wheel/buttons set its transform: scale),
-        // that scale leaks into every node's measured size for this render,
-        // not just the one being toggled. Render at true scale, then
-        // restore whatever zoom was active.
-        const prevTransform = inner.style.transform;
-        inner.style.transform = 'none';
-        try {
-          await mermaid.run({ nodes: [pre] });
-        } catch (e) {
-          console.error('mermaid render (group expand):', e);
-          return;
-        } finally {
-          inner.style.transform = prevTransform;
+      const cmp = (a, b) => {
+        const pa = prefIndex.has(a) ? prefIndex.get(a) : Infinity;
+        const pb = prefIndex.has(b) ? prefIndex.get(b) : Infinity;
+        return pa !== pb ? pa - pb : ids.indexOf(a) - ids.indexOf(b);
+      };
+      const ready = ids.filter(id => indeg.get(id) === 0).sort(cmp);
+      const result = [], done = new Set();
+      while (ready.length) {
+        ready.sort(cmp);
+        const id = ready.shift();
+        result.push(id);
+        done.add(id);
+        for (const nb of adj.get(id)) {
+          indeg.set(nb, indeg.get(nb) - 1);
+          if (indeg.get(nb) === 0 && !done.has(nb)) ready.push(nb);
         }
-        wire(diagram.querySelector('svg'));
-      });
+      }
+      for (const id of ids) if (!done.has(id)) result.push(id); // cycle leftovers
+      return result;
     }
 
-    // the first pass is already-rendered (fully collapsed) by the normal
-    // mermaid.run over .mermaid — just wire clicks onto it, no re-render.
-    // rerender is exposed too, so a global setting change (layout algorithm)
-    // can force a fresh render without losing which groups are expanded.
-    return { wire, rerender };
+    // plain-format layout: node lines are "node <id> <x> <y> <w> <h> ...",
+    // coords in inches, origin bottom-left; the leading "graph 1 <w> <h>" line
+    // carries the whole graph's size. That's exactly the space pos="x,y!" reads
+    // back, so a plain layout is the round-trip source for pinning (the SVG's
+    // point coordinates would need un-flipping and margin bookkeeping first).
+    function parsePlain(txt) {
+      const pos = new Map();
+      let height = 0;
+      for (const line of txt.split('\n')) {
+        const t = line.trim().split(/\s+/);
+        if (t[0] === 'graph') height = parseFloat(t[3]);
+        else if (t[0] === 'node') pos.set(t[1], { x: parseFloat(t[2]), y: parseFloat(t[3]) });
+      }
+      return { pos, height };
+    }
+
+    // Builds the dot text for "everything that should currently be visible":
+    // focus, its base callers/callees, every already-chosen link in
+    // upPath/downPath, and — for each of those two chains — one more level
+    // (the "frontier": candidates the user hasn't picked between yet, shown
+    // at full color since nothing there has been narrowed down). Variables
+    // are only ever shown for focus itself — this diagram is about the call
+    // *chain*, and a chain node's own reads/writes turned out to be mostly
+    // noise once a couple of hops deep (they visually compete with the call
+    // edges for the same "upstream/downstream" direction).
+    function buildDot() {
+      const nodeLines = [];
+      const edgeLines = [];
+      const edgeKeys = new Set(); // "from>to", so a pair already drawn (by the
+      // walk below or by the cross-link pass at the end) is never duplicated
+      // into a second overlapping spline
+      const seenNodes = new Set();
+      const fullColor = new Set([focusId]);
+      const depthOf = new Map(); // id -> { side: 'up'|'down', depth }
+      const focusFile = G[focusId].file;
+
+      // Re-emit a previously-laid-out node at its old spot so this render holds
+      // it still; new nodes (and everything under dot, which can't be pinned)
+      // get no pos and are placed freely. See lastPos above.
+      const canPin = curEngine !== 'dot' && lastPos;
+      function pinOf(id) {
+        if (!canPin) return '';
+        const p = lastPos.get(id);
+        return p ? ` pos="${p.x},${p.y}!"` : '';
+      }
+
+      // dot-only bookkeeping for in-rank ordering (see lastOrder above): every
+      // real call edge (candidate for a same-rank precedence constraint), and
+      // — for the var/periph nodes, which have no depthOf entry since they
+      // only ever attach to focus — the access mode that decides which side
+      // of focus they land on (mirrors the direction relAccessEdge draws).
+      const edgePairs = [];
+      const varPeriphMode = new Map(); // id -> 'r' | 'w' | 'rw'
+
+      function ensureFn(id) {
+        if (seenNodes.has(id) || !G[id]) return;
+        seenNodes.add(id);
+        nodeLines.push(relFnNodeLine(id, G[id], G[id].file === focusFile, pinOf(id)));
+      }
+      function addCallEdge(from, to) {
+        const ek = from + '>' + to;
+        if (edgeKeys.has(ek)) return;
+        edgeKeys.add(ek);
+        edgeLines.push(relCallEdge(from, to));
+        edgePairs.push([from, to]);
+      }
+      function addVarsOf(fid) {
+        if (!showVars) return;
+        for (const a of (G[fid].access || [])) {
+          if (!seenNodes.has(a.v) && G[a.v]) {
+            seenNodes.add(a.v);
+            nodeLines.push(relVarNodeLine(a.v, G[a.v], G[a.v].file === focusFile, pinOf(a.v)));
+          }
+          edgeLines.push(relAccessEdge(fid, a.v, a.mode));
+          fullColor.add(a.v);
+          varPeriphMode.set(a.v, a.mode);
+        }
+      }
+      // peripherals are shown, like variables, only for the focus itself and
+      // only while the "переменные" toggle is on — they're the same data-access
+      // concern, just against a hardware register block instead of a global
+      function addPeriphOf(fid) {
+        if (!showVars) return;
+        for (const pa of (G[fid].periph || [])) {
+          if (!seenNodes.has(pa.id)) {
+            seenNodes.add(pa.id);
+            nodeLines.push(relPeriphNodeLine(pa.id, pa.name, pinOf(pa.id)));
+          }
+          const mode = relPeriphMode(pa.regs);
+          edgeLines.push(relAccessEdge(fid, pa.id, mode, relPeriphRegLabel(pa.regs)));
+          fullColor.add(pa.id);
+          varPeriphMode.set(pa.id, mode);
+        }
+      }
+
+      ensureFn(focusId);
+      addVarsOf(focusId);
+      addPeriphOf(focusId);
+
+      function walk(side, path, adjKey, dirOf) {
+        let prev = focusId;
+        for (let i = 0; i < path.length; i++) {
+          for (const s of (G[prev][adjKey] || [])) {
+            ensureFn(s);
+            const [from, to] = dirOf(s, prev);
+            addCallEdge(from, to);
+            if (!depthOf.has(s)) depthOf.set(s, { side, depth: i });
+          }
+          prev = path[i];
+        }
+        for (const s of (G[prev][adjKey] || [])) {
+          ensureFn(s);
+          const [from, to] = dirOf(s, prev);
+          addCallEdge(from, to);
+          fullColor.add(s);
+          if (!depthOf.has(s)) depthOf.set(s, { side, depth: path.length });
+        }
+        for (const p of path) fullColor.add(p);
+      }
+      walk('up', upPath, 'callers', (s, prev) => [s, prev]);
+      walk('down', downPath, 'calls', (s, prev) => [prev, s]);
+
+      // Connect any two nodes that are *both* already on screen, even when
+      // neither is on the currently-drilled path — e.g. two sibling callees
+      // that happen to call each other. Without this, that relationship only
+      // showed up once you separately drilled into one of them, even though
+      // both ends were already visible.
+      for (const id of seenNodes) {
+        const info = G[id];
+        if (!info || !Array.isArray(info.calls)) continue; // skip var nodes
+        for (const c of info.calls) {
+          if (seenNodes.has(c)) addCallEdge(id, c);
+        }
+      }
+
+      // dot only: force each node's rank explicitly from depthOf/varPeriphMode
+      // (never from dot's own longest-path computation, which a fresh cross-
+      // link could otherwise shift a node's rank on any click) and re-assert
+      // the previous in-rank order via invisible edges — see lastOrder above.
+      const orderLines = [];
+      if (curEngine === 'dot') {
+        const rankOf = id => {
+          if (id === focusId) return 0;
+          const d = depthOf.get(id);
+          if (d) return d.side === 'up' ? -(d.depth + 1) : (d.depth + 1);
+          const m = varPeriphMode.get(id);
+          return m ? (m.includes('w') ? 1 : -1) : null;
+        };
+        const groups = new Map(); // rank -> [ids]
+        for (const id of seenNodes) {
+          const rk = rankOf(id);
+          if (rk === null || rk === 0) continue;
+          if (!groups.has(rk)) groups.set(rk, []);
+          groups.get(rk).push(id);
+        }
+        const newOrder = new Map();
+        for (const [rk, ids] of groups) {
+          const idsSet = new Set(ids);
+          const precedence = edgePairs.filter(([f, t]) => idsSet.has(f) && idsSet.has(t));
+          const prev = (lastOrder && lastOrder.get(rk)) || [];
+          const kept = prev.filter(id => idsSet.has(id));
+          const fresh = ids.filter(id => !kept.includes(id));
+          const order = topoOrder(ids, precedence, [...kept, ...fresh]);
+          newOrder.set(rk, order);
+          orderLines.push(`  { rank=same; ${order.join('; ')}; }`);
+          for (let i = 0; i < order.length - 1; i++) {
+            orderLines.push(`  ${order[i]} -> ${order[i + 1]} [style=invis, weight=100];`);
+          }
+        }
+        lastOrder = newOrder;
+      }
+
+      return { dot: [...nodeLines, ...edgeLines, ...orderLines].join('\n'), fullColor, depthOf };
+    }
+
+    function wireRelationsNodes(svg, depthOf) {
+      const nodeEls = new Map(); // id -> [el] (single-element, but same shape as setupGraphvizSvg)
+      svg.querySelectorAll('g.node[id]').forEach(el => {
+        if (G[el.id]) nodeEls.set(el.id, [el]);
+      });
+      const edges = [];
+      svg.querySelectorAll('g.edge').forEach(el => {
+        const title = el.querySelector('title');
+        const parts = title ? title.textContent.split('->') : null;
+        if (parts && parts.length === 2 && G[parts[0]] && G[parts[1]]) edges.push({ el, from: parts[0], to: parts[1] });
+      });
+
+      // Hover-highlight a node/edge together with everything connected to it,
+      // same idea as setupGraphvizSvg elsewhere on the site — but this
+      // diagram's svg is *permanently* faded (render() always adds 'fade';
+      // 'hl' marks the confirmed chain, not a transient hover state), so
+      // clearing by wiping every '.hl' on mouseleave would erase that
+      // permanent marking too. An element that's already full-color (already
+      // 'hl' from the confirmed-chain marking) has no opacity left to gain
+      // from that, so it gets a '.hlring' glow instead. hoverAdded remembers,
+      // per element, the *exact* class hover itself added — not just "hover
+      // touched this" — so clearing only ever removes what hover put on;
+      // an already-'hl' element that only gained 'hlring' this way keeps its
+      // permanent 'hl' once the glow comes off, instead of fading out with it.
+      let locked = null;
+      const hoverAdded = new Map(); // el -> 'hl' | 'hlring', whichever hover added
+      function clearHoverHighlight() {
+        for (const [el, cls] of hoverAdded) el.classList.remove(cls);
+        hoverAdded.clear();
+      }
+      function mark(el) {
+        if (!el || hoverAdded.has(el)) return;
+        const cls = el.classList.contains('hl') ? 'hlring' : 'hl';
+        el.classList.add(cls);
+        hoverAdded.set(el, cls);
+      }
+      function markKey(key) { (nodeEls.get(key) || []).forEach(mark); }
+      function highlightNode(key) {
+        markKey(key);
+        for (const e of edges) {
+          if (e.from === key || e.to === key) {
+            mark(e.el);
+            markKey(e.from);
+            markKey(e.to);
+          }
+        }
+      }
+      function highlightEdge(e) {
+        mark(e.el);
+        markKey(e.from);
+        markKey(e.to);
+      }
+
+      nodeEls.forEach((els, key) => {
+        for (const el of els) {
+          el.addEventListener('mouseenter', ev => {
+            showTip(key, ev);
+            if (!locked) { clearHoverHighlight(); highlightNode(key); }
+          });
+          el.addEventListener('mousemove', ev => { if (tip.style.display !== 'none') moveTip(ev); });
+          el.addEventListener('mouseleave', () => {
+            hideTip();
+            if (!locked) clearHoverHighlight();
+          });
+          el.addEventListener('dblclick', ev => {
+            ev.stopPropagation();
+            const href = hrefFor(key);
+            if (href) window.location.href = href;
+          });
+          const pos = depthOf.get(key);
+          if (key === focusId || !pos) {
+            // focus itself and every var/periph node: nothing to expand, so a
+            // click just locks/unlocks the hover highlight instead, like on
+            // every other diagram
+            el.addEventListener('click', ev => {
+              ev.stopPropagation();
+              if (locked === key) { locked = null; clearHoverHighlight(); return; }
+              locked = key;
+              clearHoverHighlight();
+              highlightNode(key);
+            });
+            return;
+          }
+          el.addEventListener('click', ev => {
+            ev.stopPropagation();
+            const path = pos.side === 'up' ? upPath : downPath;
+            const idx = path.indexOf(key);
+            if (idx !== -1 && idx === path.length - 1) {
+              path.splice(idx, 1); // re-clicking the current deepest pick: collapse one level
+            } else {
+              path.length = pos.depth; // new pick (or an earlier ancestor): drop everything past it
+              path.push(key);
+            }
+            render();
+          });
+        }
+      });
+
+      for (const e of edges) {
+        const edgeKey = 'edge:' + e.from + '>' + e.to;
+        e.el.addEventListener('mouseenter', () => {
+          hideTip();
+          if (!locked) { clearHoverHighlight(); highlightEdge(e); }
+        });
+        e.el.addEventListener('mouseleave', () => { if (!locked) clearHoverHighlight(); });
+        e.el.addEventListener('click', ev => {
+          ev.stopPropagation();
+          if (locked === edgeKey) { locked = null; clearHoverHighlight(); return; }
+          locked = edgeKey;
+          clearHoverHighlight();
+          highlightEdge(e);
+        });
+      }
+      svg.addEventListener('click', () => { if (locked) { locked = null; clearHoverHighlight(); } });
+    }
+
+    async function render() {
+      if (rendering) { pending = true; return; }
+      rendering = true;
+      diagram.classList.add('loading');
+      try {
+        const graphviz = await loadGraphvizWasm();
+        const { dot, fullColor, depthOf } = buildDot();
+        const pinning = curEngine !== 'dot' && lastPos;
+        // same split as index.mjs's renderDotAll: dot's rank/column layout
+        // never overlaps by construction, but neato/fdp place nodes by
+        // spring simulation alone (desired edge length only) and never check
+        // actual node boxes against each other unless told to — overlap=false
+        // is the post-pass that reads each node's real width/height and
+        // pushes apart anything that collides; sep adds a little breathing
+        // room beyond bare non-overlap, splines routes edges around nodes
+        // instead of through them.
+        //
+        // But that post-pass (prism) is a *proximity displacement* that scales
+        // the whole drawing apart non-uniformly and does NOT honor pos="!"
+        // pins — measured: it drifts already-placed nodes by inches, which is
+        // exactly the reshuffle pinning exists to prevent. overlap=true keeps
+        // pins exact (drift ~1e-4"): the pinned cluster stays put and only the
+        // new frontier nodes are placed, at the cost of the odd new node
+        // overlapping. So the very first (unpinned) render still uses the
+        // clean overlap=false layout; once there are pins to preserve, every
+        // subsequent render switches to overlap=true to actually preserve them.
+        const engineAttrs = curEngine === 'dot'
+          ? 'rankdir=LR, ranksep=0.6'
+          : `overlap=${pinning ? 'true' : 'false'}, splines=true, sep="+12"`;
+        const dotText = ['digraph G {',
+          `  graph [fontname="Segoe UI, Helvetica, sans-serif", nodesep=0.35, ${engineAttrs}];`,
+          '  node [fontname="Segoe UI, Helvetica, sans-serif", style=filled, fillcolor=white];',
+          '  edge [fontname="Segoe UI, Helvetica, sans-serif", fontsize=10];',
+          dot, '}'].join('\n');
+        const svgText = graphviz.layout(dotText, 'svg', curEngine);
+        const doc = new DOMParser().parseFromString(svgText, 'image/svg+xml');
+        const next = document.importNode(doc.documentElement, true);
+        const inner = diagram.querySelector('.inner');
+        inner.querySelector('svg').replaceWith(next);
+        next.classList.add('fade');
+
+        // Pin bookkeeping (neato/fdp only). The svg above and this plain layout
+        // are the same graph laid out twice, so the plain node coords match the
+        // svg exactly. If the previous render pinned nodes, the pinned cluster
+        // has just been shifted rigidly to fit the newcomers — pan .inner so
+        // the focus node lands back where it was. Screen-x grows with
+        // graphviz-x; screen-y is flipped (origin bottom-left) and also rides
+        // the change in total graph height, so both terms enter dY. 72 = points
+        // per inch = svg px per inch at z=1; multiply by z for the live zoom.
+        if (curEngine === 'dot') {
+          lastPos = null;
+          lastHeight = 0;
+        } else {
+          const { pos: newPos, height: newHeight } = parsePlain(graphviz.layout(dotText, 'plain', curEngine));
+          if (lastPos && lastPos.has(focusId) && newPos.has(focusId)) {
+            const of = lastPos.get(focusId), nf = newPos.get(focusId);
+            const dX = (nf.x - of.x) * 72;
+            const dY = ((newHeight - lastHeight) - (nf.y - of.y)) * 72;
+            const { z, tx, ty } = getTransform(inner);
+            setTransform(inner, z, tx - dX * z, ty - dY * z);
+          }
+          lastPos = newPos;
+          lastHeight = newHeight;
+        }
+        next.querySelectorAll('g.node[id]').forEach(el => { if (fullColor.has(el.id)) el.classList.add('hl'); });
+        next.querySelectorAll('g.edge').forEach(el => {
+          const title = el.querySelector('title');
+          const parts = title ? title.textContent.split('->') : null;
+          if (parts && parts.length === 2 && fullColor.has(parts[0]) && fullColor.has(parts[1])) {
+            el.classList.add('hl');
+          }
+        });
+        wireRelationsNodes(next, depthOf);
+      } catch (e) {
+        console.error('relations diagram render failed:', e);
+      } finally {
+        diagram.classList.remove('loading');
+        rendering = false;
+        if (pending) { pending = false; render(); }
+      }
+    }
+
+    // the build-time SVG already *is* the upPath=[]/downPath=[] state (base
+    // callers/callees, nothing dimmed) — wire it in place rather than paying
+    // for a redundant wasm load + re-layout before the user has clicked
+    wireRelationsNodes(diagram.querySelector('svg'), buildDot().depthOf);
+
+    return {
+      switchTo(engine) {
+        if (!engine || curEngine === engine) return;
+        curEngine = engine;
+        diagram.dataset.curEngine = engine;
+        lastPos = null; // coords from the old engine's space don't transfer
+        lastHeight = 0;
+        render();
+      },
+      setVarsVisible(show) {
+        if (showVars === show) return;
+        showVars = show;
+        render();
+      },
+    };
+  }
+
+  // Every graphviz diagram ships all three engines pre-rendered at build
+  // time (script.engine-data) since the graphs this tool draws are cheap
+  // enough to compute all three — so switching engines in the browser is
+  // just swapping which pre-built <svg> sits in .inner, no client-side
+  // re-layout at all.
+  function setupEngineSwitchable(diagram) {
+    const script = diagram.querySelector('script.engine-data');
+    if (!script) return null;
+    let svgs;
+    try { svgs = JSON.parse(script.textContent); } catch (e) { return null; }
+
+    // Unchecking "переменные" used to just hide the existing var nodes in
+    // place, leaving the rest of the layout exactly where graphviz put it
+    // with the freed space sitting there as a hole. index.mjs instead
+    // renders a *second*, fully independent layout per engine with the var
+    // lines never included at all (key "<engine>_novars") — so the toggle,
+    // like the engine switcher, swaps to a wholly different pre-built SVG
+    // where the remaining nodes are free to spread into the space, not a
+    // DOM visibility flip on the one shared SVG.
+    let curEngine = diagram.dataset.curEngine;
+    let showVars = true;
+    setupGraphvizSvg(diagram.querySelector('svg'));
+
+    function swap() {
+      const key = showVars ? curEngine : curEngine + '_novars';
+      const inner = diagram.querySelector('.inner');
+      const old = inner.querySelector('svg');
+      const doc = new DOMParser().parseFromString(svgs[key] || svgs[curEngine], 'image/svg+xml');
+      const next = document.importNode(doc.documentElement, true);
+      old.replaceWith(next);
+      setupGraphvizSvg(next);
+    }
+    function switchTo(engine) {
+      if (!svgs[engine] || curEngine === engine) return;
+      curEngine = engine;
+      diagram.dataset.curEngine = engine;
+      swap();
+    }
+    function setVarsVisible(show) {
+      if (showVars === show) return;
+      showVars = show;
+      swap();
+    }
+    return { switchTo, setVarsVisible };
   }
 
   // Explorer-style navigation history: every page visited extends the trail;
@@ -545,133 +1066,111 @@
     if (main) main.insertBefore(bar, main.firstChild);
   }
 
-  // Node placement strategy trades off compactness vs straight edges (ELK
-  // still routes orthogonally either way — NETWORK_SIMPLEX optimizes total
-  // edge length and will zigzag through free space to shave it down,
-  // BRANDES_KOEPF explicitly favors straight runs at the cost of more
-  // whitespace). Picked once per browser via the nav dropdown, not baked
-  // into the generated page, so switching doesn't need a regeneration.
-  const PLACEMENT_KEY = 'cg_placement';
-  const PLACEMENTS = { straight: 'BRANDES_KOEPF', compact: 'NETWORK_SIMPLEX' };
-  function currentPlacement() {
-    const v = localStorage.getItem(PLACEMENT_KEY);
-    return v && PLACEMENTS[v] ? v : 'straight';
-  }
-  function mermaidConfig(placement) {
-    return {
-      startOnLoad: false,
-      securityLevel: 'loose',
-      layout: 'elk',
-      elk: { nodePlacementStrategy: PLACEMENTS[placement] },
-      // ELK still routes orthogonally (right-angle bends); this smooths the
-      // rendered line through those points instead of drawing hard corners
-      curve: 'basis',
-      flowchart: { useMaxWidth: false, htmlLabels: true },
-      maxTextSize: 2000000,
-      maxEdges: 5000,
-    };
-  }
-
-  function buildPlacementControl(onChange) {
-    const nav = document.querySelector('nav');
-    if (!nav) return;
-    const label = document.createElement('label');
-    label.style.marginLeft = 'auto';
-    label.style.fontSize = '0.85em';
-    label.style.color = '#cbd5e1';
-    label.textContent = 'раскладка: ';
-    const select = document.createElement('select');
-    select.style.marginLeft = '4px';
-    select.style.background = '#334155';
-    select.style.color = '#e2e8f0';
-    select.style.border = '1px solid #475569';
-    select.style.borderRadius = '4px';
-    select.innerHTML = '<option value="straight">прямые линии</option><option value="compact">компактно</option>';
-    select.value = currentPlacement();
+  // Level 0's engine-select + vars-checkbox are baked straight into this
+  // diagram's own toolbar (see diagramBlockSvg in index.mjs) rather than
+  // built up in JS like buildPlacementControl above — they're a property of
+  // this one diagram, not a page-wide nav setting, so there's nothing to
+  // construct here, just wire the two controls already sitting in the markup.
+  // A page can carry more than one graphviz diagram at once (level 0 +
+  // overview + include, all on index.html) — each needs its own persisted
+  // choice, keyed off data-diagram-id, not one shared setting they'd stomp
+  // on each other with.
+  function wireDiagramToolbar(diagram, switcher) {
+    const toolbar = diagram.parentElement.querySelector('.diagram-toolbar');
+    if (!toolbar) return;
+    const id = diagram.dataset.diagramId || 'gv';
+    const engineKey = 'cg_engine_' + id;
+    const varsKey = 'cg_showvars_' + id;
+    const select = toolbar.querySelector('.gv-engine-select');
+    const checkbox = toolbar.querySelector('.gv-vars-toggle');
+    const savedEngine = storageGet(engineKey);
+    if (savedEngine && savedEngine !== select.value) {
+      select.value = savedEngine;
+      switcher.switchTo(savedEngine);
+    }
     select.addEventListener('change', () => {
-      localStorage.setItem(PLACEMENT_KEY, select.value);
-      onChange(select.value);
+      storageSet(engineKey, select.value);
+      switcher.switchTo(select.value);
     });
-    label.appendChild(select);
-    nav.appendChild(label);
+    if (!checkbox) return;
+    const savedVars = storageGet(varsKey);
+    checkbox.checked = savedVars !== '0';
+    switcher.setVarsVisible(checkbox.checked);
+    checkbox.addEventListener('change', () => {
+      storageSet(varsKey, checkbox.checked ? '1' : '0');
+      switcher.setVarsVisible(checkbox.checked);
+    });
   }
 
-  window.addEventListener('DOMContentLoaded', async () => {
+  // TEMPORARY: lets mode/model/seed/len be freely combined and re-laid-out
+  // live via graphviz-wasm.js instead of guessing which few combos to
+  // pre-bake at build time — companion to the test-raw-dot script tag and
+  // test-*-select/input controls index.mjs only emits under
+  // TEST_NEATO_MODES. No-ops (and is cheap to call) on every other page,
+  // since it just returns when that script tag isn't present. Remove this
+  // function (and its call below, and the matching HTML in index.mjs) once
+  // a winning combo is picked.
+  //
+  // mode and model left completely unset produce results empirically
+  // identical to mode=major/model=shortpath (checked by diffing crossing
+  // counts) — that's neato's actual default, so the preset here reflects
+  // what the pre-baked "органично" render actually used, not a guess.
+  const NEATO_TEST_PRESETS = { neato: { mode: 'major', model: 'shortpath', seed: '0', len: '3.5' } };
+  function wireNeatoModeTester(diagram) {
+    const toolbar = diagram.parentElement.querySelector('.diagram-toolbar');
+    const rawDotScript = diagram.querySelector('script.test-raw-dot');
+    if (!toolbar || !rawDotScript) return;
+    const rawDot = JSON.parse(rawDotScript.textContent);
+    const engineSelect = toolbar.querySelector('.gv-engine-select');
+    const modeSel = toolbar.querySelector('.test-mode-select');
+    const modelSel = toolbar.querySelector('.test-model-select');
+    const seedInput = toolbar.querySelector('.test-seed-input');
+    const lenInput = toolbar.querySelector('.test-len-input');
+    if (!engineSelect || !modeSel || !modelSel || !seedInput || !lenInput) return;
+    const controls = [modeSel, modelSel, seedInput, lenInput];
+
+    function applyPreset(engine) {
+      const preset = NEATO_TEST_PRESETS[engine];
+      controls.forEach(el => { el.disabled = !preset; });
+      if (!preset) return;
+      modeSel.value = preset.mode;
+      modelSel.value = preset.model;
+      seedInput.value = preset.seed;
+      lenInput.value = preset.len;
+    }
+
+    async function renderCustom() {
+      const graphviz = await loadGraphvizWasm();
+      let dotText = rawDot.replace(/len=[\d.]+/g, `len=${lenInput.value}`);
+      const extra = [`start=${seedInput.value}`];
+      if (modeSel.value) extra.push(`mode=${modeSel.value}`);
+      if (modelSel.value) extra.push(`model=${modelSel.value}`);
+      dotText = dotText.replace(/graph \[([^\]]*)\]/, (m, inner) => `graph [${inner}, ${extra.join(', ')}]`);
+      const svgText = graphviz.layout(dotText, 'svg', 'neato');
+      const doc = new DOMParser().parseFromString(svgText, 'image/svg+xml');
+      const next = document.importNode(doc.documentElement, true);
+      const inner = diagram.querySelector('.inner');
+      inner.querySelector('svg').replaceWith(next);
+      setupGraphvizSvg(next);
+    }
+
+    controls.forEach(el => el.addEventListener('change', renderCustom));
+    // engine dropdown swaps to a pre-baked SVG on its own (setupEngineSwitchable);
+    // this only keeps the test controls' displayed values honest about what
+    // that pre-baked render's parameters actually were
+    engineSelect.addEventListener('change', () => applyPreset(engineSelect.value));
+    applyPreset(engineSelect.value);
+  }
+
+  window.addEventListener('DOMContentLoaded', () => {
     renderTrail(updateTrail());
     document.body.appendChild(tip);
     document.querySelectorAll('.diagram').forEach(setupPanZoom);
-    mermaid.initialize(mermaidConfig(currentPlacement()));
 
-    // original source of every plain (non-grouped) diagram, captured before
-    // the first render replaces its <pre> with an <svg> — needed to redraw
-    // from scratch when the placement setting changes later. Diagrams still
-    // waiting on their <details> to open are captured too but never touched
-    // by rerenderPlain (still a <pre>, so it just picks up the new config
-    // whenever it does render).
-    const plainCode = new Map();
-    document.querySelectorAll('.diagram:not([data-groups="true"])').forEach(d => {
-      const pre = d.querySelector('pre.mermaid, pre.mermaid-lazy');
-      if (pre) plainCode.set(d, pre.textContent);
-    });
-    function rerenderPlain(d) {
-      return queueRender(async () => {
-        const old = d.querySelector('.inner svg');
-        if (!old) return; // not rendered yet (lazy) — nothing to redo
-        const inner = d.querySelector('.inner');
-        const pre = document.createElement('pre');
-        pre.className = 'mermaid';
-        pre.textContent = plainCode.get(d);
-        old.replaceWith(pre);
-        const prevTransform = inner.style.transform;
-        inner.style.transform = 'none';
-        try {
-          await mermaid.run({ nodes: [pre] });
-        } catch (e) {
-          console.error('mermaid render (placement change):', e);
-          return;
-        } finally {
-          inner.style.transform = prevTransform;
-        }
-        setupSvg(d.querySelector('svg'));
-      });
-    }
-
-    try {
-      await queueRender(() => mermaid.run({ querySelector: '.mermaid' }));
-    } catch (e) {
-      console.error('mermaid render:', e);
-    }
-    const groupRerenders = [];
-    document.querySelectorAll('.diagram[data-groups="true"]').forEach(d => {
-      const g = setupGroupedDiagram(d);
-      if (g) { g.wire(d.querySelector('svg')); groupRerenders.push(g.rerender); }
-    });
-    document.querySelectorAll('.diagram:not([data-groups="true"]) svg').forEach(el => setupSvg(el));
-
-    buildPlacementControl(async placement => {
-      mermaid.initialize(mermaidConfig(placement));
-      for (const d of plainCode.keys()) await rerenderPlain(d);
-      for (const r of groupRerenders) await r();
-    });
-
-    // diagrams inside <details> render lazily on open: hidden elements
-    // measure text incorrectly, so they carry class "mermaid-lazy" until then
-    document.querySelectorAll('details').forEach(d => {
-      d.addEventListener('toggle', async () => {
-        if (!d.open) return;
-        const lazies = Array.from(d.querySelectorAll('pre.mermaid-lazy'));
-        if (!lazies.length) return;
-        for (const el of lazies) {
-          el.classList.remove('mermaid-lazy');
-          el.classList.add('mermaid');
-        }
-        try {
-          await queueRender(() => mermaid.run({ nodes: lazies }));
-        } catch (e) {
-          console.error('mermaid render (lazy):', e);
-        }
-        d.querySelectorAll('.diagram svg').forEach(setupSvg);
-      });
+    document.querySelectorAll('.diagram[data-engine="graphviz"]').forEach(d => {
+      const s = d.dataset.focus ? setupRelationsDiagram(d) : setupEngineSwitchable(d);
+      if (s) wireDiagramToolbar(d, s);
+      wireNeatoModeTester(d);
     });
   });
 })();

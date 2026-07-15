@@ -3,3 +3,5 @@ graph-html*/
 graph-html/
 dist/
 *.log
+.claude/
+CORE/

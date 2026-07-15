@@ -1,6 +1,6 @@
 # code-graph
 
-Parses a C codebase directly with [tree-sitter](https://tree-sitter.github.io/tree-sitter/) and generates a **static HTML site of Mermaid diagrams** — open `index.html` in any browser, nothing to install, works offline (the renderer is bundled into the output).
+Parses a C codebase directly with [tree-sitter](https://tree-sitter.github.io/tree-sitter/) and generates a **static HTML site of graphviz diagrams** — open `index.html` in any browser, nothing to install, works offline (every diagram is a plain SVG, already laid out at generation time).
 
 The diagrams follow the classic **data-flow diagram** idea (functions + data stores as two node kinds), which is what makes interrupt-driven embedded code readable: an ISR node alone says nothing, but "ISR *writes* `adc_buf`, *sets* `data_ready`; main loop *reads* both" shows the actual architecture.
 
@@ -15,13 +15,14 @@ The diagrams follow the classic **data-flow diagram** idea (functions + data sto
 
 ## Viewer features
 
-- **ELK layout** (Eclipse Layout Kernel, layered/Sugiyama with orthogonal edge routing) instead of mermaid's default dagre — fewer crossings, no long diagonal edges. Bundled offline as `mermaid-elk.min.js` (built once with esbuild, cached in `dist/`).
+- **Graphviz layout**, computed once at generation time via `@hpcc-js/wasm-graphviz` (no native binary needed, no browser-side layout step). Every diagram ships with all three of `dot` (layered, best for the DAG-shaped ones: include graph, per-function callers/callees, control-flow), `neato` and `fdp` (force-directed, no rank concept — the right fit for hub-heavy graphs like level 0 and the file/overview diagrams, where a strict ranked layout would cram unrelated nodes into one column) pre-rendered; a per-diagram toolbar next to its maximize button switches between them instantly, since it's just swapping which pre-built SVG is shown.
 - **Mouse pan & zoom** — the wheel zooms the diagram at the cursor (the page scrolls only when the cursor is outside a diagram); pressing and dragging the left button on empty background pans. The `+`/`−` buttons zoom around the viewport center.
 - **Click to pin, double-click to navigate** — hovering a node or edge highlights its connections as before; a single click pins that highlight so moving the mouse to inspect other parts of a busy diagram doesn't lose it, until you click empty background (or the same element again) to release it. Double-click a node to navigate to its page — the click that starts a drag is swallowed so panning never mis-fires a pin/unpin.
 - **Breadcrumb trail** — the top of every page shows the drill-down path (file → function → function it calls → …), stored per-tab. Landing on a page already in the trail (via a breadcrumb link or the browser Back button) truncates back to it instead of growing forever.
 - **Variable importance tiers** — on the overview diagrams, globals used by many functions (and across files) render bigger and brighter; single-user globals render small and dim, whether or not they're volatile (a volatile flag touched by only one function is still visually minor, just tinted red instead of yellow so it's still recognizable as an ISR channel). The globals table is sorted by usage, with a user count column.
 - **Cursor tooltip** — kind, signature/type, file, description, writers/readers list (from `graph-data.js`). Always tracks the live hover, independently of a pinned connection highlight, so it never freezes on screen after a click — it just follows whatever's currently under the cursor and disappears when nothing is.
 - **Self-describing nodes** — every node carries a small dim kind tag on the left (`func` / `ISR` / `main` / `var` / `volatile` / `ext` / `file` / `периферия`), so no external color legend is needed. Peripheral nodes render as hexagons to read as hardware rather than data.
+- **Variables toggle** — diagrams that mix functions/peripherals with globals (level 0, overview, per-file) carry a "переменные" checkbox next to the engine switcher to hide every variable/data-channel node and its edges, leaving just the function/peripheral structure.
 
 ## Output structure
 
@@ -30,15 +31,14 @@ outDir/
   index.html          overview diagram + include graph + tables (files / functions / globals)
   files/<file>.html   one diagram per file: its functions & globals, plus dashed "ghost"
                       nodes for everything one step outside the file (clickable)
-  functions/<fn>.html one diagram per function: callers, callees, globals touched
-  mermaid-elk.min.js  bundled renderer: mermaid + ELK layout (offline)
-  app.js              viewer runtime: rendering, hover highlighting, tooltips
+  functions/<fn>.html one diagram per function: control flow (CFG), callers, callees, globals touched
+  app.js              viewer runtime: pan/zoom, hover highlighting, tooltips, engine switching
   graph-data.js       node metadata for tooltips
 ```
 
-Edge semantics: `func → var` = write, `var → func` = read, `↔` = read+write, dotted = call. Every node is clickable and navigates to its page. If the whole program is too big for one readable diagram (>130 nodes), the overview collapses to a file-level graph with aggregated edge counts. The level-0 diagram shows only variables actually *exchanged* between entry points (written in one entry's call tree, read in another's); entry points that reach the same peripheral, and peripherals whose name matches an ISR, are shown too. Solid vs. dashed still means direct vs. via-the-call-tree access; a dotted edge labeled "взводит" is an `NVIC_EnableIRQ` call, a thick edge labeled "прерывание" is the peripheral's hardware vector firing that handler. Variables that share the exact same set of writers and readers are bundled into one collapsible "data channel" node instead of one node each (click to expand) — capped at the 50 most-used channels and 40 most-used peripherals.
+Edge semantics: `func → var` = write, `var → func` = read, `↔` = read+write, dashed = call. Every node is clickable and navigates to its page. If the whole program is too big for one readable diagram (>130 nodes), the overview collapses to a file-level graph with aggregated edge counts. The level-0 diagram shows only variables actually *exchanged* between entry points (written in one entry's call tree, read in another's); entry points that reach the same peripheral, and peripherals whose name matches an ISR, are shown too. Solid vs. dashed still means direct vs. via-the-call-tree access; a dashed edge labeled "взводит" is an `NVIC_EnableIRQ` call, a thick edge labeled "прерывание" is the peripheral's hardware vector firing that handler. Variables that share the exact same set of writers and readers are bundled into one "data channel" node instead of one node each — capped at the 50 most-used channels and 40 most-used peripherals.
 
-A single large file's own diagram never hands the browser an unrenderable, hanging graph either, but nothing is silently dropped: the file's own functions are always shown in full, and anything that would overflow the diagram — neighboring functions/variables from *another* file, or (for very large files) the file's own globals — is folded into small grey group boxes, one per neighboring file (plus one per variable-importance tier for the file's own globals, when even those are too many). Every box expands in place on click, recomposing and re-rendering just that part of the diagram — nothing is lost, it's just collapsed until you ask for it.
+A file's own diagram always shows every one of its own functions and globals in full, plus dashed "ghost" nodes for everything one step outside the file (a neighboring file's function that calls into or is called from this one, a variable this file touches that's defined elsewhere) — nothing is folded away or hidden behind a click.
 
 ## Usage
 

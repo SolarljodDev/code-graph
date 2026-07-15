@@ -211,6 +211,20 @@ function extractFileScopeVars(root, commentIdx) {
 }
 
 // How is this identifier used: read, write, or both?
+// fold a new access mode into an existing one: r + w (in either order) => rw.
+const mergeMode = (prev, m) => (!prev ? m : prev === m ? prev : 'rw');
+
+// every named identifier leaf under a (possibly grouped/OR'd) expression,
+// e.g. collectIdentifiers for `(FLAG1 | FLAG2)` -> {FLAG1, FLAG2} — used to
+// pull every flag name out of a bitmask test regardless of how many bits it
+// checks at once.
+function collectIdentifiers(node, out) {
+  if (node.type === 'identifier') { out.add(node.text); return; }
+  if (node.type === 'parenthesized_expression' || node.type === 'binary_expression') {
+    for (const c of node.namedChildren) collectIdentifiers(c, out);
+  }
+}
+
 function classifyAccess(id) {
   let n = id;
   while (n.parent) {
@@ -276,6 +290,18 @@ function analyzeFunction(funcNode) {
   // a real variable; that absence is itself the signal that flags them as
   // peripheral candidates in pass 2, not a naming-convention guess
   const derefNames = new Set();
+  // per-register breakdown behind each derefName: which fields of the block are
+  // touched and how (`UART2->CR1 |= x` -> UART2: { CR1: 'rw' }). derefNames
+  // still flags the block as a peripheral candidate in pass 2; this keeps the
+  // field that pass used to throw away, so a reader of DR and a writer of CR1
+  // on the same UART2 stay distinguishable.
+  const derefFields = new Map(); // name -> Map(field -> 'r' | 'w' | 'rw')
+  // named bits tested against a register in a bitwise-AND, e.g. the
+  // "USART_SR_RXNE" in `if (X->SR & USART_SR_RXNE)` — this is how ISR bodies
+  // near-universally spell "which specific interrupt source is this",
+  // usually invisible once periph access is collapsed to just the register.
+  // name -> Map(field -> Set(flag name))
+  const derefFlags = new Map();
   const access = new Map(); // name -> { r, w }
   const NVIC_ARM_RE = /^(HAL_|LL_)?NVIC_EnableIRQ$/;
   if (body) {
@@ -300,11 +326,35 @@ function analyzeFunction(funcNode) {
       if (p && (p.type.endsWith('_declarator')) && sameNode(p.childForFieldName('declarator'), n)) return;
       const name = n.text;
       if (locals.has(name)) return;
+      const mode = classifyAccess(n);
       if (p && p.type === 'field_expression' && p.childForFieldName('operator')?.text === '->'
           && sameNode(p.childForFieldName('argument'), n)) {
         derefNames.add(name);
+        const field = p.childForFieldName('field')?.text;
+        if (field) {
+          let fm = derefFields.get(name);
+          if (!fm) { fm = new Map(); derefFields.set(name, fm); }
+          fm.set(field, mergeMode(fm.get(field), mode));
+
+          // "X->field & FLAG" (either operand order) — collect every named
+          // identifier on the other side, so `& (FLAG1 | FLAG2)` yields both
+          const bexpr = p.parent;
+          if (bexpr && bexpr.type === 'binary_expression' && bexpr.childForFieldName('operator')?.text === '&') {
+            const left = bexpr.childForFieldName('left'), right = bexpr.childForFieldName('right');
+            const other = sameNode(left, p) ? right : (sameNode(right, p) ? left : null);
+            if (other) {
+              const flagNames = new Set();
+              collectIdentifiers(other, flagNames);
+              if (flagNames.size) {
+                let flagMap = derefFlags.get(name);
+                if (!flagMap) { flagMap = new Map(); derefFlags.set(name, flagMap); }
+                if (!flagMap.has(field)) flagMap.set(field, new Set());
+                for (const fl of flagNames) flagMap.get(field).add(fl);
+              }
+            }
+          }
+        }
       }
-      const mode = classifyAccess(n);
       const cur = access.get(name) || { r: false, w: false };
       if (mode.includes('r')) cur.r = true;
       if (mode.includes('w')) cur.w = true;
@@ -315,7 +365,7 @@ function analyzeFunction(funcNode) {
   const typeNode = funcNode.childForFieldName('type');
   const signature = `${typeNode ? typeNode.text + ' ' : ''}${declarator ? declarator.text : ''}`
     .replace(/\s+/g, ' ');
-  return { calls, armCalls, derefNames, access, signature };
+  return { calls, armCalls, derefNames, derefFields, access, signature };
 }
 
 // ---------------------------------------------------------------------------
@@ -625,6 +675,7 @@ function periph(name) {
   if (!peripherals.has(name)) {
     peripherals.set(name, {
       name, readers: new Set(), writers: new Set(), armers: new Set(), isrTargets: new Set(),
+      fields: new Map(), // register name -> 'r' | 'w' | 'rw', unioned across the whole program
     });
   }
   return peripherals.get(name);
@@ -665,6 +716,7 @@ for (const f of fileRecords) {
       callers: new Set(),    // funcKeys, filled below
       access: new Map(),     // varKey -> 'r' | 'w' | 'rw'
       periphAccess: new Map(), // peripheral name -> 'r' | 'w' | 'rw'
+      periphFields: new Map(), // peripheral name -> Map(register -> 'r' | 'w' | 'rw')
       arms: new Set(),         // peripheral names this function directly NVIC_EnableIRQ's
     };
     funcs.set(key, rec);
@@ -740,6 +792,17 @@ for (const f of fileRecords) {
         rec.periphAccess.set(name, prev && prev !== m ? 'rw' : (m || 'r'));
         if (mode.r) p.readers.add(rec.key);
         if (mode.w) p.writers.add(rec.key);
+        // carry the per-register breakdown onto both the function (for its own
+        // "Связи" diagram) and the peripheral (union, for level 0's node label)
+        const flds = fn.derefFields.get(name);
+        if (flds) {
+          let rf = rec.periphFields.get(name);
+          if (!rf) { rf = new Map(); rec.periphFields.set(name, rf); }
+          for (const [field, fm] of flds) {
+            rf.set(field, mergeMode(rf.get(field), fm));
+            p.fields.set(field, mergeMode(p.fields.get(field), fm));
+          }
+        }
         continue;
       }
       // anything else: macro / enum constant -> ignore
@@ -815,8 +878,6 @@ function varTier(v) {
   if (v.users <= 1) return 'minor';
   return 'normal';
 }
-const TIER_LABELS = { hot: 'часто используемые', normal: 'переменные файла', minor: 'редко используемые' };
-
 // Same hot/normal/minor 3-way split as varTier, but for "how big is this
 // count relative to its peers" instead of "how often is this var touched" —
 // used to size/tint a collapsed variable-bundle node by how many variables
@@ -832,7 +893,8 @@ function sizeTier(n, allSizes) {
 }
 
 // ---------------------------------------------------------------------------
-// Mermaid emission
+// Graphviz emission (all diagrams — see the "graphviz, not mermaid" comment
+// below for why every build*Diagram function went this way)
 // ---------------------------------------------------------------------------
 
 const sanitize = s => s.replace(/[^A-Za-z0-9_]/g, '_');
@@ -840,169 +902,11 @@ const fnId = key => 'f_' + sanitize(key);
 const varId = key => 'v_' + sanitize(key);
 const extId = name => 'x_' + sanitize(name);
 const periphId = name => 'p_' + sanitize(name);
-const esc = s => String(s).replace(/"/g, "'");
-
-const CLASSDEFS = [
-  'classDef fn fill:#dbeafe,stroke:#2563eb,color:#1e3a5f',
-  'classDef entry fill:#dcfce7,stroke:#16a34a,color:#14532d',
-  'classDef isr fill:#fee2e2,stroke:#dc2626,color:#7f1d1d',
-  'classDef gvar fill:#fef9c3,stroke:#ca8a04,color:#713f12',
-  'classDef gvarhot fill:#fde047,stroke:#a16207,stroke-width:2.5px,color:#713f12',
-  'classDef gvarminor fill:#fefce8,stroke:#ddd6a3,color:#8a7a2f',
-  'classDef ghost fill:#f4f4f5,stroke:#a1a1aa,color:#52525b,stroke-dasharray:5 4',
-  'classDef periph fill:#e0e7ff,stroke:#4338ca,color:#312e81',
-  'classDef periphhot fill:#c7d2fe,stroke:#3730a3,stroke-width:2.5px,color:#1e1b4b',
-  'classDef focus stroke-width:3.5px',
-  'classDef cfgstmt fill:#f8fafc,stroke:#94a3b8,color:#0f172a',
-  'classDef cfgcall fill:#dbeafe,stroke:#2563eb,color:#1e3a5f',
-  'classDef cfgcond fill:#fef3c7,stroke:#d97706,color:#713f12',
-  'classDef cfgterm fill:#e2e8f0,stroke:#64748b,color:#334155',
-  'classDef cfgjump fill:#fce7f3,stroke:#db2777,color:#831843',
-];
 
 function fnClass(fn) {
   return fn.isISR ? 'isr' : fn.isEntry ? 'entry' : 'fn';
 }
 const truncate = (s, n) => (s.length > n ? s.slice(0, n - 1).replace(/\s+\S*$/, '') + '…' : s);
-// full HTML-label escape (labels may contain <, >, & from source text/comments)
-const escLabel = s => String(s)
-  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, "'");
-// dim kind tag rendered to the left of the node name, like a watermark
-const cap = t => `<span class='cap'>${t}</span>`;
-
-function fnNodeLine(fn, { ghost = false, focus = false, withFile = false } = {}) {
-  const kind = fn.isISR ? 'ISR' : fn.isEntry ? 'main' : 'func';
-  let label = `${cap(kind)}<b>${esc(fn.name)}</b>`;
-  if (withFile || ghost) label += `<br><small>${esc(fn.file)}</small>`;
-  if (fn.desc && !ghost) label += `<br><small><i>${escLabel(truncate(fn.desc, 46))}</i></small>`;
-  const cls = ghost ? 'ghost' : fnClass(fn);
-  return `${fnId(fn.key)}["${label}"]:::${cls}${focus ? `\nclass ${fnId(fn.key)} focus` : ''}`;
-}
-
-function varNodeLine(v, { ghost = false, withFile = false, withType = false, tiered = false } = {}) {
-  const kind = v.isExternal ? 'ext var' : v.isVolatile ? 'volatile' : 'var';
-  const sub = [];
-  if (withType && v.typeText) sub.push(esc(v.typeText));
-  if (v.isStatic) sub.push('static');
-  if ((withFile || ghost) && v.file) sub.push(esc(v.file));
-  let cls = ghost || v.isExternal ? 'ghost' : 'gvar';
-  const nameClasses = [];
-  if (tiered && !ghost && !v.isExternal) {
-    const tier = varTier(v);
-    if (tier === 'hot') { cls = 'gvarhot'; nameClasses.push('vhot'); }
-    else if (tier === 'minor') cls = 'gvarminor';
-  }
-  // volatile-ness is a font color on the name itself, not a separate box
-  // style — keeps the tier (hot/normal/minor) as the only thing driving the
-  // box color, instead of a 3x2 matrix of box variants
-  if (v.isVolatile && !ghost && !v.isExternal) nameClasses.push('vvolatile');
-  const nameCls = nameClasses.length ? ` class='${nameClasses.join(' ')}'` : '';
-  let label = `${cap(kind)}<b${nameCls}>${esc(v.name)}</b>`;
-  if (sub.length) label += `<br><small>${sub.join(' · ')}</small>`;
-  return `${varId(v.key)}[("${label}")]:::${cls}`;
-}
-
-function extNodeLine(name) {
-  return `${extId(name)}["${cap('ext')}<b>${esc(name)}</b>"]:::ghost`;
-}
-
-// A bundle of variables grouped into one barrel is rendered in the same
-// cylinder shape as a single variable node (see varNodeLine) rather than a
-// generic grey placeholder — the size tier (hot/normal/minor, same 3-way
-// split varTier uses for how often a variable is touched, but keyed here on
-// how many variables this one barrel hides) picks the box color, so a barrel
-// folding away a lot of variables reads as visually heavier exactly like a
-// heavily-used single variable would. Volatile-ness is a font color on each
-// name, not a separate box variant.
-//
-// Always shows the full alphabetical name list — no fold/unfold control.
-// A barrel's node id and edges never depend on how many names are in the
-// label, so there was never a layout reason to hide it behind a click; it
-// only ever added an extra step to see what's actually in the box.
-function varListGroup(id, header, vars, edges, tier = 'normal') {
-  const names = vars
-    .map(v => ({ v, name: esc(v.name) }))
-    .sort((a, b) => a.name.localeCompare(b.name))
-    .map(({ v, name }) => {
-      const nameCls = v.isVolatile ? " class='vvolatile'" : '';
-      return `<b${nameCls}>${name}</b>`;
-    });
-  let cls = 'gvar';
-  if (tier === 'hot') cls = 'gvarhot';
-  else if (tier === 'minor') cls = 'gvarminor';
-  const prefix = header ? `${header}<br>` : '';
-  const line = `${id}[("${prefix}${names.join('<br>')}")]:::${cls}`;
-  return { line, edges };
-}
-
-// peripheral instance node (register block reached via `X->field`, never
-// itself defined in the scanned sources — see derefNames/periph() above).
-// Rendered as a hexagon to read as "hardware", not data. "hot" = it both
-// receives register writes from some entry point AND fires an ISR whose name
-// matches it — the two-way signature of an interrupt-driven feedback loop.
-function periphNodeLine(p) {
-  const hot = p.isrTargets.size > 0 && (p.readers.size + p.writers.size) > 0;
-  const label = `${cap('периферия')}<b>${esc(p.name)}</b>`;
-  return `${periphId(p.name)}{{"${label}"}}:::${hot ? 'periphhot' : 'periph'}`;
-}
-
-// base primitive: both sides are already-final id strings, no wrapping
-function accessEdgeRawBoth(fnSide, varSide, mode) {
-  if (mode === 'w') return [`${fnSide} --> ${varSide}`];
-  if (mode === 'rw') return [`${fnSide} <--> ${varSide}`];
-  return [`${varSide} --> ${fnSide}`];
-}
-function accessEdges(fnKey, varKey, mode) {
-  return accessEdgeRawBoth(fnId(fnKey), varId(varKey), mode);
-}
-// like accessEdges, but the var side is a literal node id (for edges pointing
-// at a collapsed group placeholder instead of a real var node)
-function accessEdgeRaw(fnKey, targetId, mode) {
-  return accessEdgeRawBoth(fnId(fnKey), targetId, mode);
-}
-
-// like accessEdgeRawBoth, but dashes the link when `direct` is false — used
-// on level 0, where an entry point's access can be direct (in its own body)
-// or only somewhere down its call tree
-function accessEdgeRawBothStyled(fnSide, otherSide, mode, direct) {
-  if (mode === 'w') return [`${fnSide} ${direct ? '-->' : '-.->'} ${otherSide}`];
-  if (mode === 'rw') return [`${fnSide} ${direct ? '<-->' : '<-.->'} ${otherSide}`];
-  return [`${otherSide} ${direct ? '-->' : '-.->'} ${fnSide}`];
-}
-function periphAccessEdgeStyled(fnKey, periphName, mode, direct) {
-  return accessEdgeRawBothStyled(fnId(fnKey), periphId(periphName), mode, direct);
-}
-
-// Level 0's variable edges used to pick --> vs <-- based on read/write mode,
-// but that direction is exactly what fed the layered layout's rank
-// assignment — a written var got ranked like a callee (after its entry), a
-// read var like a caller (before it). Since every var shown at level 0 is
-// (by construction) both written by some entry and read by a different one,
-// there's no single "direction" that's actually true for the whole edge set
-// — so the arrowhead was never meaningful here anyway, just noisy. Plain,
-// undirected connectors (solid if the entry accesses it directly, dashed if
-// only somewhere down its call tree); which endpoint is written first is
-// still decided once per bundle (see bundleDownstream), just to keep a
-// bundle shared by several entries from being pulled toward all of them at
-// once — it says nothing about read vs write.
-function accessLink(fnKey, targetId, direct, downstream) {
-  const line = direct ? '---' : '-.-';
-  return downstream ? [`${fnId(fnKey)} ${line} ${targetId}`] : [`${targetId} ${line} ${fnId(fnKey)}`];
-}
-
-const callEdge = (fromKey, toKey) => `${fnId(fromKey)} -.-> ${fnId(toKey)}`;
-const extCallEdge = (fromKey, name) => `${fnId(fromKey)} -.-> ${extId(name)}`;
-// code explicitly arms the interrupt line (NVIC_EnableIRQ) — a one-time setup
-// action, not a data flow, so it always renders dotted regardless of depth
-const armEdge = (fnKey, periphName) => `${fnId(fnKey)} -.->|"взводит"| ${periphId(periphName)}`;
-// the peripheral's hardware event vector calls the handler — thick, to read
-// as a different kind of arrow than any data or setup edge
-const triggerEdge = (periphName, fnKey) => `${periphId(periphName)} ==>|"прерывание"| ${fnId(fnKey)}`;
-
-function mermaidFlow(lines, direction = 'LR', { layout } = {}) {
-  const front = layout ? [`---`, `config:`, `  layout: ${layout}`, `---`] : [];
-  return [...front, 'flowchart ' + direction, ...CLASSDEFS.map(l => '  ' + l), ...lines.map(l => '  ' + l)].join('\n');
-}
 
 // Overview: which vars are interesting enough to show at whole-program level
 function overviewVars() {
@@ -1011,12 +915,20 @@ function overviewVars() {
   );
 }
 
-function buildOverviewDiagram() {
+// Overview/aggregate/include moved to graphviz alongside level 0: same
+// reasoning applies — these mix functions, globals and files with lots of
+// many-to-many edges (not a clean call-tree DAG the way a single function's
+// CFG is), so they're closer in shape to level 0 than to the diagrams ELK
+// stays good at (see the comment on the graphviz section above).
+async function buildOverviewDiagram() {
   const vars = overviewVars();
   const nodeCount = funcs.size + vars.length;
   if (nodeCount > 130) return buildAggregateDiagram();
 
-  const lines = [];
+  const nodeLines = [];
+  const edgeLines = [];
+  const varNodeLines = [];
+  const varEdgeLines = [];
   const shownVars = new Set(vars.map(v => v.key));
   const multiFile = fileRecords.length > 1;
 
@@ -1024,25 +936,46 @@ function buildOverviewDiagram() {
     const fnsHere = [...funcs.values()].filter(fn => fn.file === f.basename);
     const varsHere = vars.filter(v => v.file === f.basename);
     if (fnsHere.length === 0 && varsHere.length === 0) continue;
-    if (multiFile) lines.push(`subgraph sg_${sanitize(f.basename)}["${esc(f.basename)}"]`);
-    for (const fn of fnsHere) lines.push((multiFile ? '  ' : '') + fnNodeLine(fn));
-    for (const v of varsHere) lines.push((multiFile ? '  ' : '') + varNodeLine(v, { tiered: true }));
-    if (multiFile) lines.push('end');
-  }
-  for (const v of vars.filter(v => v.isExternal)) lines.push(varNodeLine(v));
-
-  for (const fn of funcs.values()) {
-    for (const calleeKey of fn.calls) lines.push(callEdge(fn.key, calleeKey));
-    for (const [varKey, mode] of fn.access) {
-      if (shownVars.has(varKey)) lines.push(...accessEdges(fn.key, varKey, mode));
+    if (fnsHere.length) {
+      if (multiFile) {
+        nodeLines.push(`  subgraph cluster_${sanitize(f.basename)} {`,
+          `    label="${dotEsc(f.basename)}"; fontsize=11; fontcolor="#71717a"; color="#cbd5e1";`);
+      }
+      for (const fn of fnsHere) nodeLines.push(dotFnNode(fn));
+      if (multiFile) nodeLines.push('  }');
+    }
+    if (varsHere.length) {
+      // graphviz merges same-named subgraphs wherever they're reopened in
+      // the file, so the file's vars still land inside its own cluster even
+      // though they're built into a separate array (omitted, not just
+      // hidden, when the "переменные" toggle is off — see renderDotAll).
+      // label/color repeated here (not just in the fnsHere branch above)
+      // because a data-only file like config.c has vars but no functions,
+      // so this may be the only branch that ever opens cluster_<file>.
+      if (multiFile) {
+        varNodeLines.push(`  subgraph cluster_${sanitize(f.basename)} {`,
+          `    label="${dotEsc(f.basename)}"; fontsize=11; fontcolor="#71717a"; color="#cbd5e1";`);
+      }
+      for (const v of varsHere) varNodeLines.push(dotVarNode(v, { tiered: true }));
+      if (multiFile) varNodeLines.push('  }');
     }
   }
-  return mermaidFlow(lines, 'LR');
+  for (const v of vars.filter(v => v.isExternal)) varNodeLines.push(dotVarNode(v));
+
+  for (const fn of funcs.values()) {
+    for (const calleeKey of fn.calls) edgeLines.push(dotCallEdge(fn.key, calleeKey));
+    for (const [varKey, mode] of fn.access) {
+      if (shownVars.has(varKey)) varEdgeLines.push(...dotAccessEdges(fn.key, varKey, mode));
+    }
+  }
+  const { svgs, hasVars } = await renderDotAll(nodeLines, edgeLines, varNodeLines, varEdgeLines);
+  return { svgs, varsToggle: hasVars };
 }
 
-function buildAggregateDiagram() {
+async function buildAggregateDiagram() {
   // Too many nodes: collapse to file level
-  const lines = [];
+  const nodeLines = [];
+  const edgeLines = [];
   const fileOf = new Map();
   for (const fn of funcs.values()) fileOf.set(fn.key, fn.file);
   const callAgg = new Map(); // "a|b" -> count
@@ -1063,51 +996,51 @@ function buildAggregateDiagram() {
   }
   for (const f of fileRecords) {
     if (f.funcs.length === 0 && f.vars.defs.length === 0) continue;
-    lines.push(`file_${sanitize(f.basename)}["${cap('file')}<b>${esc(f.basename)}</b><br><small>функций: ${f.funcs.length} · глобалов: ${f.vars.defs.length}</small>"]:::fn`);
+    nodeLines.push(dotFileNode(f.basename,
+      [`<FONT POINT-SIZE="9">функций: ${f.funcs.length} &#183; глобалов: ${f.vars.defs.length}</FONT>`]));
   }
   for (const [k, n] of callAgg) {
     const [a, b] = k.split('|');
-    lines.push(`file_${sanitize(a)} -."вызовов: ${n}".-> file_${sanitize(b)}`);
+    edgeLines.push(dotEdge(`file_${sanitize(a)}`, `file_${sanitize(b)}`, { style: 'dashed', label: `вызовов: ${n}` }));
   }
   for (const [k, n] of varAgg) {
     const [a, b] = k.split('|');
-    lines.push(`file_${sanitize(a)} ---|"общих переменных: ${n}"| file_${sanitize(b)}`);
+    edgeLines.push(dotEdge(`file_${sanitize(a)}`, `file_${sanitize(b)}`, { dir: 'none', label: `общих переменных: ${n}` }));
   }
-  return mermaidFlow(lines, 'LR');
+  const { svgs } = await renderDotAll(nodeLines, edgeLines);
+  return { svgs, varsToggle: false };
 }
 
-function buildIncludeDiagram() {
+async function buildIncludeDiagram() {
   const basenameSet = new Set(fileRecords.map(f => f.basename));
-  const lines = [];
+  const nodeLines = [];
+  const edgeLines = [];
   const seen = new Set();
-  for (const f of fileRecords) {
-    lines.push(`file_${sanitize(f.basename)}["${cap('file')}<b>${esc(f.basename)}</b>"]:::fn`);
-  }
+  for (const f of fileRecords) nodeLines.push(dotFileNode(f.basename));
   for (const f of fileRecords) {
     for (const inc of f.includes) {
       if (!basenameSet.has(inc.raw)) continue;
-      const edge = `file_${sanitize(f.basename)} --> file_${sanitize(inc.raw)}`;
-      if (!seen.has(edge)) { seen.add(edge); lines.push(edge); }
+      const key = `${f.basename}|${inc.raw}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edgeLines.push(dotEdge(`file_${sanitize(f.basename)}`, `file_${sanitize(inc.raw)}`));
     }
   }
-  return mermaidFlow(lines, 'LR');
+  // file-include graphs are the textbook DAG-shaped case (see the Go
+  // package-dependency example this whole switch started from) — dot's
+  // rank columns are the right read here, unlike level 0/overview
+  const { svgs } = await renderDotAll(nodeLines, edgeLines);
+  return { svgs, defaultEngine: 'dot', varsToggle: false };
 }
 
-// Large files (many own functions/globals, or many cross-file neighbors) can
-// blow past what ELK's layout can lay out in a readable time. Instead of
-// dropping information, the excess is folded into small grey placeholder
-// nodes — one per neighboring file (so "everything from uart.c" is one box,
-// "everything from tim.c" is another), plus one per own-variable importance
-// tier if even the file's own functions+globals are too many. Function
-// groups expand in place on click (viewer.js recomposes the mermaid source
-// with that group's real nodes swapped in) — nothing is ever silently
-// omitted, it's just collapsed until asked for. Variable-only groups never
-// explode into one node per variable; they stay a single node whose label
-// toggles between a summary and the full alphabetical name list.
-const FILE_DIAGRAM_FULL_MAX = 150;   // own + neighbors fits: show it all directly
-const FILE_DIAGRAM_OWN_MAX = 150;    // own funcs+vars alone fits: only group neighbors
-
-function buildFileDiagram(f) {
+// The file's own functions/globals (clustered, solid) plus one hop of
+// neighbors (ghost, dashed) — always shown flat, no size-based collapsing.
+// This used to fold large files into click-to-expand grey placeholder
+// groups because ELK's layout could choke on the combined size; graphviz
+// doesn't have that failure mode at the sizes this tool sees in practice,
+// so the extra collapse/expand machinery (and the client-side mermaid-source
+// recomposition it needed) isn't worth carrying.
+async function buildFileDiagram(f) {
   const fnsHere = [...funcs.values()].filter(fn => fn.file === f.basename);
   const fnKeysHere = new Set(fnsHere.map(fn => fn.key));
   const varsHere = [...varDefs.values()].filter(v => v.file === f.basename);
@@ -1135,195 +1068,65 @@ function buildFileDiagram(f) {
     }
   }
 
-  const ownCount = fnsHere.length + varsHere.length;
-  const fullCount = ownCount + ghostFns.size + ghostVars.size + extCalls.size;
+  const nodeLines = [`  subgraph cluster_this {`,
+    `    label="${dotEsc(f.basename)}"; fontsize=11; fontcolor="#71717a"; color="#cbd5e1";`];
+  for (const fn of fnsHere) nodeLines.push(dotFnNode(fn));
+  nodeLines.push('  }');
+  for (const g of ghostFns.values()) nodeLines.push(dotFnNode(g, { ghost: true, withFile: true }));
+  for (const ec of extCalls) nodeLines.push(dotExtNode(ec));
 
-  if (fullCount <= FILE_DIAGRAM_FULL_MAX) {
-    // small enough: the old flat rendering, no grouping needed at all
-    const lines = [];
-    lines.push(`subgraph sg_this["${esc(f.basename)}"]`);
-    for (const fn of fnsHere) lines.push('  ' + fnNodeLine(fn));
-    for (const v of varsHere) lines.push('  ' + varNodeLine(v, { withType: true }));
-    lines.push('end');
-    for (const g of ghostFns.values()) lines.push(fnNodeLine(g, { ghost: true, withFile: true }));
-    for (const g of ghostVars.values()) lines.push(varNodeLine(g, { ghost: true, withFile: true }));
-    for (const ec of extCalls) lines.push(extNodeLine(ec));
-    const shownFns = new Set([...fnKeysHere, ...ghostFns.keys()]);
-    const shownVars = new Set([...varKeysHere, ...ghostVars.keys()]);
-    const edgeSeen = new Set();
-    const pushEdge = e => { if (!edgeSeen.has(e)) { edgeSeen.add(e); lines.push(e); } };
-    for (const fnKey of shownFns) {
-      const fn = funcs.get(fnKey);
-      for (const calleeKey of fn.calls) {
-        if (shownFns.has(calleeKey) && (fnKeysHere.has(fnKey) || fnKeysHere.has(calleeKey))) {
-          pushEdge(callEdge(fnKey, calleeKey));
-        }
-      }
-      if (fnKeysHere.has(fnKey)) {
-        for (const ec of fn.extCalls) pushEdge(extCallEdge(fnKey, ec));
-      }
-      for (const [varKey, mode] of fn.access) {
-        if (shownVars.has(varKey) && (fnKeysHere.has(fnKey) || varKeysHere.has(varKey))) {
-          accessEdges(fnKey, varKey, mode).forEach(pushEdge);
-        }
-      }
-    }
-    return { code: mermaidFlow(lines, 'LR'), groups: null };
-  }
-
-  if (fnsHere.length > FILE_DIAGRAM_OWN_MAX * 2) {
-    return null; // pathological: even the file's own functions alone are unreadable
-  }
-
-  // --- grouped rendering ---
-  const collapseVars = ownCount > FILE_DIAGRAM_OWN_MAX; // own alone too big: fold own vars into tier groups too
-
-  const baseLines = [];
-  baseLines.push(`subgraph sg_this["${esc(f.basename)}"]`);
-  for (const fn of fnsHere) baseLines.push('  ' + fnNodeLine(fn));
-  if (!collapseVars) for (const v of varsHere) baseLines.push('  ' + varNodeLine(v, { withType: true }));
-  baseLines.push('end');
-
-  // groupKey -> { label, fnMembers: Map, varMembers: Map, collapsed: Set<string>, expanded: Set<string> }
-  // fn and var members are always kept in separate group keys (fn:.../var:...)
-  // even when they'd otherwise share the same neighboring-file label, so a
-  // group is never a mix of the two — see groupList below, which renders
-  // variable-only groups very differently from function ones.
-  const groups = new Map();
-  const group = (key, label) => {
-    if (!groups.has(key)) groups.set(key, { label, fnMembers: new Map(), varMembers: new Map(), collapsed: new Set(), expanded: new Set() });
-    return groups.get(key);
-  };
-  const fnGroupKey = file => 'fn:' + (file || '__unknown__');
-  const varGroupKey = key => 'var:' + key;
+  // same reopened-subgraph trick as buildOverviewDiagram: the file's own
+  // vars still land inside cluster_this even though they're a separate
+  // array, omitted entirely (not hidden) when "переменные" is off
+  const varNodeLines = ['  subgraph cluster_this {'];
+  for (const v of varsHere) varNodeLines.push(dotVarNode(v));
+  varNodeLines.push('  }');
+  for (const g of ghostVars.values()) varNodeLines.push(dotVarNode(g, { ghost: true, withFile: true }));
 
   const shownFns = new Set([...fnKeysHere, ...ghostFns.keys()]);
+  const shownVars = new Set([...varKeysHere, ...ghostVars.keys()]);
+  const edgeLines = [];
+  const varEdgeLines = [];
+  const edgeSeen = new Set();
+  const pushEdge = (arr, e) => { if (!edgeSeen.has(e)) { edgeSeen.add(e); arr.push(e); } };
   for (const fnKey of shownFns) {
     const fn = funcs.get(fnKey);
-    const isOwn = fnKeysHere.has(fnKey);
     for (const calleeKey of fn.calls) {
-      const calleeIsHere = fnKeysHere.has(calleeKey);
-      if (isOwn === calleeIsHere) continue; // both own (already in baseLines) or both foreign (never shown)
-      if (isOwn) {
-        const g = ghostFns.get(calleeKey);
-        if (!g) continue;
-        const gr = group(fnGroupKey(g.file), g.file || 'без файла');
-        gr.fnMembers.set(calleeKey, g);
-        gr.collapsed.add(`${fnId(fnKey)} -.-> GID`);
-        gr.expanded.add(callEdge(fnKey, calleeKey));
-      } else {
-        const g = ghostFns.get(fnKey);
-        if (!g) continue;
-        const gr = group(fnGroupKey(g.file), g.file || 'без файла');
-        gr.fnMembers.set(fnKey, g);
-        gr.collapsed.add(`GID -.-> ${fnId(calleeKey)}`);
-        gr.expanded.add(callEdge(fnKey, calleeKey));
+      if (shownFns.has(calleeKey) && (fnKeysHere.has(fnKey) || fnKeysHere.has(calleeKey))) {
+        pushEdge(edgeLines, dotCallEdge(fnKey, calleeKey));
       }
     }
-    if (isOwn) {
-      for (const ec of fn.extCalls) {
-        const gr = group('fn:__lib__', 'библиотеки / макросы');
-        gr.fnMembers.set('ext:' + ec, { __ext: ec });
-        gr.collapsed.add(`${fnId(fnKey)} -.-> GID`);
-        gr.expanded.add(extCallEdge(fnKey, ec));
-      }
+    if (fnKeysHere.has(fnKey)) {
+      for (const ec of fn.extCalls) pushEdge(edgeLines, dotExtCallEdge(fnKey, ec));
     }
     for (const [varKey, mode] of fn.access) {
-      const varIsOwn = varKeysHere.has(varKey);
-      if (isOwn && varIsOwn && !collapseVars) continue; // own fn <-> own var, both shown directly
-
-      if (varIsOwn) {
-        // own var, own file's own vars are only ever grouped when collapseVars
-        if (!collapseVars) {
-          // ghost fn <-> our own var (own var shown directly, group the ghost side)
-          const g = ghostFns.get(fnKey);
-          if (!g) continue;
-          const gr = group(fnGroupKey(g.file), g.file || 'без файла');
-          gr.fnMembers.set(fnKey, g);
-          gr.collapsed.add(accessEdgeRawBoth('GID', varId(varKey), mode)[0]);
-          accessEdges(fnKey, varKey, mode).forEach(e => gr.expanded.add(e));
-        } else if (isOwn) {
-          const v = varDefs.get(varKey);
-          const gr = group(varGroupKey('tier:' + varTier(v)), TIER_LABELS[varTier(v)]);
-          gr.varMembers.set(varKey, v);
-          gr.collapsed.add(accessEdgeRaw(fnKey, 'GID', mode)[0]);
-        }
-        // else: ghost fn <-> own var, and the own var is ALSO folded into a
-        // tier group — a group-to-group edge; skipped (rare double-collapse,
-        // not worth the extra bookkeeping of two placeholder ids at once)
-      } else {
-        const v = varDefs.get(varKey);
-        if (!v) continue;
-        const key = v.file || (v.isExternal ? '__extern__' : '__unknown__');
-        const label = v.file || (v.isExternal ? 'внешние объявления (extern)' : 'без файла');
-        const gr = group(varGroupKey(key), label);
-        gr.varMembers.set(varKey, v);
-        gr.collapsed.add(accessEdgeRaw(fnKey, 'GID', mode)[0]);
+      if (shownVars.has(varKey) && (fnKeysHere.has(fnKey) || varKeysHere.has(varKey))) {
+        dotAccessEdges(fnKey, varKey, mode).forEach(e => pushEdge(varEdgeLines, e));
       }
     }
   }
-
-  // Function groups still expand in place into their real (ghost) nodes —
-  // useful, since each one is independently navigable. Variable-only groups
-  // never explode into one node per variable: they render as a single node
-  // whose label toggles between a short summary and the full alphabetical
-  // name list, with the very same edges in both states, so nothing else in
-  // the diagram ever has to re-layout when one is opened or closed.
-  const varGroupSizes = [...groups.values()]
-    .filter(gr => gr.varMembers.size && !gr.fnMembers.size)
-    .map(gr => gr.varMembers.size);
-
-  const groupList = [];
-  let gi = 0;
-  for (const [, gr] of groups) {
-    const id = `grp_${sanitize(f.basename)}_${gi++}`;
-    const count = gr.fnMembers.size + gr.varMembers.size;
-    if (!count) continue;
-
-    if (gr.varMembers.size && !gr.fnMembers.size) {
-      const vars = [...gr.varMembers.values()];
-      const header = `${cap('группа')}<b>${esc(gr.label)}</b>`;
-      const edges = [...gr.collapsed].map(e => e.replace(/GID/g, id));
-      const vlg = varListGroup(id, header, vars, edges, sizeTier(vars.length, varGroupSizes));
-      baseLines.push(vlg.line, ...vlg.edges);
-      continue;
-    }
-
-    const realLines = [];
-    for (const [k, g] of gr.fnMembers) realLines.push(g.__ext ? extNodeLine(g.__ext) : fnNodeLine(g, { ghost: true, withFile: true }));
-    for (const v of gr.varMembers.values()) realLines.push(varNodeLine(v, { ghost: v.file !== f.basename, withFile: true, withType: true, tiered: v.file === f.basename }));
-    const phLine = `${id}["${cap('группа')}<b>${esc(gr.label)}</b><br><small>${count} узлов — клик, чтобы показать</small>"]:::ghost`;
-    groupList.push({
-      id, label: gr.label, count,
-      phLine,
-      realLines,
-      collapsedEdges: [...gr.collapsed].map(e => e.replace(/GID/g, id)),
-      expandedEdges: [...gr.expanded],
-    });
-  }
-
-  return { code: null, groups: groupList, baseLines, classDefs: CLASSDEFS };
+  const { svgs, hasVars } = await renderDotAll(nodeLines, edgeLines, varNodeLines, varEdgeLines);
+  return { svgs, defaultEngine: 'dot', varsToggle: hasVars };
 }
 
-// Flowchart of the function's own control flow (branches, loops, calls in order)
-// Returns { code, links } — links maps CFG node id -> root-relative href for
-// double-click navigation (ids like "c3" are only unique within this one
-// diagram, so they travel with the page as window.CFG_LINKS, not graph-data.js).
-function buildCfgDiagram(fn) {
+const CFG_SHAPE = { term: 'ellipse', ret: 'ellipse', cond: 'diamond', loop: 'diamond', call: 'box', jump: 'ellipse' };
+const CFG_CLASS = { term: 'cfgterm', ret: 'cfgterm', cond: 'cfgcond', loop: 'cfgcond', call: 'cfgcall', jump: 'cfgjump' };
+
+// Flowchart of the function's own control flow (branches, loops, calls in
+// order) — a single-entry DAG (plus loop backedges), exactly the shape dot's
+// rank layout is built for; see the fsm.html/finite-automaton comparison
+// this defaulted it to 'dot' from. Returns { svgs, links } — links maps CFG
+// node id -> root-relative href for double-click navigation (ids like "c3"
+// are only unique within this one diagram, so they travel with the page as
+// window.CFG_LINKS, not graph-data.js).
+async function buildCfgDiagram(fn) {
   if (!fn.cfg) return null;
-  const lines = [];
+  const nodeLines = [];
+  const edgeLines = [];
   const links = {};
   for (const n of fn.cfg.nodes) {
-    const label = n.label.split('\n').map(escLabel).join('<br>');
-    switch (n.kind) {
-      case 'term': lines.push(`${n.id}(["${label}"]):::cfgterm`); break;
-      case 'ret': lines.push(`${n.id}(["${label}"]):::cfgterm`); break;
-      case 'cond':
-      case 'loop': lines.push(`${n.id}{"${label}"}:::cfgcond`); break;
-      case 'call': lines.push(`${n.id}["${label}"]:::cfgcall`); break;
-      case 'jump': lines.push(`${n.id}(["${label}"]):::cfgjump`); break;
-      default: lines.push(`${n.id}["${label}"]:::cfgstmt`);
-    }
+    const label = n.label.split('\n').map(dotEsc).join('<BR/>');
+    nodeLines.push(dotNode(n.id, [label], CFG_SHAPE[n.kind] || 'box', CFG_CLASS[n.kind] || 'cfgstmt'));
     // clickable: jump to the first call target defined in this codebase
     for (const cname of n.calls || []) {
       const cands = functionsByName.get(cname);
@@ -1335,9 +1138,238 @@ function buildCfgDiagram(fn) {
     }
   }
   for (const e of fn.cfg.edges) {
-    lines.push(e.label ? `${e.from} -->|"${escLabel(e.label)}"| ${e.to}` : `${e.from} --> ${e.to}`);
+    edgeLines.push(dotEdge(e.from, e.to, e.label ? { label: e.label } : {}));
   }
-  return { code: mermaidFlow(lines, 'TB'), links };
+  const { svgs } = await renderDotAll(nodeLines, edgeLines, [], [], { rankdir: 'TB' });
+  return { svgs, defaultEngine: 'dot', varsToggle: false, links };
+}
+
+// ---------------------------------------------------------------------------
+// Level 0 emission (graphviz, not mermaid)
+// ---------------------------------------------------------------------------
+// Every other diagram is close enough to a DAG (or is turned into one, like
+// the call tree) that ELK's layered algorithm has a real rank order to work
+// with. Level 0 doesn't: peripherals arm/trigger each other and loop back
+// into entries (main arms UART, UART's ISR arms TIMER, TIMER's ISR arms UART
+// again), so there's no single direction that's "downstream" for the whole
+// graph, and ELK's layered engine was visibly straining against that (see the
+// elk.mrtree/elk.force notes below, in the code this replaced). Graphviz's
+// `dot` handles this the same way ELK would try to (an internal feedback-arc
+// heuristic picks which edges to treat as "back" for ranking purposes) but
+// its spline router is noticeably better at bending edges around unrelated
+// nodes instead of through them — verified against a synthetic sample with
+// exactly this arm/trigger cycle before committing to the switch.
+const dotEsc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+function dotNode(id, rows, shape, cls, extra = '') {
+  return `  ${id} [id="${id}" class="${cls}" shape=${shape} label=<${rows.join('<BR/>')}>${extra}];`;
+}
+const dotKindRow = text => `<FONT POINT-SIZE="10">${dotEsc(text)}</FONT>`;
+// ghost nodes (one hop outside the thing this diagram is centered on — a
+// neighboring file's function, a var defined elsewhere) need a dashed border
+// on top of the fill, which means restating style= in full rather than
+// layering onto the graph-level `node [style=filled]` default (a node's own
+// style= attribute replaces the inherited one, it doesn't merge with it)
+const GHOST_STYLE = ' style="filled,dashed"';
+
+function dotFnNode(fn, { ghost = false, withFile = false, focus = false } = {}) {
+  const kind = fn.isISR ? 'ISR' : fn.isEntry ? 'main' : 'func';
+  const rows = [dotKindRow(kind), `<B>${dotEsc(fn.name)}</B>`];
+  if (withFile || ghost) rows.push(`<FONT POINT-SIZE="9">${dotEsc(fn.file)}</FONT>`);
+  if (fn.desc && !ghost) rows.push(`<FONT POINT-SIZE="9"><I>${dotEsc(truncate(fn.desc, 46))}</I></FONT>`);
+  const cls = ghost ? 'ghost' : fnClass(fn);
+  const extra = (ghost ? GHOST_STYLE : '') + (focus ? ' penwidth=3' : '');
+  return dotNode(fnId(fn.key), rows, 'box', cls, extra);
+}
+function dotVarNode(v, { tiered = false, ghost = false, withFile = false } = {}) {
+  const kind = v.isExternal ? 'ext var' : v.isVolatile ? 'volatile' : 'var';
+  let cls = ghost || v.isExternal ? 'ghost' : 'gvar';
+  if (tiered && !ghost && !v.isExternal) {
+    const tier = varTier(v);
+    if (tier === 'hot') cls = 'gvarhot'; else if (tier === 'minor') cls = 'gvarminor';
+  }
+  const nameColor = v.isVolatile && !ghost ? ' COLOR="#dc2626"' : '';
+  const rows = [dotKindRow(kind), `<B${nameColor}>${dotEsc(v.name)}</B>`];
+  const sub = [];
+  if (v.typeText) sub.push(dotEsc(v.typeText));
+  if (v.isStatic) sub.push('static');
+  if ((withFile || ghost) && v.file) sub.push(dotEsc(v.file));
+  if (sub.length) rows.push(`<FONT POINT-SIZE="9">${sub.join(' &#183; ')}</FONT>`);
+  return dotNode(varId(v.key), rows, 'cylinder', cls, ghost ? GHOST_STYLE : '');
+}
+// external call target (library function/macro, never defined in the
+// scanned sources) — same ghost treatment as an out-of-file neighbor
+function dotExtNode(name) {
+  return dotNode(extId(name), [dotKindRow('ext'), `<B>${dotEsc(name)}</B>`], 'box', 'ghost', GHOST_STYLE);
+}
+const MODE_WORD = { r: 'чтение', w: 'запись', rw: 'чтение/запись' };
+// "CCR: запись\nCNDTR: запись" from a Map(register -> mode), for the edge
+// label rather than the node — packing the register list into the
+// peripheral's own node label used to stretch it across the whole diagram
+// once a peripheral was touched from several entries/functions; a per-edge
+// label keeps the node compact and ties each register straight to *who*
+// touches it. Registers alphabetised so the same access reads the same way
+// wherever it appears; \n is graphviz's own line-break escape for a plain
+// (non-HTML) label, not a literal newline. Capped, so an edge from a
+// call-tree that touches a dozen registers doesn't grow a giant label.
+function periphRegEdgeLabel(fields, cap = 6) {
+  if (!fields || !fields.size) return '';
+  const regs = [...fields.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  const shown = regs.slice(0, cap).map(([f, m]) => `${f}: ${MODE_WORD[m]}`);
+  if (regs.length > cap) shown.push(`+${regs.length - cap}`);
+  return shown.join('\\n');
+}
+function dotPeriphNode(p) {
+  const hot = p.isrTargets.size > 0 && (p.readers.size + p.writers.size) > 0;
+  return dotNode(periphId(p.name), [dotKindRow('периферия'), `<B>${dotEsc(p.name)}</B>`], 'hexagon', hot ? 'periphhot' : 'periph');
+}
+// peripheral as it appears on a single function's "Связи" diagram — same
+// compact block as dotPeriphNode, register detail lives on the edge instead
+// (see periphRegEdgeLabel).
+function dotPeriphRelNode(name) {
+  return dotNode(periphId(name), [dotKindRow('периферия'), `<B>${dotEsc(name)}</B>`], 'hexagon', 'periph');
+}
+// aggregate a register map down to one direction for the fn<->periph edge
+function periphAggMode(fields) {
+  let r = false, w = false;
+  for (const m of fields.values()) { if (m.includes('r')) r = true; if (m.includes('w')) w = true; }
+  return r && w ? 'rw' : w ? 'w' : 'r';
+}
+function dotVarBundleNode(id, vars, tier) {
+  let cls = 'gvar';
+  if (tier === 'hot') cls = 'gvarhot'; else if (tier === 'minor') cls = 'gvarminor';
+  const rows = vars.map(v => v.name).sort().map(name => `<B>${dotEsc(name)}</B>`);
+  return dotNode(id, rows, 'cylinder', cls);
+}
+// file-level node used by the overview/aggregate/include diagrams
+function dotFileNode(basename, extraRows = []) {
+  return dotNode(`file_${sanitize(basename)}`, [dotKindRow('файл'), `<B>${dotEsc(basename)}</B>`, ...extraRows], 'box', 'fn');
+}
+
+function dotEdge(from, to, { dir = 'forward', style, label, penwidth } = {}) {
+  const attrs = [`dir=${dir}`];
+  if (style) attrs.push(`style=${style}`);
+  if (label) {
+    attrs.push(`label="${dotEsc(label)}"`);
+    // neato/fdp place nodes purely by spring simulation on the *node* boxes —
+    // a multi-line label text has no box of its own competing for room, so a
+    // labeled edge between two otherwise strongly-connected nodes (a
+    // peripheral and its own ISR is the classic case) can end up shorter than
+    // the label needs, spilling the text onto one of the nodes. len sets a
+    // longer preferred spring length just for edges that actually carry a
+    // label, so they get more room without stretching the rest of the
+    // diagram. Ignored by dot (rank/ranksep governs edge length there), so
+    // harmless to always include.
+    attrs.push('len=3.5');
+  }
+  if (penwidth) attrs.push(`penwidth=${penwidth}`);
+  return `  ${from} -> ${to} [${attrs.join(', ')}];`;
+}
+// Every var shown at level 0 is (by construction) written by one entry and
+// read by a different one, so there's no single "direction" that's actually
+// true for the whole edge — an arrowhead would just be noise. Plain,
+// undirected connector instead (solid if the entry accesses it directly,
+// dashed if only somewhere down its call tree); which endpoint the edge
+// list is written first is decided once per bundle purely to keep a bundle
+// shared by several entries from being pulled toward all of them at once —
+// it says nothing about read vs write.
+function dotAccessLink(fnKey, targetId, direct, downstream) {
+  const a = fnId(fnKey);
+  const [from, to] = downstream ? [a, targetId] : [targetId, a];
+  return dotEdge(from, to, { dir: 'none', style: direct ? undefined : 'dashed' });
+}
+function dotPeriphAccessEdge(fnKey, periphName, mode, direct, fields) {
+  const a = fnId(fnKey), b = periphId(periphName);
+  const style = direct ? undefined : 'dashed';
+  const label = periphRegEdgeLabel(fields);
+  if (mode === 'w') return dotEdge(a, b, { style, label });
+  if (mode === 'rw') return dotEdge(a, b, { dir: 'both', style, label });
+  return dotEdge(b, a, { style, label });
+}
+const dotArmEdge = (fnKey, periphName) =>
+  dotEdge(fnId(fnKey), periphId(periphName), { style: 'dashed', label: 'взводит' });
+const dotTriggerEdge = (periphName, fnKey) =>
+  dotEdge(periphId(periphName), fnId(fnKey), { penwidth: 2.2, label: 'прерывание' });
+// plain call graph edge — dashed, control transfer rather than data
+const dotCallEdge = (fromKey, toKey) => dotEdge(fnId(fromKey), fnId(toKey), { style: 'dashed' });
+const dotExtCallEdge = (fromKey, name) => dotEdge(fnId(fromKey), extId(name), { style: 'dashed' });
+function dotAccessEdges(fnKey, varKey, mode) {
+  const a = fnId(fnKey), b = varId(varKey);
+  if (mode === 'w') return [dotEdge(a, b)];
+  if (mode === 'rw') return [dotEdge(a, b, { dir: 'both' })];
+  return [dotEdge(b, a)];
+}
+
+// node color is a CSS class (svg g.node.<class> in the page <style>, near
+// CSS below) rather than baked into each node. The var tiers here are a
+// notch more saturated than a first instinct would pick: "minor" only means
+// "small/rare" across the whole program, but every var shown at level 0
+// already cleared that bar (see showVars above), so a near-invisible
+// gvarminor would misread as unimportant here.
+//
+// `dot` (rankdir=LR) was the first choice here, and it does route edges
+// around unrelated nodes far better than ELK ever did — but it's still a
+// *layered* algorithm like ELK, just with nicer splines: every node at the
+// same graph-distance from an entry point lands in the same rank, i.e. the
+// same straight column. On a real firmware-sized graph (a few entries, a
+// couple dozen peripherals/var-bundles most of which sit one hop out) that
+// reproduces exactly the "everything jammed into one strict line" problem
+// this replaced ELK for in the first place. neato has no rank concept at
+// all — springs settle wherever the connections pull them — which is what
+// actually spreads peripherals/vars left/right instead of into a column
+// (verified against a real ~80-function project before switching to it as
+// the default). All three engines are cheap enough on a graph this size to
+// render every one of them at build time instead of picking just one —
+// viewer.js swaps the pre-built SVG instantly, no client-side re-layout.
+const LEVEL0_ENGINES = ['neato', 'dot', 'fdp'];
+
+// Hiding variables via the "переменные" checkbox used to just set
+// display:none on the existing var nodes/edges, leaving the rest of the
+// diagram exactly where graphviz put it — so the freed space just sat there
+// as a hole instead of the function/peripheral nodes spreading out to use
+// it. Rendering a *second*, fully independent layout with the var lines
+// never included at all (not hidden after the fact) fixes that: the
+// engine's own placement decisions are free to change once fewer nodes are
+// competing for space. Both variants are cheap enough at build time to
+// precompute for every engine, same reasoning as LEVEL0_ENGINES itself —
+// so the checkbox, like the engine switcher, is an instant SVG swap in the
+// browser, never a live re-layout.
+//
+// coreNodeLines/coreEdgeLines are the functions/peripherals/files that
+// exist regardless of the toggle; varNodeLines/varEdgeLines are the
+// variable and data-channel-bundle nodes and every edge touching one —
+// entirely omitted from the "_novars" render rather than hidden in it.
+async function renderDotAll(coreNodeLines, coreEdgeLines, varNodeLines = [], varEdgeLines = [], { rankdir = 'LR' } = {}) {
+  const { Graphviz } = await import('@hpcc-js/wasm-graphviz');
+  const graphviz = await Graphviz.load();
+  const svgs = {};
+  const hasVars = varNodeLines.length > 0;
+  const build = (nodeLines, edgeLines, engine) => {
+    const engineAttrs = engine === 'dot'
+      ? `rankdir=${rankdir}, ranksep=0.6`
+      : 'overlap=false, splines=true, sep="+12"';
+    return ['digraph G {',
+      `  graph [fontname="Segoe UI, Helvetica, sans-serif", nodesep=0.35, ${engineAttrs}];`,
+      '  node [fontname="Segoe UI, Helvetica, sans-serif", style=filled, fillcolor=white];',
+      '  edge [fontname="Segoe UI, Helvetica, sans-serif", fontsize=10];',
+      ...nodeLines, ...edgeLines, '}'].join('\n');
+  };
+  for (const engine of LEVEL0_ENGINES) {
+    svgs[engine] = graphviz.layout(
+      build([...coreNodeLines, ...varNodeLines], [...coreEdgeLines, ...varEdgeLines], engine), 'svg', engine);
+    if (hasVars) {
+      svgs[engine + '_novars'] = graphviz.layout(build(coreNodeLines, coreEdgeLines, engine), 'svg', engine);
+    }
+  }
+  // TEMPORARY: raw (unrendered) neato dot text, so the page can let the user
+  // freely combine mode x model x seed client-side via graphviz-wasm.js
+  // instead of us guessing which few combos to pre-bake — see
+  // wireNeatoModeTester in viewer.js. Gated on an env var so normal builds
+  // don't carry this; drop this line (and the matching HTML/JS) once done.
+  const testRawDot = process.env.TEST_NEATO_MODES
+    ? build([...coreNodeLines, ...varNodeLines], [...coreEdgeLines, ...varEdgeLines], 'neato')
+    : undefined;
+  return { svgs, hasVars, testRawDot };
 }
 
 // Level 0: entry points (main + ISRs), the peripherals they arm/drive, the
@@ -1347,16 +1379,17 @@ function buildCfgDiagram(fn) {
 // one collapsible "data channel" node instead of one node each, so a dozen
 // buffers that all flow main -> DMA1_Channel2_IRQHandler read as a single
 // thick edge instead of a dozen parallel ones.
-function buildLevel0Diagram() {
+async function buildLevel0Diagram() {
   const entries = [...funcs.values()].filter(f => f.isEntry || f.isISR);
   if (entries.length === 0) return null;
 
-  const varInfo = new Map();    // entryKey -> Map(varKey -> {r, w, direct})
-  const periphInfo = new Map(); // entryKey -> Map(periphName -> {r, w, direct})
-  const armInfo = new Map();    // entryKey -> Set(periphName) directly or via call tree
+  const varInfo = new Map();      // entryKey -> Map(varKey -> {r, w, direct})
+  const periphInfo = new Map();   // entryKey -> Map(periphName -> {r, w, direct})
+  const periphFieldInfo = new Map(); // entryKey -> Map(periphName -> Map(register -> mode)), unioned across the whole call tree
+  const armInfo = new Map();      // entryKey -> Set(periphName) directly or via call tree
 
   for (const e of entries) {
-    const vAcc = new Map(), pAcc = new Map(), aAcc = new Set();
+    const vAcc = new Map(), pAcc = new Map(), aAcc = new Set(), pFields = new Map();
     const seen = new Set([e.key]);
     const queue = [e.key];
     while (queue.length) {
@@ -1378,11 +1411,17 @@ function buildLevel0Diagram() {
         if (direct) cur.direct = true;
         pAcc.set(pk, cur);
       }
+      for (const [pk, fields] of f.periphFields) {
+        let rf = pFields.get(pk);
+        if (!rf) { rf = new Map(); pFields.set(pk, rf); }
+        for (const [reg, m] of fields) rf.set(reg, mergeMode(rf.get(reg), m));
+      }
       for (const pk of f.arms) aAcc.add(pk);
       for (const c of f.calls) if (!seen.has(c)) { seen.add(c); queue.push(c); }
     }
     varInfo.set(e.key, vAcc);
     periphInfo.set(e.key, pAcc);
+    periphFieldInfo.set(e.key, pFields);
     armInfo.set(e.key, aAcc);
   }
 
@@ -1441,10 +1480,15 @@ function buildLevel0Diagram() {
     periphCapNote = `показаны ${LEVEL0_MAX_PERIPHS} самых задействованных узлов периферии из ${total}`;
   }
 
-  // --- assemble ---
-  const baseLines = [];
-  for (const e of entries) baseLines.push(fnNodeLine(e));
-  for (const p of periphList) baseLines.push(periphNodeLine(p));
+  // --- assemble --- (core = entries/peripherals, shown regardless of the
+  // "переменные" toggle; var* = variable/bundle nodes and every edge
+  // touching one, entirely omitted — not hidden — from the no-vars render)
+  const nodeLines = [];
+  const edgeLines = [];
+  const varNodeLines = [];
+  const varEdgeLines = [];
+  for (const e of entries) nodeLines.push(dotFnNode(e));
+  for (const p of periphList) nodeLines.push(dotPeriphNode(p));
 
   // A bundle can be shared by both "mostly writing" and "mostly reading"
   // entries at once — there's no single true direction for the edge set as
@@ -1464,33 +1508,34 @@ function buildLevel0Diagram() {
   const singletons = bundles.filter(b => b.vars.length === 1);
   const multi = bundles.filter(b => b.vars.length >= 2);
   for (const b of singletons) {
-    baseLines.push(varNodeLine(varDefs.get(b.vars[0]), { withType: true, withFile: true, tiered: true }));
+    varNodeLines.push(dotVarNode(varDefs.get(b.vars[0]), { tiered: true }));
   }
   for (const b of singletons) {
     const vk = b.vars[0];
     const downstream = bundleDownstream(b);
     for (const ek of b.involved) {
       const a = varInfo.get(ek).get(vk);
-      baseLines.push(...accessLink(ek, varId(vk), a.direct, downstream));
+      varEdgeLines.push(dotAccessLink(ek, varId(vk), a.direct, downstream));
     }
   }
 
   for (const e of entries) {
     const pAcc = periphInfo.get(e.key);
+    const pFields = periphFieldInfo.get(e.key);
     for (const p of periphList) {
       const a = pAcc.get(p.name);
       if (!a) continue;
       const mode = a.r && a.w ? 'rw' : a.w ? 'w' : 'r';
-      baseLines.push(...periphAccessEdgeStyled(e.key, p.name, mode, a.direct));
+      edgeLines.push(dotPeriphAccessEdge(e.key, p.name, mode, a.direct, pFields.get(p.name)));
     }
     const aAcc = armInfo.get(e.key);
     for (const p of periphList) {
-      if (aAcc.has(p.name)) baseLines.push(armEdge(e.key, p.name));
+      if (aAcc.has(p.name)) edgeLines.push(dotArmEdge(e.key, p.name));
     }
   }
   for (const p of periphList) {
     for (const isrKey of p.isrTargets) {
-      if (funcs.has(isrKey)) baseLines.push(triggerEdge(p.name, isrKey));
+      if (funcs.has(isrKey)) edgeLines.push(dotTriggerEdge(p.name, isrKey));
     }
   }
 
@@ -1507,14 +1552,12 @@ function buildLevel0Diagram() {
   for (const b of multi) {
     const id = `bnd_${gi++}`;
     const downstream = bundleDownstream(b);
-    const edges = [];
+    const vars = b.vars.map(vk => varDefs.get(vk));
+    varNodeLines.push(dotVarBundleNode(id, vars, sizeTier(vars.length, multiSizes)));
     for (const ek of b.involved) {
       const allDirect = b.vars.every(vk => (varInfo.get(ek).get(vk) || {}).direct);
-      edges.push(...accessLink(ek, id, allDirect, downstream));
+      varEdgeLines.push(dotAccessLink(ek, id, allDirect, downstream));
     }
-    const vars = b.vars.map(vk => varDefs.get(vk));
-    const vlg = varListGroup(id, '', vars, edges, sizeTier(vars.length, multiSizes));
-    baseLines.push(vlg.line, ...vlg.edges);
     extraNodes[id] = {
       label: `${vars.length} перем.`, kind: 'gvar',
       desc: vars.map(v => v.name).sort().join(', '),
@@ -1522,48 +1565,60 @@ function buildLevel0Diagram() {
   }
 
   const note = [varCapNote, periphCapNote].filter(Boolean).join('; ');
-  // elk.mrtree was tried here (main as root, branching outward instead of a
-  // strict left-to-right rank order) but this graph isn't a tree — several
-  // entries share the same bundle/peripheral — so mrtree drew every edge
-  // that didn't fit its spanning tree as a special squiggly "feedback edge"
-  // marker, which looked broken rather than better. Back to the plain
-  // layered algorithm; a real radial layout isn't exposed by Mermaid's ELK
-  // integration (see the "why is main always on the left" question).
-  return { code: mermaidFlow(baseLines, 'LR'), groups: null, note, extraNodes };
+  const { svgs, hasVars, testRawDot } = await renderDotAll(nodeLines, edgeLines, varNodeLines, varEdgeLines);
+  return { svgs, varsToggle: hasVars, note, extraNodes, testRawDot };
 }
 
-function buildFunctionDiagram(fn) {
-  const lines = [];
-  lines.push(fnNodeLine(fn, { focus: true }));
+async function buildFunctionDiagram(fn) {
+  const nodeLines = [dotFnNode(fn, { focus: true })];
+  const edgeLines = [];
   const shown = new Set([fn.key]);
 
   for (const c of fn.callers) {
     const caller = funcs.get(c);
     if (!caller || shown.has(c)) continue;
     shown.add(c);
-    lines.push(fnNodeLine(caller, { withFile: caller.file !== fn.file }));
-    lines.push(callEdge(c, fn.key));
+    nodeLines.push(dotFnNode(caller, { withFile: caller.file !== fn.file }));
+    edgeLines.push(dotCallEdge(c, fn.key));
   }
   for (const calleeKey of fn.calls) {
     const callee = funcs.get(calleeKey);
     if (!callee) continue;
     if (!shown.has(calleeKey)) {
       shown.add(calleeKey);
-      lines.push(fnNodeLine(callee, { withFile: callee.file !== fn.file }));
+      nodeLines.push(dotFnNode(callee, { withFile: callee.file !== fn.file }));
     }
-    lines.push(callEdge(fn.key, calleeKey));
+    edgeLines.push(dotCallEdge(fn.key, calleeKey));
   }
   for (const ec of fn.extCalls) {
-    lines.push(extNodeLine(ec));
-    lines.push(extCallEdge(fn.key, ec));
+    nodeLines.push(dotExtNode(ec));
+    edgeLines.push(dotExtCallEdge(fn.key, ec));
   }
+  const varNodeLines = [];
+  const varEdgeLines = [];
   for (const [varKey, mode] of fn.access) {
     const v = varDefs.get(varKey);
     if (!v) continue;
-    lines.push(varNodeLine(v, { withFile: v.file !== fn.file, withType: true }));
-    lines.push(...accessEdges(fn.key, varKey, mode));
+    varNodeLines.push(dotVarNode(v, { withFile: v.file !== fn.file }));
+    varEdgeLines.push(...dotAccessEdges(fn.key, varKey, mode));
   }
-  return mermaidFlow(lines, 'LR');
+  // peripherals this function touches directly, with the specific registers
+  // on the edge — grouped with the variables (both are data access, both ride
+  // the "переменные" toggle) rather than the call nodes
+  for (const [pName, fields] of fn.periphFields) {
+    varNodeLines.push(dotPeriphRelNode(pName));
+    varEdgeLines.push(dotPeriphAccessEdge(fn.key, pName, periphAggMode(fields), true, fields));
+  }
+  const { svgs, hasVars } = await renderDotAll(nodeLines, edgeLines, varNodeLines, varEdgeLines);
+  // neato, not dot: the client-side chain-expansion in viewer.js pins
+  // already-visible nodes at their current coordinates on every re-layout
+  // (via pos="x,y!") so clicking one more hop doesn't reshuffle everything
+  // already on screen — dot's rank-based algorithm has no such notion (every
+  // node's column is reassigned from scratch), only neato/fdp respect a
+  // pinned starting position. Matching the *initial* engine to neato too
+  // means the very first click doesn't jump between two unrelated layout
+  // styles.
+  return { svgs, defaultEngine: 'neato', varsToggle: hasVars };
 }
 
 // ---------------------------------------------------------------------------
@@ -1597,15 +1652,24 @@ const CSS = `
   .zoombar button:hover { background: #f4f4f5; }
   /* lives outside .diagram (sibling in .diagram-wrap), positioned relative to
      the wrap's own box — independent of the diagram's own scroll/zoom state,
-     since a scaled-down .inner doesn't shrink .diagram's scrollable extent */
-  .maxbtn { position: absolute; bottom: 6px; right: 6px; z-index: 6;
-    border: 1px solid #d4d4d8; background: #fff; border-radius: 6px; width: 30px; height: 30px;
+     since a scaled-down .inner doesn't shrink .diagram's scrollable extent.
+     Scoped to a direct child of .diagram-wrap: a level-0 diagram's maxbtn
+     sits inside .diagram-toolbar instead (next rule), which positions itself
+     the same way and lets flexbox place the button within it. */
+  .diagram-wrap > .maxbtn { position: absolute; bottom: 6px; right: 6px; z-index: 6; }
+  .maxbtn { border: 1px solid #d4d4d8; background: #fff; border-radius: 6px; width: 30px; height: 30px;
     cursor: pointer; font-size: 15px; transition: transform .15s; }
   .maxbtn:hover { background: #f4f4f5; }
   .maxbtn.active { transform: rotate(180deg); }
+  .diagram-toolbar { position: absolute; bottom: 6px; right: 6px; z-index: 6;
+    display: flex; align-items: center; gap: 8px; background: rgba(255,255,255,.9);
+    padding: 4px 8px; border-radius: 6px; border: 1px solid #d4d4d8; font-size: 0.82em; }
+  .diagram-toolbar select { border: 1px solid #d4d4d8; border-radius: 4px; font-size: 0.95em; }
+  .gv-ctrl { display: flex; align-items: center; gap: 4px; cursor: pointer; white-space: nowrap; }
   .diagram.maximized { position: fixed; inset: 0; z-index: 1000; max-height: none;
     width: 100vw; height: 100vh; border-radius: 0; }
-  .diagram-wrap:has(.diagram.maximized) .maxbtn { position: fixed; z-index: 1001; }
+  .diagram-wrap:has(.diagram.maximized) .maxbtn,
+  .diagram-wrap:has(.diagram.maximized) .diagram-toolbar { position: fixed; z-index: 1001; }
   body.diagram-maximized { overflow: hidden; }
   .legend { display: flex; gap: 14px; flex-wrap: wrap; margin: 10px 0 16px; font-size: 0.85rem; color: #52525b; align-items: center; }
   .chip { display: inline-block; width: 14px; height: 14px; border-radius: 4px; vertical-align: -2px; margin-right: 5px; border: 1.5px solid; }
@@ -1622,21 +1686,64 @@ const CSS = `
   .tip .k { opacity: .65; font-size: 11.5px; }
   .tip .sig { font-family: Consolas, monospace; font-size: 11.5px; color: #93c5fd; margin: 2px 0; }
   .tip .d { margin-top: 4px; }
-  svg g.node, svg .edgePaths path, svg .edgeLabel, svg path.flowchart-link { transition: opacity .13s; }
-  svg.fade g.node, svg.fade .edgePaths path, svg.fade .edgeLabel, svg.fade path.flowchart-link { opacity: .13; }
+  svg g.node { transition: opacity .13s; cursor: pointer; }
+  svg.fade g.node { opacity: .13; }
   svg.fade .hl { opacity: 1 !important; }
-  svg .edgePaths path.hl, svg path.flowchart-link.hl { stroke-width: 3px !important; }
-  svg g.node { cursor: pointer; }
-  svg .cap { opacity: .42; font-size: 9px; letter-spacing: .5px; margin-right: 6px;
-    text-transform: uppercase; font-weight: 400; }
-  svg .label small { opacity: .62; }
-  svg b.vhot { font-size: 18px; }
-  svg b.vvolatile { color: #dc2626; }
-  svg g.node.gvarminor { opacity: .55; }
-  svg.fade g.node.gvarminor { opacity: .13; }
-  svg g.node.gvarminor .label { font-size: 11px; }
+  /* hover ring: for the "Связи" diagram, where .hl already marks the
+     permanently-confirmed chain (see setupRelationsDiagram in viewer.js) — an
+     already-full-color node/edge has no opacity left to restore on hover, so
+     it gets a glow instead, the same way a dimmed one gets its color back. */
+  svg g.node.hlring path, svg g.node.hlring polygon, svg g.node.hlring ellipse
+    { filter: drop-shadow(0 0 4px #2563eb) drop-shadow(0 0 4px #2563eb); }
+  svg g.edge.hlring path { filter: drop-shadow(0 0 3px #2563eb); }
   .diagram.panning { cursor: grabbing; }
   .diagram.panning svg g.node { cursor: grabbing; }
+  .diagram.loading { cursor: wait; }
+  .diagram.loading .inner { opacity: .6; transition: opacity .15s; }
+  /* node color is a CSS class rather than baked into the SVG's fill/stroke
+     directly, so the whole palette lives in one place. Any shape tag
+     graphviz might use for a class (polygon for box/hexagon, path for
+     cylinder, ellipse for CFG start/end) is covered. */
+  .diagram[data-engine="graphviz"] svg g.node.fn path,
+  .diagram[data-engine="graphviz"] svg g.node.fn polygon { fill: #dbeafe; stroke: #2563eb; }
+  .diagram[data-engine="graphviz"] svg g.node.entry path,
+  .diagram[data-engine="graphviz"] svg g.node.entry polygon { fill: #dcfce7; stroke: #16a34a; }
+  .diagram[data-engine="graphviz"] svg g.node.isr path,
+  .diagram[data-engine="graphviz"] svg g.node.isr polygon { fill: #fee2e2; stroke: #dc2626; }
+  .diagram[data-engine="graphviz"] svg g.node.periph path,
+  .diagram[data-engine="graphviz"] svg g.node.periph polygon { fill: #e0e7ff; stroke: #4338ca; }
+  .diagram[data-engine="graphviz"] svg g.node.periphhot path,
+  .diagram[data-engine="graphviz"] svg g.node.periphhot polygon { fill: #c7d2fe; stroke: #3730a3; stroke-width: 2px; }
+  .diagram[data-engine="graphviz"] svg g.node.gvar path,
+  .diagram[data-engine="graphviz"] svg g.node.gvar polygon { fill: #fcd34d; stroke: #b45309; }
+  .diagram[data-engine="graphviz"] svg g.node.gvarhot path,
+  .diagram[data-engine="graphviz"] svg g.node.gvarhot polygon { fill: #f59e0b; stroke: #92400e; stroke-width: 2px; }
+  /* "minor" here just means "smaller bundle", not "unimportant" (every var
+     shown already matters enough to cross entry points/files), so it stays
+     legible rather than fading toward invisible the way a low-importance
+     tier normally would. */
+  .diagram[data-engine="graphviz"] svg g.node.gvarminor path,
+  .diagram[data-engine="graphviz"] svg g.node.gvarminor polygon { fill: #fde68a; stroke: #ca8a04; }
+  .diagram[data-engine="graphviz"] svg g.node.ghost path,
+  .diagram[data-engine="graphviz"] svg g.node.ghost polygon { fill: #f4f4f5; stroke: #a1a1aa; }
+  .diagram[data-engine="graphviz"] svg g.node.cfgstmt polygon { fill: #f8fafc; stroke: #94a3b8; }
+  .diagram[data-engine="graphviz"] svg g.node.cfgcall polygon { fill: #dbeafe; stroke: #2563eb; }
+  .diagram[data-engine="graphviz"] svg g.node.cfgcond polygon { fill: #fef3c7; stroke: #d97706; }
+  .diagram[data-engine="graphviz"] svg g.node.cfgterm ellipse { fill: #e2e8f0; stroke: #64748b; }
+  .diagram[data-engine="graphviz"] svg g.node.cfgjump ellipse { fill: #fce7f3; stroke: #db2777; }
+  svg g.edge, svg g.edge * { transition: opacity .13s; }
+  svg.fade g.edge { opacity: .13; }
+  svg.fade g.edge.hl { opacity: 1 !important; }
+  svg g.edge.hl path { stroke-width: 2.5px !important; }
+  svg g.edge.hl polygon { stroke-width: 2.5px !important; }
+  /* register-access labels (e.g. "CCR: запись") only earn their keep once
+     that specific edge is actually highlighted — at rest, every peripheral's
+     incoming edges showing their register list at once was the whole
+     diagram's worth of text cluttering it permanently. Graphviz still lays
+     the label out (reserves its space / routes the edge around it), this
+     only ever hides the rendered text, so nothing reflows on hover. */
+  svg g.edge > text { opacity: 0; }
+  svg g.edge.hl > text { opacity: 1 !important; }
   .trailbar { font-size: 0.85rem; color: #52525b; margin: 0 0 14px; }
   .trailbar a { color: #2563eb; text-decoration: none; }
   .trailbar a:hover { text-decoration: underline; }
@@ -1687,49 +1794,56 @@ ${extraNodes ? `window.PAGE_EXTRA_NODES = ${JSON.stringify(extraNodes)};` : ''}
 <main>
 ${body}
 </main>
-<script src="${rel}mermaid-elk.min.js"></script>
 <script src="${rel}graph-data.js"></script>
 <script src="${rel}app.js"></script>
 </body>
 </html>`;
 }
 
-// lazy: rendered on <details> open (hidden diagrams measure text incorrectly)
-function diagramBlock(code, { lazy = false } = {}) {
+// Every diagram ships as already-laid-out SVGs — one per engine — computed
+// at build time, not in the browser (see setupGraphvizSvg in viewer.js for
+// the hover/click wiring). Only the default engine's SVG is inlined into
+// .inner; the rest ride along in a hidden JSON
+// blob so switching engines in the browser is an instant DOM swap, not a
+// re-render (see setupEngineSwitchable in viewer.js). Engine/vars controls
+// live in a toolbar next to this diagram's own maximize button (not the
+// page-wide nav) since they're properties of this one diagram, not a
+// page-wide setting; varsToggle is only worth showing on diagrams that
+// actually mix in variable nodes (not aggregate/include, which are file-only).
+function diagramBlockSvg(svgs, { defaultEngine = 'neato', varsToggle = true, diagramId = 'gv', focus, testRawDot } = {}) {
   return `<div class="diagram-wrap">
-<div class="diagram" tabindex="-1">
+<div class="diagram" data-engine="graphviz" data-cur-engine="${defaultEngine}" data-diagram-id="${diagramId}"${focus ? ` data-focus="${focus}"` : ''} tabindex="-1">
 <div class="zoombar">
   <button onclick="zoom(this, 1.25)">+</button>
   <button onclick="zoom(this, 0.8)">&minus;</button>
 </div>
-<div class="inner"><pre class="${lazy ? 'mermaid-lazy' : 'mermaid'}">${escapeHtml(code)}</pre></div>
+<div class="inner">${svgs[defaultEngine]}</div>
+<script type="application/json" class="engine-data">${JSON.stringify(svgs)}</script>
+${testRawDot ? `<script type="application/json" class="test-raw-dot">${JSON.stringify(testRawDot)}</script>` : ''}
 </div>
-<button class="maxbtn" onclick="toggleMaximize(this)" title="На весь экран (F)">&#9974;</button>
-</div>`;
-}
-
-// A file diagram with grouped placeholders: rendered fully collapsed up
-// front (fast), with the data needed to expand any one group in place
-// (viewer.js recomposes the mermaid source and re-runs mermaid on it) parked
-// in a hidden JSON blob alongside it.
-function groupedDiagramBlock(fileDiagram) {
-  const { baseLines, classDefs, groups } = fileDiagram;
-  const collapsedLines = [...baseLines, ...groups.flatMap(g => [g.phLine, ...g.collapsedEdges])];
-  const code = mermaidFlow(collapsedLines, 'LR');
-  const payload = {
-    baseLines, classDefs,
-    groups: groups.map(g => ({ id: g.id, phLine: g.phLine, realLines: g.realLines, collapsedEdges: g.collapsedEdges, expandedEdges: g.expandedEdges })),
-  };
-  return `<div class="diagram-wrap">
-<div class="diagram" data-groups="true" tabindex="-1">
-<div class="zoombar">
-  <button onclick="zoom(this, 1.25)">+</button>
-  <button onclick="zoom(this, 0.8)">&minus;</button>
+<div class="diagram-toolbar">
+${varsToggle ? '  <label class="gv-ctrl"><input type="checkbox" class="gv-vars-toggle" checked> переменные</label>\n' : ''}  <select class="gv-engine-select">
+    <option value="neato"${defaultEngine === 'neato' ? ' selected' : ''}>органично</option>
+    <option value="dot"${defaultEngine === 'dot' ? ' selected' : ''}>иерархично</option>
+    <option value="fdp"${defaultEngine === 'fdp' ? ' selected' : ''}>силовое</option>
+  </select>
+${testRawDot ? `  <label class="gv-ctrl">mode <select class="test-mode-select">
+    <option value="">(default)</option>
+    <option value="KK">KK</option>
+    <option value="major">major</option>
+    <option value="hier">hier</option>
+    <option value="ipsep">ipsep</option>
+  </select></label>
+  <label class="gv-ctrl">model <select class="test-model-select">
+    <option value="">(default)</option>
+    <option value="shortpath">shortpath</option>
+    <option value="circuit">circuit</option>
+    <option value="mds">mds</option>
+  </select></label>
+  <label class="gv-ctrl">seed <input type="number" class="test-seed-input" value="0" min="0" max="999" style="width:4em"></label>
+  <label class="gv-ctrl">len <input type="number" class="test-len-input" value="3.5" min="0.5" max="10" step="0.5" style="width:4em"></label>` : ''}
+  <button class="maxbtn" onclick="toggleMaximize(this)" title="На весь экран (F)">&#9974;</button>
 </div>
-<div class="inner"><pre class="mermaid">${escapeHtml(code)}</pre></div>
-<script type="application/json" class="group-data">${JSON.stringify(payload)}</script>
-</div>
-<button class="maxbtn" onclick="toggleMaximize(this)" title="На весь экран (F)">&#9974;</button>
 </div>`;
 }
 
@@ -1740,26 +1854,29 @@ const funcsDir = path.join(outDir, 'functions');
 fs.mkdirSync(filesDir, { recursive: true });
 fs.mkdirSync(funcsDir, { recursive: true });
 
-// bundle mermaid + ELK layout engine so the output works offline; the bundle
-// is built once with esbuild and cached in dist/
 const here = path.dirname(fileURLToPath(import.meta.url));
-async function ensureViewerBundle() {
-  const entry = path.join(here, 'viewer-entry.mjs');
-  const outfile = path.join(here, 'dist', 'mermaid-elk.min.js');
-  const fresh = fs.existsSync(outfile)
-    && fs.statSync(outfile).mtimeMs >= fs.statSync(entry).mtimeMs;
-  if (!fresh) {
-    console.log('Building mermaid+ELK browser bundle (one-time)...');
-    const esbuild = await import('esbuild');
-    await esbuild.build({
-      entryPoints: [entry], bundle: true, format: 'iife', minify: true,
-      outfile, logLevel: 'silent',
-    });
-  }
-  return outfile;
-}
-fs.copyFileSync(await ensureViewerBundle(), path.join(outDir, 'mermaid-elk.min.js'));
 fs.copyFileSync(path.join(here, 'viewer.js'), path.join(outDir, 'app.js'));
+
+// graphviz-wasm.js: the same @hpcc-js/wasm-graphviz build index.mjs itself
+// uses, re-exported as a classic (non-module) script so viewer.js can load
+// it with a plain <script src> — a real `import`/`type=module` fetch of a
+// package from node_modules gets refused by Chrome on file:// pages (this
+// tool's normal way of being opened, no server), which is why this can't
+// just be a copy like app.js above. The wasm binary itself is embedded
+// inline in this file (no separate .wasm fetch), so once loaded it works
+// fully offline. Used by the function-page "Связи" diagram to lay out
+// caller/callee chains the user expands by clicking — see setupRelationsDiagram
+// in viewer.js.
+{
+  const src = fs.readFileSync(
+    path.join(here, 'node_modules', '@hpcc-js', 'wasm-graphviz', 'dist', 'index.js'), 'utf-8');
+  const re = /export\{(\w+) as Graph,(\w+) as Graphviz,(\w+) as Subgraph\};/;
+  const m = src.match(re);
+  if (!m) throw new Error('graphviz-wasm.js: could not find the expected export{...} tail — package layout changed?');
+  const classic = src.slice(0, m.index) +
+    `globalThis.GraphvizWasm={Graph:${m[1]},Graphviz:${m[2]},Subgraph:${m[3]}};`;
+  fs.writeFileSync(path.join(outDir, 'graphviz-wasm.js'), classic);
+}
 
 // graph-data.js: node info for hover tooltips on every page
 {
@@ -1770,6 +1887,24 @@ fs.copyFileSync(path.join(here, 'viewer.js'), path.join(outDir, 'app.js'));
       label: fn.name, kind: fn.isISR ? 'isr' : fn.isEntry ? 'entry' : 'fn',
       file: fn.file, sig: fn.signature, desc: fn.desc || undefined,
       href: `functions/${pageName(fn.key)}.html`,
+      // caller/callee ids + accessed-var ids, in the same "svg element id"
+      // namespace as everything else here — lets the client walk the call
+      // graph arbitrarily deep (e.g. the function-page relations diagram's
+      // click-to-expand-a-chain feature) without a page reload, by feeding
+      // freshly-built dot text through graphviz-wasm.js. Only populated for
+      // real (in-codebase) functions, not extfn/isr distinguishing needed.
+      calls: [...fn.calls].map(fnId),
+      callers: [...fn.callers].map(fnId),
+      access: [...fn.access.entries()].map(([vk, mode]) => ({ v: varId(vk), mode })),
+      // peripherals touched directly, with per-register detail — lets the
+      // client rebuild the "Связи" diagram show e.g. "UART2: CR1 (запись)"
+      // exactly as the build-time SVG does (see dotPeriphRelNode)
+      periph: fn.periphFields.size
+        ? [...fn.periphFields.entries()].map(([name, fields]) => ({
+            id: periphId(name), name,
+            regs: [...fields.entries()].map(([reg, mode]) => ({ reg, mode })),
+          }))
+        : undefined,
     };
     for (const ec of fn.extCalls) {
       nodes[extId(ec)] = nodes[extId(ec)] || { label: ec, kind: 'extfn' };
@@ -1827,8 +1962,15 @@ fs.copyFileSync(path.join(here, 'viewer.js'), path.join(outDir, 'app.js'));
       `<td>${users(v.writers)}</td><td>${users(v.readers)}</td></tr>`;
   }).join('\n');
 
-  const level0 = buildLevel0Diagram();
-  const level0Diagram = level0 ? diagramBlock(level0.code) : '';
+  const level0 = await buildLevel0Diagram();
+  const level0Diagram = level0
+    ? diagramBlockSvg(level0.svgs, { diagramId: 'level0', varsToggle: level0.varsToggle, testRawDot: level0.testRawDot })
+    : '';
+  const overview = await buildOverviewDiagram();
+  const overviewDiagram = diagramBlockSvg(overview.svgs, { diagramId: 'overview', varsToggle: overview.varsToggle });
+  const include = await buildIncludeDiagram();
+  const includeDiagram = diagramBlockSvg(include.svgs,
+    { diagramId: 'include', varsToggle: false, defaultEngine: include.defaultEngine || 'neato' });
   const body = `
 <h1>Обзор программы</h1>
 <p class="muted">Источник: ${roots.map(r => escapeHtml(path.resolve(r))).join(', ')} —
@@ -1848,12 +1990,12 @@ ${level0Diagram}
 <summary>Полная карта — все функции и переменные</summary>
 <p class="muted">Яркие крупные переменные — «шины» программы (много читателей/писателей, часто из разных файлов);
 бледные — используются одной функцией. Колесо мыши — масштаб, зажатая левая кнопка на пустом месте — перетаскивание.</p>
-${diagramBlock(buildOverviewDiagram(), { lazy: true })}
-</details>` : diagramBlock(buildOverviewDiagram())}
+${overviewDiagram}
+</details>` : overviewDiagram}
 
 <details>
 <summary>Граф include (файлы)</summary>
-${diagramBlock(buildIncludeDiagram(), { lazy: true })}
+${includeDiagram}
 </details>
 
 <h2>Файлы</h2>
@@ -1872,16 +2014,9 @@ ${diagramBlock(buildIncludeDiagram(), { lazy: true })}
 // per-file pages
 for (const f of fileRecords) {
   const fnsHere = [...funcs.values()].filter(fn => fn.file === f.basename);
-  const fileDiagram = buildFileDiagram(f);
-  let diagramSection;
-  if (!fileDiagram) {
-    diagramSection = `<p class="muted">Файл слишком велик для общей схемы связей (${fnsHere.length} функций) — см. список ниже, у каждой функции есть собственная страница со схемой.</p>`;
-  } else if (fileDiagram.groups) {
-    diagramSection = `<p class="muted">Файл слишком велик, чтобы показать всё сразу — связи с ${fileDiagram.groups.length} внешними группами и/или переменными файла свёрнуты в серые блоки; клик по блоку разворачивает его на месте, ничего не убрано насовсем.</p>
-${groupedDiagramBlock(fileDiagram)}`;
-  } else {
-    diagramSection = diagramBlock(fileDiagram.code);
-  }
+  const fileDiagram = await buildFileDiagram(f);
+  const diagramSection = diagramBlockSvg(fileDiagram.svgs,
+    { defaultEngine: fileDiagram.defaultEngine, varsToggle: fileDiagram.varsToggle, diagramId: 'file_' + sanitize(f.basename) });
   const body = `
 <h1>${escapeHtml(f.basename)}</h1>
 <p class="muted">${escapeHtml(f.filePath)}</p>
@@ -1902,7 +2037,8 @@ for (const fn of funcs.values()) {
     const modeText = { r: 'читает', w: 'пишет', rw: 'читает + пишет' }[mode];
     return `<li><b>${escapeHtml(v.name)}</b> — ${modeText}${v.isVolatile ? ' <b style="color:#dc2626">volatile</b>' : ''}${v.file ? ` <span class="muted">(${escapeHtml(v.file)})</span>` : ' <span class="muted">(внешняя)</span>'}${v.desc ? ` — ${escapeHtml(v.desc)}` : ''}</li>`;
   }).join('\n');
-  const cfg = buildCfgDiagram(fn);
+  const cfg = await buildCfgDiagram(fn);
+  const funcDiagram = await buildFunctionDiagram(fn);
   const body = `
 <h1>${escapeHtml(fn.name)}${fn.isISR ? ' <span style="color:#dc2626;font-size:0.8em">обработчик прерывания</span>' : ''}</h1>
 <p><span class="sig">${escapeHtml(fn.signature)}</span> &nbsp; в файле <a href="../files/${sanitize(fn.file)}.html">${escapeHtml(fn.file)}</a></p>
@@ -1910,9 +2046,9 @@ ${fn.desc ? `<p>${escapeHtml(fn.desc)}</p>` : ''}
 ${LEGEND}
 ${cfg ? `<h2>Алгоритм</h2>
 <p class="muted">Порядок выполнения: ромбы — условия и циклы, синие блоки — вызовы (двойной клик — перейти), «да/нет» — ветви.</p>
-${diagramBlock(cfg.code)}` : ''}
+${diagramBlockSvg(cfg.svgs, { defaultEngine: cfg.defaultEngine, varsToggle: false, diagramId: 'cfg_' + pageName(fn.key) })}` : ''}
 <h2>Связи</h2>
-${diagramBlock(buildFunctionDiagram(fn))}
+${diagramBlockSvg(funcDiagram.svgs, { defaultEngine: funcDiagram.defaultEngine, varsToggle: funcDiagram.varsToggle, diagramId: 'fndiag_' + pageName(fn.key), focus: fnId(fn.key) })}
 ${varList ? `<h2>Глобальные переменные функции</h2><ul>${varList}</ul>` : ''}`;
   fs.writeFileSync(path.join(funcsDir, `${pageName(fn.key)}.html`),
     htmlPage({ title: fn.name, rel: '../', path: `functions/${pageName(fn.key)}.html`, body, cfgLinks: cfg ? cfg.links : undefined }));
