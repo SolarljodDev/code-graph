@@ -1,0 +1,55 @@
+{
+  "name": "code-graph-cfg",
+  "displayName": "Code Graph — алгоритмы рядом с кодом",
+  "description": "Лента диаграмм «Алгоритм» (control-flow) всех функций C рядом с кодом: клик по ноде → переход в исходник; команда на строке кода → подсветка её ноды в графе.",
+  "version": "0.1.0",
+  "publisher": "code-graph",
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": ["Visualization"],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:c"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "codeGraphCfg.open",
+        "title": "Code Graph: открыть панель «Алгоритмы» рядом с кодом"
+      },
+      {
+        "command": "codeGraphCfg.locate",
+        "title": "Code Graph: показать текущую строку в графе"
+      },
+      {
+        "command": "codeGraph.level0.open",
+        "title": "Code Graph: показать диаграмму уровня 0 (точки входа, периферия, переменные)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "codeGraphCfg.locate",
+        "key": "ctrl+alt+g",
+        "when": "editorTextFocus && editorLangId == c"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "codeGraphCfg.locate",
+          "when": "editorLangId == c",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "postinstall": "node copy-wasm.js"
+  },
+  "dependencies": {
+    "@hpcc-js/wasm-graphviz": "^1.24.1",
+    "tree-sitter-wasms": "0.1.13",
+    "web-tree-sitter": "0.21.0"
+  }
+}

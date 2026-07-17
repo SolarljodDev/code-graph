@@ -476,39 +476,226 @@
     if (sub.length) rows.push(`<FONT POINT-SIZE="9">${sub.join(' &#183; ')}</FONT>`);
     return `  ${id} [id="${id}"${pos} class="${cls}" shape=cylinder label=<${rows.join('<BR/>')}>];`;
   }
-  const REL_MODE_WORD = { r: 'чтение', w: 'запись', rw: 'чтение/запись' };
   // peripheral block on a function's "Связи" diagram — kept compact (just the
-  // name); the specific registers this function touches go on the edge label
-  // instead (see relPeriphRegLabel), mirroring the build-time dotPeriphRelNode
-  // + periphRegEdgeLabel split so a client re-layout looks identical.
+  // name); the specific registers/bits this function touches go on the edge
+  // instead (see relPeriphDirDetail), mirroring the build-time
+  // dotPeriphRelNode + periphDirDetail split so a client re-layout looks
+  // identical.
   function relPeriphNodeLine(id, name, pos = '') {
     const rows = [`<FONT POINT-SIZE="10">периферия</FONT>`, `<B>${escHtml(name)}</B>`];
     return `  ${id} [id="${id}"${pos} class="periph" shape=hexagon label=<${rows.join('<BR/>')}>];`;
   }
-  // one direction for the whole fn<->periph edge, from the register modes
-  function relPeriphMode(regs) {
-    let r = false, w = false;
-    for (const x of regs) { if (x.mode.includes('r')) r = true; if (x.mode.includes('w')) w = true; }
-    return r && w ? 'rw' : w ? 'w' : 'r';
+  // mirrors index.mjs's isEnableFlagName/shortFlagName exactly (see there for
+  // the rationale) — two separate runtimes (this file ships to the browser,
+  // index.mjs runs at build time), so the logic is duplicated rather than
+  // shared.
+  const ENABLE_FLAG_RE = /(?:EN|ON|UE)$/;
+  function isEnableFlagName(name) { return ENABLE_FLAG_RE.test(name); }
+  // drops only the leading family segment (`DMA_CCR_EN` -> `CCR_EN`), keeps
+  // the register — same rule for every peripheral, no RCC special case.
+  function shortFlagName(flagName) {
+    const idx = flagName.indexOf('_');
+    return idx === -1 ? flagName : flagName.slice(idx + 1);
   }
-  // "CCR: запись\nCNDTR: запись" — \n is graphviz's own line-break escape for
-  // a plain (non-HTML) label, not a literal newline
-  function relPeriphRegLabel(regs, cap = 6) {
-    if (!regs.length) return '';
-    const sorted = [...regs].sort((a, b) => a.reg.localeCompare(b.reg));
-    const shown = sorted.slice(0, cap).map(r => `${r.reg}: ${REL_MODE_WORD[r.mode] || r.mode}`);
-    if (sorted.length > cap) shown.push(`+${sorted.length - cap}`);
-    return shown.join('\\n');
+  // one direction's full register/bit breakdown — mirrors index.mjs's
+  // periphDirDetail. No longer the edge's *visible* label (see addPeriphOf):
+  // a long version of it used to be baked straight into the graphviz label,
+  // and neato has no box to fit a tall multi-line label against, so it would
+  // drift the label away from the edge once a function touched enough
+  // registers at once. Returned separately and revealed only on hover — see
+  // injectPeriphDetailLabels and the .periph-detail/.periph-default CSS pair.
+  function relPeriphDirDetail(regs, dir, cap = 6) {
+    const relevant = regs.filter(r => r.mode.includes(dir));
+    if (!relevant.length) return { detail: '', hasEnable: false, enableLabel: '' };
+    let hasEnable = false, enableLabel = '';
+    const sorted = [...relevant].sort((a, b) => a.reg.localeCompare(b.reg));
+    const names = sorted.map(r => {
+      if (dir === 'w') {
+        // r.wFlags is [name, 'set'|'clear'|'both'][] (index.mjs's periphFlags
+        // 'w' side is a Map now, keyed by set/clear polarity — see
+        // mergeFlagPolarity there) — mirrors periphDirDetail exactly: a bit
+        // only ever cleared here gets a ~ prefix and never counts as the
+        // edge's enable-default-label candidate.
+        const flags = r.wFlags;
+        if (!flags || !flags.length) return r.reg;
+        const sortedFlags = [...flags].sort((a, b) => a[0].localeCompare(b[0]));
+        if (!hasEnable) {
+          const enableBit = sortedFlags.find(([fl, pol]) => isEnableFlagName(fl) && pol !== 'clear');
+          if (enableBit) { hasEnable = true; enableLabel = shortFlagName(enableBit[0]); }
+        }
+        return sortedFlags.map(([fl, pol]) => (pol === 'clear' ? '~' : '') + shortFlagName(fl)).join(', ');
+      }
+      const flags = r.rFlags;
+      if (flags && flags.length) {
+        const sortedFlags = [...flags].sort();
+        return sortedFlags.map(shortFlagName).join(', ');
+      }
+      return r.reg;
+    });
+    const shown = names.slice(0, cap);
+    if (names.length > cap) shown.push(`+${names.length - cap}`);
+    return { detail: shown.join('\\n'), hasEnable, enableLabel };
+  }
+  // Two edges between the exact same pair of nodes but opposite direction (a
+  // write-direction access edge and its read-direction sibling) otherwise
+  // draw as one perfectly straight, perfectly coincident line — client-side
+  // DOM equivalent of index.mjs's bendAntiParallelEdges (see there for the
+  // full rationale, incl. why tailport/headport was tried and reverted).
+  // Bends each half of a real anti-parallel pair into a gentle bow after
+  // layout, endpoints unchanged, and rotates the arrowhead to match.
+  //
+  // No explicit left/right sign needed: the reverse edge of a pair runs the
+  // *same* physical line from the opposite end, so its own (dx,dy) — and
+  // therefore its own perpendicular — already points the other way on its
+  // own.
+  function bendOneEdge(el, path, polygon) {
+    const d = path.getAttribute('d');
+    const nums = d && d.match(/-?\d+(?:\.\d+)?/g);
+    if (!nums || nums.length < 4) return;
+    const x1 = parseFloat(nums[0]), y1 = parseFloat(nums[1]);
+    const x2 = parseFloat(nums[nums.length - 2]), y2 = parseFloat(nums[nums.length - 1]);
+    const dx = x2 - x1, dy = y2 - y1;
+    const len = Math.hypot(dx, dy);
+    if (len < 1) return; // coincident nodes — nothing sane to bend
+    const midX = (x1 + x2) / 2, midY = (y1 + y2) / 2;
+    const bend = Math.min(18, len * 0.16);
+    const cx = midX + (-dy / len) * bend, cy = midY + (dx / len) * bend;
+    path.setAttribute('d', `M${x1.toFixed(2)},${y1.toFixed(2)} Q${cx.toFixed(2)},${cy.toFixed(2)} ${x2.toFixed(2)},${y2.toFixed(2)}`);
+    if (polygon) {
+      // a quadratic bezier's tangent at the endpoint points from the control
+      // point straight to the endpoint — rotate the arrowhead to match it.
+      const rot = Math.atan2(y2 - cy, x2 - cx) - Math.atan2(dy, dx);
+      const cos = Math.cos(rot), sin = Math.sin(rot);
+      const pts = polygon.getAttribute('points').trim().split(/\s+/).map(p => {
+        const [px, py] = p.split(',').map(Number);
+        const rx = px - x2, ry = py - y2;
+        return `${(x2 + rx * cos - ry * sin).toFixed(2)},${(y2 + rx * sin + ry * cos).toFixed(2)}`;
+      }).join(' ');
+      polygon.setAttribute('points', pts);
+    }
+    // the label (if any) was placed by graphviz for the *straight* line —
+    // shift it by the same offset the control point moved off the
+    // straight-line midpoint, or it's left stranded where the line used to
+    // run instead of following the curve it's actually sitting on now.
+    const offX = cx - midX, offY = cy - midY;
+    el.querySelectorAll('text').forEach(t => {
+      t.setAttribute('x', (parseFloat(t.getAttribute('x')) + offX).toFixed(2));
+      t.setAttribute('y', (parseFloat(t.getAttribute('y')) + offY).toFixed(2));
+    });
+  }
+  function bendAntiParallelEdges(svgRoot) {
+    const edges = [];
+    svgRoot.querySelectorAll('g.edge').forEach(el => {
+      const title = el.querySelector('title');
+      const parts = title ? title.textContent.split('->') : null;
+      const path = parts && parts.length === 2 && el.querySelector('path');
+      if (path) edges.push({ el, from: parts[0], to: parts[1], path });
+    });
+    const pairKeys = new Set(edges.map(e => `${e.from}>${e.to}`));
+    for (const e of edges) {
+      if (pairKeys.has(`${e.to}>${e.from}`)) bendOneEdge(e.el, e.path, e.el.querySelector('polygon'));
+    }
+  }
+
+  // client-side DOM equivalent of index.mjs's injectPeriphDetailLabels
+  // (string/regex there, real DOM here since this runs in the browser).
+  // `details` is the {from, to, detail} list addPeriphOf collected while
+  // building the edges. Revealed by the same .periph-detail/.periph-default
+  // CSS pair keyed off .hl that the existing hover system already toggles —
+  // no extra listeners needed for the swap itself.
+  // perpendicular push, off graphviz's own on-the-line anchor point —
+  // mirrors index.mjs's pushLabelPerp/pathPoints exactly (see there for the
+  // full rationale): two tiers, not one flat distance — the always-visible
+  // default label sits close (PUSH_NEAR), the hover-revealed detail stack
+  // sits further out, growing with how many lines it has to fit (PUSH_NEAR +
+  // PUSH_PER_LINE * lines). Direction comes from the path's local segment
+  // nearest the label's own point, not the overall start-to-end chord — a
+  // longer edge routed around other nodes can have local direction that
+  // differs noticeably from its overall chord.
+  const PERIPH_LABEL_PUSH_NEAR = 8;
+  const PERIPH_LABEL_PUSH_PER_LINE = 6;
+  function pathPoints(pathEl) {
+    const d = pathEl && pathEl.getAttribute('d');
+    const nums = d && d.match(/-?\d+(?:\.\d+)?/g);
+    if (!nums || nums.length < 4) return null;
+    const pts = [];
+    for (let i = 0; i + 1 < nums.length; i += 2) pts.push([parseFloat(nums[i]), parseFloat(nums[i + 1])]);
+    return pts;
+  }
+  function pushLabelPerp(pathEl, x0, y0, dist) {
+    const pts = pathPoints(pathEl);
+    if (!pts || pts.length < 2) return { x: x0, y: y0 };
+    let best = null, bestDist = Infinity;
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const [x1, y1] = pts[i], [x2, y2] = pts[i + 1];
+      const d = Math.hypot((x1 + x2) / 2 - x0, (y1 + y2) / 2 - y0);
+      if (d < bestDist) { bestDist = d; best = [x1, y1, x2, y2]; }
+    }
+    const [x1, y1, x2, y2] = best;
+    const dx = x2 - x1, dy = y2 - y1;
+    const len = Math.hypot(dx, dy);
+    if (len < 1) return { x: x0, y: y0 };
+    return { x: x0 + (-dy / len) * dist, y: y0 + (dx / len) * dist };
+  }
+  function injectPeriphDetailLabels(svgRoot, details) {
+    if (!details.length) return;
+    const byPair = new Map();
+    svgRoot.querySelectorAll('g.edge').forEach(el => {
+      const title = el.querySelector('title');
+      const parts = title ? title.textContent.split('->') : null;
+      if (parts && parts.length === 2) byPair.set(parts[0] + '>' + parts[1], el);
+    });
+    for (const { from, to, detail } of details) {
+      const el = byPair.get(from + '>' + to);
+      const text = el && el.querySelector('text');
+      if (!text) continue;
+      text.classList.add('periph-default');
+      const path = el.querySelector('path');
+      const origX = parseFloat(text.getAttribute('x')), origY = parseFloat(text.getAttribute('y'));
+      const lines = detail.split('\\n');
+      const near = pushLabelPerp(path, origX, origY, PERIPH_LABEL_PUSH_NEAR);
+      const far = pushLabelPerp(path, origX, origY, PERIPH_LABEL_PUSH_NEAR + PERIPH_LABEL_PUSH_PER_LINE * lines.length);
+      text.setAttribute('x', near.x.toFixed(2));
+      text.setAttribute('y', near.y.toFixed(2));
+      const dy = 12;
+      const baseY = far.y - dy * (lines.length - 1) / 2;
+      const clones = lines.map((line, i) => {
+        const clone = text.cloneNode(false);
+        clone.classList.remove('periph-default');
+        clone.classList.add('periph-detail');
+        clone.setAttribute('x', far.x.toFixed(2));
+        clone.setAttribute('y', (baseY + dy * i).toFixed(2));
+        clone.textContent = line;
+        return clone;
+      });
+      text.after(...clones);
+    }
   }
   const relCallEdge = (callerId, calleeId) => `  ${callerId} -> ${calleeId} [dir=forward, style=dashed];`;
-  function relAccessEdge(fnIdStr, varIdStr, mode, label = '') {
+  // always 0-2 separate directed lines (never dir=both) — see
+  // dotPeriphAccessEdges/dotAccessEdges in index.mjs for why: a register or
+  // var that's both read and written gets its own write edge and read edge,
+  // each with its own label, instead of one double-headed arrow. Endpoints
+  // stay at the plain node centers — see bendAntiParallelEdges for how the
+  // resulting coincident write/read lines get visually told apart instead.
+  // dashedRead: periph edges are solid=write/dashed=read (see
+  // dotPeriphAccessEdges in index.mjs) — plain variable access edges never
+  // used dashed for direction, only for call edges (relCallEdge above), so
+  // this only applies when addPeriphOf asks for it.
+  function relAccessEdge(fnIdStr, otherIdStr, mode, wLabel = '', rLabel = '', dashedRead = false) {
     // len: see dotEdge's comment in index.mjs — a labeled edge otherwise gets
     // no extra room reserved for the text, and a short one can spill it onto
     // a node. Only engages neato/fdp; dot ignores it.
-    const attrs = label ? ` label="${escHtml(label)}", len=3.5` : '';
-    if (mode === 'w') return `  ${fnIdStr} -> ${varIdStr} [dir=forward${attrs}];`;
-    if (mode === 'rw') return `  ${fnIdStr} -> ${varIdStr} [dir=both${attrs}];`;
-    return `  ${varIdStr} -> ${fnIdStr} [dir=forward${attrs}];`;
+    const lines = [];
+    if (mode.includes('w')) {
+      const attrs = wLabel ? ` label="${escHtml(wLabel)}", len=3.5` : '';
+      lines.push(`  ${fnIdStr} -> ${otherIdStr} [dir=forward${attrs}];`);
+    }
+    if (mode.includes('r')) {
+      const attrs = (rLabel ? ` label="${escHtml(rLabel)}", len=3.5` : '') + (dashedRead ? ', style=dashed' : '');
+      lines.push(`  ${otherIdStr} -> ${fnIdStr} [dir=forward${attrs}];`);
+    }
+    return lines;
   }
 
   function setupRelationsDiagram(diagram) {
@@ -630,6 +817,7 @@
       const fullColor = new Set([focusId]);
       const depthOf = new Map(); // id -> { side: 'up'|'down', depth }
       const focusFile = G[focusId].file;
+      const edgeDetails = []; // {from, to, detail} — see injectPeriphDetailLabels
 
       // Re-emit a previously-laid-out node at its old spot so this render holds
       // it still; new nodes (and everything under dot, which can't be pinned)
@@ -668,14 +856,18 @@
             seenNodes.add(a.v);
             nodeLines.push(relVarNodeLine(a.v, G[a.v], G[a.v].file === focusFile, pinOf(a.v)));
           }
-          edgeLines.push(relAccessEdge(fid, a.v, a.mode));
+          edgeLines.push(...relAccessEdge(fid, a.v, a.mode));
           fullColor.add(a.v);
           varPeriphMode.set(a.v, a.mode);
         }
       }
       // peripherals are shown, like variables, only for the focus itself and
       // only while the "переменные" toggle is on — they're the same data-access
-      // concern, just against a hardware register block instead of a global
+      // concern, just against a hardware register block instead of a global.
+      // No longer folds in a separate "armed" fact (arming has its own honest
+      // home now — a synthetic NVIC node, same as index.mjs's
+      // dotPeriphAccessEdges — see there for the full rationale): this edge
+      // is purely real register access, read or write.
       function addPeriphOf(fid) {
         if (!showVars) return;
         for (const pa of (G[fid].periph || [])) {
@@ -683,8 +875,20 @@
             seenNodes.add(pa.id);
             nodeLines.push(relPeriphNodeLine(pa.id, pa.name, pinOf(pa.id)));
           }
-          const mode = relPeriphMode(pa.regs);
-          edgeLines.push(relAccessEdge(fid, pa.id, mode, relPeriphRegLabel(pa.regs)));
+          const w = relPeriphDirDetail(pa.regs, 'w');
+          const r = relPeriphDirDetail(pa.regs, 'r');
+          const mode = (r.detail ? 'r' : '') + (w.detail ? 'w' : '');
+          // RCC excluded from the callout (its enable bits are clock gates
+          // for *other* peripherals, not a fact about RCC itself — see
+          // index.mjs's dotPeriphAccessEdges for the full rationale).
+          const wDefault = pa.name === 'RCC' ? '' : (w.hasEnable ? w.enableLabel : '');
+          // a blank default still needs *some* label so graphviz reserves a
+          // real text anchor for injectPeriphDetailLabels to clone from.
+          const wLabel = w.detail ? (wDefault || ' ') : wDefault;
+          const rLabel = r.detail ? ' ' : '';
+          edgeLines.push(...relAccessEdge(fid, pa.id, mode, wLabel, rLabel, true));
+          if (w.detail) edgeDetails.push({ from: fid, to: pa.id, detail: w.detail });
+          if (r.detail) edgeDetails.push({ from: pa.id, to: fid, detail: r.detail });
           fullColor.add(pa.id);
           varPeriphMode.set(pa.id, mode);
         }
@@ -767,7 +971,7 @@
         lastOrder = newOrder;
       }
 
-      return { dot: [...nodeLines, ...edgeLines, ...orderLines].join('\n'), fullColor, depthOf };
+      return { dot: [...nodeLines, ...edgeLines, ...orderLines].join('\n'), fullColor, depthOf, edgeDetails };
     }
 
     function wireRelationsNodes(svg, depthOf) {
@@ -892,7 +1096,7 @@
       diagram.classList.add('loading');
       try {
         const graphviz = await loadGraphvizWasm();
-        const { dot, fullColor, depthOf } = buildDot();
+        const { dot, fullColor, depthOf, edgeDetails } = buildDot();
         const pinning = curEngine !== 'dot' && lastPos;
         // same split as index.mjs's renderDotAll: dot's rank/column layout
         // never overlaps by construction, but neato/fdp place nodes by
@@ -923,6 +1127,8 @@
         const svgText = graphviz.layout(dotText, 'svg', curEngine);
         const doc = new DOMParser().parseFromString(svgText, 'image/svg+xml');
         const next = document.importNode(doc.documentElement, true);
+        bendAntiParallelEdges(next);
+        injectPeriphDetailLabels(next, edgeDetails);
         const inner = diagram.querySelector('.inner');
         inner.querySelector('svg').replaceWith(next);
         next.classList.add('fade');
@@ -1011,17 +1217,50 @@
     // DOM visibility flip on the one shared SVG.
     let curEngine = diagram.dataset.curEngine;
     let showVars = true;
-    let cyclicOnly = false;
+    // two independent checkboxes (gv-cyclic-toggle / gv-setup-toggle), not one
+    // exclusive choice — both checked = the plain "all" variant, exactly one
+    // checked = that variant's own inclusive reachability diagram, neither
+    // checked = their overlap (see buildLevel0Diagram in index.mjs)
+    let cyclicOn = true, setupOn = true;
+    // "DMA-потоки" — off by default (unlike vars/cyclic/setup, which start
+    // checked): the source/destination edges are extra detail most views
+    // don't need, so they only appear once asked for. Independent of
+    // filterSuffix()/showVars, same as those two — see the key order comment
+    // below.
+    let dmaOn = false;
     setupGraphvizSvg(diagram.querySelector('svg'));
 
-    // key order matches how index.mjs's buildLevel0Diagram actually names
-    // the extra variants: "<engine>", "<engine>_novars", "<engine>_cyclic",
-    // "<engine>_cyclic_novars" — cyclic segment always comes before novars
+    // key order matches how index.mjs's buildLevel0Diagram actually names the
+    // extra variants: "<engine>", "<engine>_novars", "<engine>_cyclic",
+    // "<engine>_cyclic_novars", "<engine>_setuponly", "<engine>_setuponly_novars",
+    // "<engine>_overlap", "<engine>_overlap_novars", each optionally also with
+    // a "_dma" segment inserted right before a trailing "_novars" (see
+    // withVariantSuffix in index.mjs) — filter segment, then _dma, then novars
+    function filterSuffix() {
+      if (cyclicOn && setupOn) return '';
+      if (cyclicOn) return '_cyclic';
+      if (setupOn) return '_setuponly';
+      return '_overlap';
+    }
     function swap() {
-      const key = curEngine + (cyclicOnly ? '_cyclic' : '') + (showVars ? '' : '_novars');
+      const filterBase = curEngine + filterSuffix();
+      const dmaBase = filterBase + (dmaOn ? '_dma' : '');
+      const key = dmaBase + (showVars ? '' : '_novars');
+      // a variant with nothing to hide behind "переменные" (e.g. setup-only
+      // reaches no global vars) never gets its own "_novars" render (see
+      // renderDotAll's hasVars gate in index.mjs) — fall back to that same
+      // filtered variant's with-vars render, not all the way to svgs[curEngine],
+      // or unchecking "переменные" would silently jump back to the unfiltered
+      // "all" diagram instead of just leaving this one's (empty) vars alone.
+      // Same idea one level up for "DMA-потоки": a filter this variant has no
+      // DMA edges at all in never gets its own "_dma" render (see
+      // assembleLevel0's hasDma gate) — fall back to that filter's plain
+      // render (dmaBase collapses to filterBase in the fallback chain) rather
+      // than all the way to the unfiltered engine default.
       const inner = diagram.querySelector('.inner');
       const old = inner.querySelector('svg');
-      const doc = new DOMParser().parseFromString(svgs[key] || svgs[curEngine], 'image/svg+xml');
+      const doc = new DOMParser().parseFromString(
+        svgs[key] || svgs[dmaBase] || svgs[filterBase] || svgs[curEngine], 'image/svg+xml');
       const next = document.importNode(doc.documentElement, true);
       old.replaceWith(next);
       setupGraphvizSvg(next);
@@ -1037,12 +1276,22 @@
       showVars = show;
       swap();
     }
-    function setCyclicOnly(on) {
-      if (cyclicOnly === on) return;
-      cyclicOnly = on;
+    function setCyclicOn(on) {
+      if (cyclicOn === on) return;
+      cyclicOn = on;
       swap();
     }
-    return { switchTo, setVarsVisible, setCyclicOnly };
+    function setSetupOn(on) {
+      if (setupOn === on) return;
+      setupOn = on;
+      swap();
+    }
+    function setDmaOn(on) {
+      if (dmaOn === on) return;
+      dmaOn = on;
+      swap();
+    }
+    return { switchTo, setVarsVisible, setCyclicOn, setSetupOn, setDmaOn };
   }
 
   // Explorer-style navigation history: every page visited extends the trail;
@@ -1111,14 +1360,32 @@
     });
 
     const cyclicCheckbox = toolbar.querySelector('.gv-cyclic-toggle');
-    if (!cyclicCheckbox || !switcher.setCyclicOnly) return;
-    const cyclicKey = 'cg_cyclic_' + id;
-    const savedCyclic = storageGet(cyclicKey);
-    cyclicCheckbox.checked = savedCyclic === '1';
-    switcher.setCyclicOnly(cyclicCheckbox.checked);
+    const setupCheckbox = toolbar.querySelector('.gv-setup-toggle');
+    if (!cyclicCheckbox || !setupCheckbox || !switcher.setCyclicOn) return;
+    const cyclicKey = 'cg_cyclic_' + id, setupKey = 'cg_setup_' + id;
+    const savedCyclic = storageGet(cyclicKey), savedSetup = storageGet(setupKey);
+    if (savedCyclic !== null) cyclicCheckbox.checked = savedCyclic === '1';
+    if (savedSetup !== null) setupCheckbox.checked = savedSetup === '1';
+    switcher.setCyclicOn(cyclicCheckbox.checked);
+    switcher.setSetupOn(setupCheckbox.checked);
     cyclicCheckbox.addEventListener('change', () => {
       storageSet(cyclicKey, cyclicCheckbox.checked ? '1' : '0');
-      switcher.setCyclicOnly(cyclicCheckbox.checked);
+      switcher.setCyclicOn(cyclicCheckbox.checked);
+    });
+    setupCheckbox.addEventListener('change', () => {
+      storageSet(setupKey, setupCheckbox.checked ? '1' : '0');
+      switcher.setSetupOn(setupCheckbox.checked);
+    });
+
+    const dmaCheckbox = toolbar.querySelector('.gv-dma-toggle');
+    if (!dmaCheckbox || !switcher.setDmaOn) return;
+    const dmaKey = 'cg_dma_' + id;
+    const savedDma = storageGet(dmaKey);
+    if (savedDma !== null) dmaCheckbox.checked = savedDma === '1';
+    switcher.setDmaOn(dmaCheckbox.checked);
+    dmaCheckbox.addEventListener('change', () => {
+      storageSet(dmaKey, dmaCheckbox.checked ? '1' : '0');
+      switcher.setDmaOn(dmaCheckbox.checked);
     });
   }
 
@@ -1140,10 +1407,11 @@
     const toolbar = diagram.parentElement.querySelector('.diagram-toolbar');
     const rawDotScript = diagram.querySelector('script.test-raw-dot');
     if (!toolbar || !rawDotScript) return;
-    const rawDot = JSON.parse(rawDotScript.textContent); // { all: {withVars, noVars}, cyclic: {withVars, noVars} }
+    const rawDot = JSON.parse(rawDotScript.textContent); // { all, cyclic, setuponly, overlap: {withVars, noVars} }
     const engineSelect = toolbar.querySelector('.gv-engine-select');
     const varsCheckbox = toolbar.querySelector('.gv-vars-toggle');
     const cyclicCheckbox = toolbar.querySelector('.gv-cyclic-toggle');
+    const setupCheckbox = toolbar.querySelector('.gv-setup-toggle');
     const modeSel = toolbar.querySelector('.test-mode-select');
     const modelSel = toolbar.querySelector('.test-model-select');
     const seedInput = toolbar.querySelector('.test-seed-input');
@@ -1164,11 +1432,14 @@
     async function renderCustom() {
       try {
         const graphviz = await loadGraphvizWasm();
-        // honor both the vars AND the cyclic-only checkbox — otherwise every
-        // test-control change re-drew the *all, with-vars* raw dot regardless
-        // of either checkbox's current state, so both silently reset the
-        // moment you touched a slider
-        const variant = (cyclicCheckbox && cyclicCheckbox.checked) ? rawDot.cyclic : rawDot.all;
+        // honor all three checkboxes — otherwise every test-control change
+        // re-drew the *all, with-vars* raw dot regardless of any of their
+        // current states, so all of them silently reset the moment you
+        // touched a slider
+        const cyclicOn = !cyclicCheckbox || cyclicCheckbox.checked;
+        const setupOn = !setupCheckbox || setupCheckbox.checked;
+        const variantKey = cyclicOn && setupOn ? 'all' : cyclicOn ? 'cyclic' : setupOn ? 'setuponly' : 'overlap';
+        const variant = rawDot[variantKey];
         const base = (!varsCheckbox || varsCheckbox.checked) ? variant.withVars : variant.noVars;
         let dotText = base.replace(/len=[\d.]+/g, `len=${lenInput.value}`);
         const extra = [`start=${seedInput.value}`];
@@ -1198,6 +1469,9 @@
     }
     if (cyclicCheckbox) {
       cyclicCheckbox.addEventListener('change', () => { if (!modeSel.disabled) renderCustom(); });
+    }
+    if (setupCheckbox) {
+      setupCheckbox.addEventListener('change', () => { if (!modeSel.disabled) renderCustom(); });
     }
     // engine dropdown swaps to a pre-baked SVG on its own (setupEngineSwitchable);
     // this only keeps the test controls' displayed values honest about what

@@ -214,15 +214,38 @@ function extractFileScopeVars(root, commentIdx) {
 // fold a new access mode into an existing one: r + w (in either order) => rw.
 const mergeMode = (prev, m) => (!prev ? m : prev === m ? prev : 'rw');
 
+// CMSIS/HAL bit-flag macros are always SHOUTING_SNAKE_CASE — a local
+// variable or parameter is not (`byte`, `data`, `len`). Used to keep
+// collectIdentifiers from misattributing a plain data value as a "flag" once
+// flag extraction covers plain `=` assignments too (see analyzeFunction's
+// third addFlagNames branch below) — `USART1->DR = byte` must never grow a
+// fake "byte" flag entry the way `CCR = DMA_CCR_MINC | DMA_CCR_EN` correctly
+// grows `MINC`/`EN` ones.
+const MACRO_CONST_RE = /^[A-Z_][A-Z0-9_]*$/;
 // every named identifier leaf under a (possibly grouped/OR'd) expression,
 // e.g. collectIdentifiers for `(FLAG1 | FLAG2)` -> {FLAG1, FLAG2} — used to
 // pull every flag name out of a bitmask test regardless of how many bits it
-// checks at once.
+// checks at once. Only collects SHOUTING_SNAKE_CASE leaves (see
+// MACRO_CONST_RE) — a lowercase identifier is a variable, never a flag.
 function collectIdentifiers(node, out) {
-  if (node.type === 'identifier') { out.add(node.text); return; }
+  if (node.type === 'identifier') {
+    if (MACRO_CONST_RE.test(node.text)) out.add(node.text);
+    return;
+  }
   if (node.type === 'parenthesized_expression' || node.type === 'binary_expression') {
     for (const c of node.namedChildren) collectIdentifiers(c, out);
   }
+}
+// merges a 'w'-direction flag's set/clear polarity into an accumulating Map
+// (flagName -> 'set'|'clear'|'both') — 'set' from `|= FLAG` and the one-shot
+// `field = FLAG1 | FLAG2 | ...` idiom, 'clear' from `field &= ~FLAG`. The same
+// bit seen as both within the merge (a channel disabled then immediately
+// re-armed in the same function, e.g. u1_kick's `CCR &= ~DMA_CCR_EN; ...;
+// CCR |= DMA_CCR_EN;`) collapses to 'both' rather than picking one arbitrarily
+// — periphDirDetail treats 'both' as "ends up enabled", same as a plain 'set'.
+function mergeFlagPolarity(map, name, polarity) {
+  const prev = map.get(name);
+  map.set(name, prev && prev !== polarity ? 'both' : polarity);
 }
 
 function classifyAccess(id) {
@@ -255,6 +278,12 @@ function classifyAccess(id) {
   }
   return 'r';
 }
+
+// Bare DMA controller instance (DMA1, DMA2 — never DMA1_Channel4, that's its
+// own instance). Declared up here, ahead of fileRecords/peripherals below,
+// because analyzeFunction (which needs it) runs while fileRecords is still
+// being built. See the fuller comment by allDerefNames/dmaChannelTarget.
+const DMA_BUS_RE = /^DMA[0-9]+$/;
 
 function analyzeFunction(funcNode) {
   const declarator = funcNode.childForFieldName('declarator');
@@ -296,12 +325,23 @@ function analyzeFunction(funcNode) {
   // field that pass used to throw away, so a reader of DR and a writer of CR1
   // on the same UART2 stay distinguishable.
   const derefFields = new Map(); // name -> Map(field -> 'r' | 'w' | 'rw')
-  // named bits tested against a register in a bitwise-AND, e.g. the
-  // "USART_SR_RXNE" in `if (X->SR & USART_SR_RXNE)` — this is how ISR bodies
-  // near-universally spell "which specific interrupt source is this",
-  // usually invisible once periph access is collapsed to just the register.
-  // name -> Map(field -> Set(flag name))
+  // named bits behind a register access, split by which mode they came in as
+  // — read-tested (`if (X->SR & USART_SR_RXNE)`, how ISR bodies near-
+  // universally spell "which interrupt source is this") vs write-set/cleared
+  // (`X->CCR |= DMA_CCR_EN` / `X->CCR &= ~DMA_CCR_EN`) — a register touched
+  // via two different bits in two different places should read as two
+  // different things, not collapse to one anonymous "CCR: чтение/запись".
+  // name -> Map(field -> { r: Set(flag name), w: Set(flag name) })
   const derefFlags = new Map();
+  // a DMA channel's own address registers (`CPAR`/`CMAR`) resolved to
+  // *what* they point at, when the right-hand side of a plain `X->CPAR = ...`
+  // assignment is simple enough to tell statically — `&PERIPH->field` names a
+  // peripheral, a bare identifier or `&identifier` names a global/static var.
+  // Anything else (a local pointer alias, e.g. `X->CMAR = (uint32_t)m->data`
+  // where `m` points into a runtime queue slot) is left unresolved — there's
+  // no attempt to trace local pointer assignments. See resolveAddrExpr.
+  // name -> Map(field -> { kind: 'var' | 'periph', name })
+  const derefAddrRefs = new Map();
   const access = new Map(); // name -> { r, w }
   const NVIC_ARM_RE = /^(HAL_|LL_)?NVIC_EnableIRQ$/;
   if (body) {
@@ -332,24 +372,89 @@ function analyzeFunction(funcNode) {
         derefNames.add(name);
         const field = p.childForFieldName('field')?.text;
         if (field) {
+          // named bits behind this access, split by which mode they came in
+          // as — 'r' from `X->field & FLAG` (either operand order, tests a
+          // bit), 'w' from `X->field |= FLAG` (sets), `X->field &= ~FLAG`
+          // (clears), or a plain `X->field = FLAG1 | FLAG2 | ...` (a one-shot
+          // full-register config write, e.g. DMA_CCR init or USART CR1
+          // enable). A plain assignment whose right side isn't built from
+          // named constants at all (`X->field = 0x1234`, `X->field = byte`)
+          // still has no named bit — collectIdentifiers only ever adds
+          // SHOUTING_SNAKE_CASE leaves (MACRO_CONST_RE), so a lowercase
+          // variable or a bare number never becomes a fake "flag"; the caller
+          // falls back to the bare register name for those, same as before
+          // this was generalized past the original bare-DMA1/DMA2-only
+          // special case (user request, 2026-07-16: main's setup-time
+          // `USART1->CR1 = TE | RE | IDLEIE | UE` was showing as bare "CR1"
+          // instead of surfacing the `UE` enable bit).
+          // `w`'s per-flag value is a Map(flagName -> 'set'|'clear'|'both'),
+          // not a Set — same flag name can mean opposite things depending on
+          // whether it came in via `|=` (arm) or `&= ~` (disarm); `r` stays a
+          // plain Set (a bit *test* has no set/clear polarity). `polarity` is
+          // only meaningful when kind === 'w'.
+          function addFlagNames(kind, node, polarity) {
+            const flagNames = new Set();
+            collectIdentifiers(node, flagNames);
+            if (!flagNames.size) return;
+            let flagMap = derefFlags.get(name);
+            if (!flagMap) { flagMap = new Map(); derefFlags.set(name, flagMap); }
+            let perKind = flagMap.get(field);
+            if (!perKind) { perKind = { r: new Set(), w: new Map() }; flagMap.set(field, perKind); }
+            if (kind === 'w') {
+              for (const fl of flagNames) mergeFlagPolarity(perKind.w, fl, polarity);
+            } else {
+              for (const fl of flagNames) perKind.r.add(fl);
+            }
+          }
+          // `X->field |= FLAG` / `X->field &= ~FLAG` is the universal
+          // set/clear-a-bit idiom (arm/disarm, enable/disable) — hardware-wise
+          // a read-modify-write, but nothing is semantically *read* here: nobody
+          // downstream branches on the bit this statement itself just set. Field-
+          // level mode is downgraded to plain 'w' for exactly this idiom so it
+          // doesn't masquerade as a read of the register (which used to draw a
+          // phantom read-edge with no actual read site to point to — see the
+          // dwin_tick -> u2_dma_kick -> DMA1_Channel7->CCR case that prompted this).
+          // Any other compound assignment (`CNT += 1`, `CR1 ^= x`, a `&=` with a
+          // non-complement mask, ...) keeps classifyAccess's genuine 'rw'.
+          let fieldMode = mode;
+          const parent = p.parent;
+          const isSetClearIdiom = parent && parent.type === 'assignment_expression'
+            && sameNode(parent.childForFieldName('left'), p)
+            && (() => {
+              const op = parent.children.find(c => !c.isNamed && c.text.endsWith('='))?.text;
+              const right = parent.childForFieldName('right');
+              if (op === '|=' && right) return true;
+              if (op === '&=' && right && right.type === 'unary_expression'
+                  && right.children[0]?.text === '~') return true;
+              return false;
+            })();
+          if (isSetClearIdiom) fieldMode = 'w';
+
           let fm = derefFields.get(name);
           if (!fm) { fm = new Map(); derefFields.set(name, fm); }
-          fm.set(field, mergeMode(fm.get(field), mode));
+          fm.set(field, mergeMode(fm.get(field), fieldMode));
 
-          // "X->field & FLAG" (either operand order) — collect every named
-          // identifier on the other side, so `& (FLAG1 | FLAG2)` yields both
-          const bexpr = p.parent;
-          if (bexpr && bexpr.type === 'binary_expression' && bexpr.childForFieldName('operator')?.text === '&') {
-            const left = bexpr.childForFieldName('left'), right = bexpr.childForFieldName('right');
+          if (parent && parent.type === 'binary_expression' && parent.childForFieldName('operator')?.text === '&') {
+            const left = parent.childForFieldName('left'), right = parent.childForFieldName('right');
             const other = sameNode(left, p) ? right : (sameNode(right, p) ? left : null);
-            if (other) {
-              const flagNames = new Set();
-              collectIdentifiers(other, flagNames);
-              if (flagNames.size) {
-                let flagMap = derefFlags.get(name);
-                if (!flagMap) { flagMap = new Map(); derefFlags.set(name, flagMap); }
-                if (!flagMap.has(field)) flagMap.set(field, new Set());
-                for (const fl of flagNames) flagMap.get(field).add(fl);
+            if (other) addFlagNames('r', other);
+          } else if (parent && parent.type === 'assignment_expression' && sameNode(parent.childForFieldName('left'), p)) {
+            const op = parent.children.find(c => !c.isNamed && c.text.endsWith('='))?.text;
+            const right = parent.childForFieldName('right');
+            if (op === '|=' && right) {
+              addFlagNames('w', right, 'set');
+            } else if (op === '&=' && right && right.type === 'unary_expression'
+                && right.children[0]?.text === '~') {
+              addFlagNames('w', right.childForFieldName('argument'), 'clear');
+            } else if (op === '=' && right) {
+              addFlagNames('w', right, 'set');
+              if (field === 'CPAR' || field === 'CMAR') {
+                const ref = resolveAddrExpr(right);
+                if (ref) {
+                  let am = derefAddrRefs.get(name);
+                  if (!am) { am = new Map(); derefAddrRefs.set(name, am); }
+                  am.set(field, ref);
+                }
               }
             }
           }
@@ -392,7 +497,40 @@ function analyzeFunction(funcNode) {
   // whole call tree, which is reserved for when no loop was found *at all*.
   const hasLoop = !!loopNode;
 
-  return { calls, armCalls, derefNames, derefFields, derefFlags, access, signature, loopCallNames, hasLoop };
+  return { calls, armCalls, derefNames, derefFields, derefFlags, derefAddrRefs, access, signature, loopCallNames, hasLoop };
+}
+
+// Strips a DMA CPAR/CMAR assignment's right-hand side down to the expression
+// that actually names the source/destination address — casts
+// (`(uint32_t)...`) and parens first, then, if what's left is `&something`,
+// unwraps that one layer too (both `X->CPAR = (uint32_t)&USART1->DR` and
+// `X->CPAR = &USART1->DR` name the same target either way; a plain
+// `X->CMAR = u1_rx_buf` never had a `&` in the first place — arrays decay to
+// a pointer on their own). What remains is classified: a `->` field access
+// names the peripheral it's rooted at (the specific field doesn't matter —
+// the peripheral is the whole point of the node), a bare identifier names a
+// var. Anything else (`m->data` off a local pointer, as in u1_kick — the
+// queue-slot address isn't known until runtime) resolves to null; this never
+// tries to trace a local variable's own prior assignment.
+function resolveAddrExpr(node) {
+  let n = node;
+  for (;;) {
+    if (n && n.type === 'parenthesized_expression') { n = n.namedChildren[0]; continue; }
+    if (n && n.type === 'cast_expression') { n = n.childForFieldName('value'); continue; }
+    break;
+  }
+  if (!n) return null;
+  if (n.type === 'pointer_expression' && n.childForFieldName('operator')?.text === '&') {
+    n = n.childForFieldName('argument');
+    while (n && n.type === 'parenthesized_expression') n = n.namedChildren[0];
+  }
+  if (!n) return null;
+  if (n.type === 'field_expression' && n.childForFieldName('operator')?.text === '->') {
+    const base = n.childForFieldName('argument');
+    return base && base.type === 'identifier' ? { kind: 'periph', name: base.text } : null;
+  }
+  if (n.type === 'identifier') return { kind: 'var', name: n.text };
+  return null;
 }
 
 // A while/for statement that never terminates by its own condition — the
@@ -731,6 +869,39 @@ function periph(name) {
   return peripherals.get(name);
 }
 
+// Every literal `X->field` base name used anywhere in the program, gathered
+// up front so the DMA controller/channel redirect below (see dmaChannelTarget)
+// can tell a real channel/stream instance from one it would otherwise have to
+// invent. Vendor headers give DMA1/DMA2 their own status-flag register (ISR
+// on F1-style "channel" parts, LISR/HISR on F4/F7/H7-style "stream" parts)
+// shared across every channel/stream, while each channel/stream keeps its own
+// config registers under its own name (DMA1_Channel4, DMA1_Stream4) — so a
+// flag test against the bare controller name is the *only* case where the
+// code's own identifier doesn't already point at the specific unit it's
+// about.
+const allDerefNames = new Set();
+for (const f of fileRecords) for (const fn of f.funcs) for (const n of fn.derefNames) allDerefNames.add(n);
+
+// A DMA status flag's own macro name always ends in the channel/stream number
+// it belongs to (TCIF4, HTIF4, CTCIF4, ...) regardless of family or how the
+// bits are actually laid out inside the register — so this reads the target
+// off the flag's own text rather than any bit-position arithmetic, which is
+// what makes it work the same for F1-style channels and F4/F7/H7-style
+// streams alike. Returns null (no redirect — the flag stays attributed to
+// the bare controller) when there's no trailing number, or when the would-be
+// target was never itself seen as a real `X->field` instance in this
+// program — never invents a node purely from the naming convention.
+function dmaChannelTarget(busName, flagName) {
+  const m = /(\d+)$/.exec(flagName);
+  if (!m) return null;
+  const n = m[1];
+  const channel = `${busName}_Channel${n}`;
+  if (allDerefNames.has(channel)) return channel;
+  const stream = `${busName}_Stream${n}`;
+  if (allDerefNames.has(stream)) return stream;
+  return null;
+}
+
 for (const f of fileRecords) {
   for (const v of f.vars.defs) {
     const key = v.isStatic ? `${v.name}@${f.basename}` : v.name;
@@ -767,7 +938,8 @@ for (const f of fileRecords) {
       access: new Map(),     // varKey -> 'r' | 'w' | 'rw'
       periphAccess: new Map(), // peripheral name -> 'r' | 'w' | 'rw'
       periphFields: new Map(), // peripheral name -> Map(register -> 'r' | 'w' | 'rw')
-      periphFlags: new Map(),  // peripheral name -> Map(register -> Set(flag name))
+      periphFlags: new Map(),  // peripheral name -> Map(register -> { r: Set(flag), w: Set(flag) })
+      periphAddrRefs: new Map(), // peripheral name -> Map(register -> { kind: 'var'|'periph', name })
       arms: new Set(),         // peripheral names this function directly NVIC_EnableIRQ's
       loopCalls: new Set(),    // funcKeys called inside this function's own top-level infinite loop
       hasLoop: fn.hasLoop,     // a top-level while(1)/for(;;) was found, even if loopCalls ends up empty
@@ -846,31 +1018,133 @@ for (const f of fileRecords) {
       }
       if (fn.derefNames.has(name)) {
         // never resolved to a real var/func/extern, but seen as `name->field`:
-        // a peripheral register block from a vendor header we didn't parse
-        const p = periph(name);
-        const m = (mode.r ? 'r' : '') + (mode.w ? 'w' : '');
-        const prev = rec.periphAccess.get(name);
-        rec.periphAccess.set(name, prev && prev !== m ? 'rw' : (m || 'r'));
-        if (mode.r) p.readers.add(rec.key);
-        if (mode.w) p.writers.add(rec.key);
-        // carry the per-register breakdown onto both the function (for its own
-        // "Связи" diagram) and the peripheral (union, for level 0's node label)
+        // a peripheral register block from a vendor header we didn't parse.
+        //
+        // For a bare DMA controller name (DMA1, DMA2 — never DMA1_Channel4,
+        // that already names its own unit), a flag whose text carries a
+        // channel/stream number gets attributed straight to that channel's
+        // own peripheral instead of the shared controller (see
+        // dmaChannelTarget) — everything else (a field with no named flag at
+        // all, e.g. a blanket `IFCR = 0xFFFFFFFF` clear, or a flag with no
+        // resolvable/real target) falls back to the controller name exactly
+        // as before, so that genuinely ambiguous case still gets a node.
         const flds = fn.derefFields.get(name);
-        if (flds) {
-          let rf = rec.periphFields.get(name);
-          if (!rf) { rf = new Map(); rec.periphFields.set(name, rf); }
-          for (const [field, fm] of flds) {
-            rf.set(field, mergeMode(rf.get(field), fm));
-            p.fields.set(field, mergeMode(p.fields.get(field), fm));
-          }
-        }
         const flagsByField = fn.derefFlags.get(name);
-        if (flagsByField) {
-          let rflag = rec.periphFlags.get(name);
-          if (!rflag) { rflag = new Map(); rec.periphFlags.set(name, rflag); }
-          for (const [field, flags] of flagsByField) {
-            if (!rflag.has(field)) rflag.set(field, new Set());
-            for (const fl of flags) rflag.get(field).add(fl);
+        const isDmaBus = DMA_BUS_RE.test(name);
+
+        // redirect target name -> { fields: Map(field -> mode), flags: Map(field -> {r,w}) }
+        const buckets = new Map();
+        function bucket(t) {
+          let b = buckets.get(t);
+          if (!b) { b = { fields: new Map(), flags: new Map() }; buckets.set(t, b); }
+          return b;
+        }
+
+        if (flds) {
+          for (const [field, fm] of flds) {
+            const flagRec = flagsByField && flagsByField.get(field);
+            let residual = fm; // mode left unaccounted for by a redirected flag
+            // 'r' stays a Set(flagName), 'w' is now a Map(flagName ->
+            // 'set'|'clear'|'both') — handled separately since their element
+            // shapes differ (see mergeFlagPolarity/addFlagNames above).
+            if (isDmaBus && flagRec) {
+              if (flagRec.r && flagRec.r.size) {
+                residual = residual.replace('r', '');
+                for (const flag of flagRec.r) {
+                  const chan = dmaChannelTarget(name, flag);
+                  const b = bucket(chan || name);
+                  b.fields.set(field, mergeMode(b.fields.get(field), 'r'));
+                  if (!b.flags.has(field)) b.flags.set(field, { r: new Set(), w: new Map() });
+                  b.flags.get(field).r.add(flag);
+                }
+              }
+              if (flagRec.w && flagRec.w.size) {
+                residual = residual.replace('w', '');
+                for (const [flag, polarity] of flagRec.w) {
+                  const chan = dmaChannelTarget(name, flag);
+                  const b = bucket(chan || name);
+                  b.fields.set(field, mergeMode(b.fields.get(field), 'w'));
+                  if (!b.flags.has(field)) b.flags.set(field, { r: new Set(), w: new Map() });
+                  mergeFlagPolarity(b.flags.get(field).w, flag, polarity);
+                }
+              }
+            }
+            if (residual) {
+              const b = bucket(name);
+              b.fields.set(field, mergeMode(b.fields.get(field), residual));
+              // carry over the flag names for whichever direction(s) weren't
+              // redirected above — for a non-DMA peripheral (isDmaBus false)
+              // that's simply everything flagRec has, same as pre-redirect.
+              if (flagRec) {
+                if (!b.flags.has(field)) b.flags.set(field, { r: new Set(), w: new Map() });
+                const cur = b.flags.get(field);
+                if (residual.includes('r') && flagRec.r) for (const fl of flagRec.r) cur.r.add(fl);
+                if (residual.includes('w') && flagRec.w) {
+                  for (const [fl, pol] of flagRec.w) mergeFlagPolarity(cur.w, fl, pol);
+                }
+              }
+            }
+          }
+        } else {
+          bucket(name); // bare access with no `->field` breakdown at all
+        }
+
+        for (const [tName, b] of buckets) {
+          const p = periph(tName);
+          let tr = false, tw = false;
+          for (const fm of b.fields.values()) { if (fm.includes('r')) tr = true; if (fm.includes('w')) tw = true; }
+          if (!b.fields.size) { tr = mode.r; tw = mode.w; }
+          const tm = (tr ? 'r' : '') + (tw ? 'w' : '');
+          const prev = rec.periphAccess.get(tName);
+          rec.periphAccess.set(tName, prev && prev !== tm ? 'rw' : (tm || 'r'));
+          if (tr) p.readers.add(rec.key);
+          if (tw) p.writers.add(rec.key);
+          // carry the per-register breakdown onto both the function (for its own
+          // "Связи" diagram) and the peripheral (union, for level 0's node label)
+          if (b.fields.size) {
+            let rf = rec.periphFields.get(tName);
+            if (!rf) { rf = new Map(); rec.periphFields.set(tName, rf); }
+            for (const [field, fm] of b.fields) {
+              rf.set(field, mergeMode(rf.get(field), fm));
+              p.fields.set(field, mergeMode(p.fields.get(field), fm));
+            }
+          }
+          if (b.flags.size) {
+            let rflag = rec.periphFlags.get(tName);
+            if (!rflag) { rflag = new Map(); rec.periphFlags.set(tName, rflag); }
+            for (const [field, perKind] of b.flags) {
+              if (!rflag.has(field)) rflag.set(field, { r: new Set(), w: new Map() });
+              const cur = rflag.get(field);
+              for (const fl of perKind.r) cur.r.add(fl);
+              for (const [fl, pol] of perKind.w) mergeFlagPolarity(cur.w, fl, pol);
+            }
+          }
+          // CPAR/CMAR address refs are keyed off the literal derefName they
+          // were found on (see resolveAddrExpr) — they only ever live on the
+          // bucket that resolved to that exact same name (never a DMA-bus
+          // redirect target; CPAR/CMAR live on the channel's own name, e.g.
+          // "DMA1_Channel4", which never matches DMA_BUS_RE in the first
+          // place, so isDmaBus is always false for it).
+          if (tName === name) {
+            const addrRefs = fn.derefAddrRefs.get(name);
+            if (addrRefs && addrRefs.size) {
+              let ra = rec.periphAddrRefs.get(tName);
+              if (!ra) { ra = new Map(); rec.periphAddrRefs.set(tName, ra); }
+              for (const [field, ref] of addrRefs) {
+                // a 'var' ref only ever carries the bare identifier text at
+                // this point (resolveAddrExpr has no file context) — resolve
+                // it to a real varKey now, same rule as any other access
+                // (resolveVar), and drop it if it doesn't name an actual
+                // global/static (e.g. a param/local resolveAddrExpr can't
+                // tell apart from a global by AST shape alone).
+                if (ref.kind === 'var') {
+                  const vk = resolveVar(ref.name, f.basename);
+                  if (vk) ra.set(field, { kind: 'var', key: vk });
+                } else {
+                  ra.set(field, ref);
+                }
+              }
+            }
           }
         }
         continue;
@@ -884,6 +1158,35 @@ for (const f of fileRecords) {
       const p = periph(name);
       p.armers.add(rec.key);
       rec.arms.add(name);
+
+      // NVIC itself never becomes a real peripheral node the normal way —
+      // NVIC_EnableIRQ's actual register write (NVIC->ISER[...] |= ...) lives
+      // inside a CMSIS core header (core_cm3.h) this tool doesn't parse, and
+      // even when that header *is* fed in, the call site says "NVIC_EnableIRQ"
+      // while the real body is named "__NVIC_EnableIRQ" (CMSIS's own
+      // `#define NVIC_EnableIRQ __NVIC_EnableIRQ` alias) — invisible to a
+      // syntax-only parser with no preprocessor, so the two never link up.
+      // Synthesized here instead, flowing through the exact same
+      // register/flag rendering pipeline as a real access (register "ISER",
+      // one flag per interrupt line actually armed) so it renders, groups,
+      // and hover-reveals identically to every other peripheral — no special
+      // casing anywhere else. "IRQ_" is a throwaway one-segment prefix:
+      // shortFlagName always strips exactly the first segment for display
+      // (see its own comment), so this makes the *literal* IRQn identifier
+      // (`DMA1_Channel7_IRQn`) the thing that survives onto the edge, not
+      // some invented shorthand. User request, 2026-07-16.
+      const nvic = periph('NVIC');
+      nvic.writers.add(rec.key);
+      nvic.fields.set('ISER', mergeMode(nvic.fields.get('ISER'), 'w'));
+      const prevNvic = rec.periphAccess.get('NVIC');
+      rec.periphAccess.set('NVIC', prevNvic && prevNvic !== 'w' ? 'rw' : 'w');
+      let nvicFields = rec.periphFields.get('NVIC');
+      if (!nvicFields) { nvicFields = new Map(); rec.periphFields.set('NVIC', nvicFields); }
+      nvicFields.set('ISER', mergeMode(nvicFields.get('ISER'), 'w'));
+      let nvicFlags = rec.periphFlags.get('NVIC');
+      if (!nvicFlags) { nvicFlags = new Map(); rec.periphFlags.set('NVIC', nvicFlags); }
+      if (!nvicFlags.has('ISER')) nvicFlags.set('ISER', { r: new Set(), w: new Map() });
+      mergeFlagPolarity(nvicFlags.get('ISER').w, `IRQ_${irqRaw}`, 'set');
     }
   }
 }
@@ -1242,12 +1545,29 @@ const dotKindRow = text => `<FONT POINT-SIZE="10">${dotEsc(text)}</FONT>`;
 // style= attribute replaces the inherited one, it doesn't merge with it)
 const GHOST_STYLE = ' style="filled,dashed"';
 
-// every flag name an ISR tests via `X->REG & FLAG` anywhere in its body
-// (see periphFlags/derefFlags) — deduped and capped, since a handler that
-// juggles several sources (e.g. a shared DMA IRQ) can rack up a dozen.
+// every flag name an ISR touches anywhere in its body — read-tested
+// (`X->SR & FLAG`, "is this the source") or write-set/cleared (`X->SR &= ~FLAG`,
+// the near-universal "acknowledge this interrupt" pattern); see
+// periphFlags/derefFlags. Deduped and capped, since a handler that juggles
+// several sources (e.g. a shared DMA IRQ) can rack up a dozen.
 function isrFlagList(fn, cap = 6) {
   const all = new Set();
-  for (const regs of fn.periphFlags.values()) for (const flags of regs.values()) for (const f of flags) all.add(f);
+  // Read-tested flags only (`if (X->SR & FLAG)`) — this list answers "which
+  // interrupt source is this handler reacting to", and that's decided by the
+  // condition it was dispatched on, not by whatever it writes afterwards
+  // (acknowledging/clearing the flag, e.g. `DMA1->IFCR = DMA_IFCR_CTCIF7`, is
+  // bookkeeping for *this same* source, not a source of its own — showing it
+  // next to the tested flag reads as two separate events instead of one).
+  // Enable/on bits (DMA_CCR_EN, RCC_CR_HSEON...) are excluded for the same
+  // reason even on the read side — they arm something, they don't report an
+  // event; see isEnableFlagName. The leading "DMA_" is dropped too: the
+  // handler's own name already says which DMA instance this is, so it's dead
+  // weight on an already-tight node.
+  for (const regs of fn.periphFlags.values()) {
+    for (const { r } of regs.values()) {
+      for (const f of r) if (!isEnableFlagName(f)) all.add(f.replace(/^DMA_/, ''));
+    }
+  }
   if (!all.size) return '';
   const sorted = [...all].sort();
   const shown = sorted.slice(0, cap);
@@ -1260,7 +1580,7 @@ function dotFnNode(fn, { ghost = false, withFile = false, focus = false } = {}) 
   if (fn.desc && !ghost) rows.push(`<FONT POINT-SIZE="9"><I>${dotEsc(truncate(fn.desc, 46))}</I></FONT>`);
   if (fn.isISR && !ghost) {
     const flags = isrFlagList(fn);
-    if (flags) rows.push(`<FONT POINT-SIZE="9">флаги: ${dotEsc(flags)}</FONT>`);
+    if (flags) rows.push(`<FONT POINT-SIZE="9">${dotEsc(flags)}</FONT>`);
   }
   const cls = ghost ? 'ghost' : fnClass(fn);
   const extra = (ghost ? GHOST_STYLE : '') + (focus ? ' penwidth=3' : '');
@@ -1287,22 +1607,93 @@ function dotVarNode(v, { tiered = false, ghost = false, withFile = false } = {})
 function dotExtNode(name) {
   return dotNode(extId(name), [dotKindRow('ext'), `<B>${dotEsc(name)}</B>`], 'box', 'ghost', GHOST_STYLE);
 }
-const MODE_WORD = { r: 'чтение', w: 'запись', rw: 'чтение/запись' };
-// "CCR: запись\nCNDTR: запись" from a Map(register -> mode), for the edge
-// label rather than the node — packing the register list into the
-// peripheral's own node label used to stretch it across the whole diagram
-// once a peripheral was touched from several entries/functions; a per-edge
-// label keeps the node compact and ties each register straight to *who*
-// touches it. Registers alphabetised so the same access reads the same way
-// wherever it appears; \n is graphviz's own line-break escape for a plain
-// (non-HTML) label, not a literal newline. Capped, so an edge from a
-// call-tree that touches a dozen registers doesn't grow a giant label.
-function periphRegEdgeLabel(fields, cap = 6) {
-  if (!fields || !fields.size) return '';
-  const regs = [...fields.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-  const shown = regs.slice(0, cap).map(([f, m]) => `${f}: ${MODE_WORD[m]}`);
-  if (regs.length > cap) shown.push(`+${regs.length - cap}`);
-  return shown.join('\\n');
+// a bit name shaped like "this arms/turns something on" — the near-universal
+// STM32 convention is a trailing EN or ON (RCC_APB2ENR_IOPAEN, DMA_CCR_EN,
+// RCC_CR_HSEON/PLLON), as opposed to a status/test flag that never ends that
+// way (USART_SR_IDLE, DMA_ISR_TCIF7). USART/UART's own master-enable bit
+// breaks that suffix pattern (`USART_CR1_UE`, "USART Enable" — a genuine,
+// separate CMSIS convention, not a typo), added 2026-07-16 once plain `=`
+// assignment decomposition (see analyzeFunction's addFlagNames) started
+// surfacing it. Used to decide whether an edge's default label reads its
+// enable bit's own register-qualified name instead of sitting blank — see
+// dotPeriphAccessEdges.
+const ENABLE_FLAG_RE = /(?:EN|ON|UE)$/;
+function isEnableFlagName(name) { return ENABLE_FLAG_RE.test(name); }
+// STM32 CMSIS bit-flag macros are named <family>_<register>_<bit>
+// (`RCC_APB2ENR_IOPAEN`, `DMA_CCR_EN`, `USART_SR_IDLE`, ...) — only the
+// leading family segment repeats information the diagram already carries
+// elsewhere (the node's own label, e.g. DMA1_Channel7), so it's the one
+// dropped here; the register segment (`CCR`, `SR`, `APB2ENR`, ...) stays —
+// unlike the family, it's real information periphDirDetail doesn't already
+// surface anywhere else (register-grouped detail lines used to exist but
+// were removed; see periphDirDetail's own comment), and dropping it too
+// briefly (2026-07-16) turned out to lose too much — `DMA_CCR_EN` -> `EN`
+// reads as "some enable bit, could be any register" instead of "the CCR
+// enable bit". First tried keeping *only* the bit name (dropping both family
+// and register, matching an earlier RCC-only special case); reverted after
+// user feedback the same day — register context matters even when the
+// family doesn't. Any flag name with more than one underscore-delimited
+// segment drops just its first; a bare one-segment name is returned as-is.
+function shortFlagName(flagName) {
+  const idx = flagName.indexOf('_');
+  return idx === -1 ? flagName : flagName.slice(idx + 1);
+}
+// one direction's full register/bit breakdown from a Map(register ->
+// 'r'|'w'|'rw') plus the matching Map(register -> {r,w: Set(flag)}) — every
+// register whose mode includes `dir` gets one line, showing the *specific
+// bit* touched in that direction when one was detected and falling back to
+// the bare register name otherwise (a plain non-decomposable access, e.g.
+// `CCR = 0x1234` or `x = REG->DR`). This is no longer the edge's *visible*
+// label (see dotPeriphAccessEdges) — a long version of it used to be baked
+// straight into the graphviz label, and neato has no box to fit a tall
+// multi-line label against, so it would drift the label away from the edge
+// entirely once a function touched enough registers at once (RCC's
+// clock/peripheral-enable sequence in main being the worst offender: 5
+// registers, all correctly attributed to RCC, just unreadably far from the
+// RCC node). Returned separately from the edge's own default text now, and
+// revealed only on hover — see the .periph-detail/.periph-default CSS pair.
+// \n is graphviz's own line-break escape for a plain (non-HTML) label, not a
+// literal newline. Capped, so a call-tree touching a dozen registers doesn't
+// grow a giant hover block.
+function periphDirDetail(fields, flags, dir, cap = 6) {
+  if (!fields || !fields.size) return { detail: '', hasEnable: false, enableLabel: '' };
+  const regs = [...fields.entries()].filter(([, m]) => m.includes(dir)).map(([f]) => f).sort();
+  if (!regs.length) return { detail: '', hasEnable: false, enableLabel: '' };
+  let hasEnable = false, enableLabel = '';
+  const names = regs.map(reg => {
+    const bits = flags && flags.get(reg) && flags.get(reg)[dir];
+    if (bits && bits.size) {
+      if (dir === 'w') {
+        // bits: Map(flagName -> 'set'|'clear'|'both') — a bit only ever
+        // cleared here (`&= ~FLAG`, never `|= FLAG` anywhere in the same
+        // tree) gets a literal ~ prefix so it reads as "turned off", not
+        // "turned on"; 'set' and 'both' (armed at least once, even if also
+        // disarmed elsewhere — the disable-then-rearm restart idiom, e.g.
+        // u1_kick's `CCR &= ~DMA_CCR_EN; ...; CCR |= DMA_CCR_EN;`) render
+        // plain, since the bit genuinely does get set somewhere.
+        const sorted = [...bits.keys()].sort();
+        if (!hasEnable) {
+          // first enable-shaped bit found (regs already walked in sorted
+          // order, so this is deterministic) — shortFlagName keeps the
+          // register segment (`CCR_EN`, not bare `EN`), used as-is for the
+          // edge's always-visible default label (see dotPeriphAccessEdges):
+          // the register the bit lives on is the whole point, a bare "EN"
+          // doesn't say which register got armed. Excludes pure-'clear'
+          // bits — this label means "this edge arms the peripheral", and a
+          // bit that's only ever cleared here does the opposite.
+          const enableBit = sorted.find(fl => isEnableFlagName(fl) && bits.get(fl) !== 'clear');
+          if (enableBit) { hasEnable = true; enableLabel = shortFlagName(enableBit); }
+        }
+        return sorted.map(fl => (bits.get(fl) === 'clear' ? '~' : '') + shortFlagName(fl)).join(', ');
+      }
+      const sorted = [...bits].sort();
+      return sorted.map(shortFlagName).join(', ');
+    }
+    return reg;
+  });
+  const shown = names.slice(0, cap);
+  if (names.length > cap) shown.push(`+${names.length - cap}`);
+  return { detail: shown.join('\\n'), hasEnable, enableLabel };
 }
 function dotPeriphNode(p) {
   const hot = p.isrTargets.size > 0 && (p.readers.size + p.writers.size) > 0;
@@ -1310,15 +1701,9 @@ function dotPeriphNode(p) {
 }
 // peripheral as it appears on a single function's "Связи" diagram — same
 // compact block as dotPeriphNode, register detail lives on the edge instead
-// (see periphRegEdgeLabel).
+// (see periphDirRegLabel).
 function dotPeriphRelNode(name) {
   return dotNode(periphId(name), [dotKindRow('периферия'), `<B>${dotEsc(name)}</B>`], 'hexagon', 'periph');
-}
-// aggregate a register map down to one direction for the fn<->periph edge
-function periphAggMode(fields) {
-  let r = false, w = false;
-  for (const m of fields.values()) { if (m.includes('r')) r = true; if (m.includes('w')) w = true; }
-  return r && w ? 'rw' : w ? 'w' : 'r';
 }
 function dotVarBundleNode(id, vars, tier) {
   let cls = 'gvar';
@@ -1331,9 +1716,15 @@ function dotFileNode(basename, extraRows = []) {
   return dotNode(`file_${sanitize(basename)}`, [dotKindRow('файл'), `<B>${dotEsc(basename)}</B>`, ...extraRows], 'box', 'fn');
 }
 
-function dotEdge(from, to, { dir = 'forward', style, label, penwidth } = {}) {
+function dotEdge(from, to, { dir = 'forward', style, label, penwidth, id, color } = {}) {
   const attrs = [`dir=${dir}`];
+  // explicit id lets post-render SVG processing find this exact edge back
+  // (graphviz's own default is just "from&#45;&gt;to" in a <title>, which
+  // collides whenever two edges share the same pair of nodes) — see
+  // injectPeriphDetailLabels.
+  if (id) attrs.push(`id="${dotEsc(id)}"`);
   if (style) attrs.push(`style=${style}`);
+  if (color) attrs.push(`color="${color}", fontcolor="${color}"`);
   if (label) {
     attrs.push(`label="${dotEsc(label)}"`);
     // neato/fdp place nodes purely by spring simulation on the *node* boxes —
@@ -1363,25 +1754,285 @@ function dotAccessLink(fnKey, targetId, direct, downstream) {
   const [from, to] = downstream ? [a, targetId] : [targetId, a];
   return dotEdge(from, to, { dir: 'none', style: direct ? undefined : 'dashed' });
 }
-function dotPeriphAccessEdge(fnKey, periphName, mode, direct, fields) {
+// always 0-2 separate directed edges (never dir=both) — a register that's
+// both read and written gets one line on each edge instead of one
+// double-headed arrow, so its two labels ("what's written" / "what's read")
+// don't have to be crammed together at the same spot on the same line.
+//
+// Line style here is purely read vs write — solid (write, entry -> periph)
+// vs dashed (read, periph -> entry) — never direct-vs-indirect the way
+// dotAccessLink's var edges use it. Peripheral edges used to also fold in
+// direct/indirect (solid if the entry's own body touches the register,
+// dashed if only somewhere down its call tree), but that distinction turned
+// out to carry no real information at level 0: level 0 is already an
+// aggregate over an entry's *whole* reachable behavior, so "does the entry
+// touch this itself or one call away" is an arbitrary implementation detail,
+// not a fact worth a whole visual channel — and it actively misled a reader
+// into treating "dashed" as some flavor of "read" (the two encodings clashed
+// on exactly the read edges, which were dashed *and* an actual read at the
+// same time whenever the read happened to also be indirect). Dropped after
+// user discussion (2026-07-16): read/write is the fact that matters here;
+// direct/indirect is still tracked internally (aggregateEntryInfo's
+// `.direct`, used by the setup/cyclic overlap math) but no longer drawn.
+//
+// This used to also fold in a peripheral's "armed" state (`this entry calls
+// NVIC_EnableIRQ on this peripheral`), on the theory that arming and writing
+// an enable bit are really one fact ("this entry turns the peripheral on")
+// told twice. Dropped (2026-07-16) now that arming has its own honest home —
+// a synthetic NVIC node (see the `armCalls` handling in analyzeFunction) — so
+// this edge no longer needs to stand in for it: a pure NVIC_EnableIRQ arm
+// with no matching register write reachable from this entry used to show a
+// bare "_EN" here with nothing behind it (confusing — "_EN" implies an
+// actual enable bit, and there wasn't one), and now correctly shows nothing
+// at all on *this* edge; the arm fact still shows, just on the entry's edge
+// to NVIC instead. This edge is now purely "peripheral enable" in the simple
+// sense — a real register bit, no interrupt involved. Default label is the
+// enable bit's own register-qualified name (`CCR_EN`, `APB2ENR_IOPAEN`, ...)
+// whenever periphDirDetail found one. The full register/flag breakdown never
+// sits in the graphviz label itself any more (see periphDirDetail for why —
+// tall multi-line labels drift away from long edges under neato) and is
+// instead returned via `details`, for the caller to bake into the SVG as a
+// hidden hover-reveal (see injectPeriphDetailLabels in
+// buildLevel0Diagram/buildFunctionDiagram and the .periph-detail/
+// .periph-default CSS pair).
+function dotPeriphAccessEdges(fnKey, periphName, fields, flags, idPrefix) {
   const a = fnId(fnKey), b = periphId(periphName);
-  const style = direct ? undefined : 'dashed';
-  const label = periphRegEdgeLabel(fields);
-  if (mode === 'w') return dotEdge(a, b, { style, label });
-  if (mode === 'rw') return dotEdge(a, b, { dir: 'both', style, label });
-  return dotEdge(b, a, { style, label });
+  const lines = [];
+  const details = [];
+
+  const w = periphDirDetail(fields, flags, 'w');
+  const r = periphDirDetail(fields, flags, 'r');
+
+  if (w.detail) {
+    // RCC is excluded from the "_EN" callout entirely: its own enable bits
+    // (`RCC_AHBENR_DMA1EN`, `RCC_APB2ENR_USART1EN`, ...) are clock gates for
+    // *other* peripherals, not a fact about RCC itself — RCC always gets
+    // some clock-enable write in any real project, so singling out
+    // whichever one happened to be found first (of what's often several,
+    // one per peripheral main brings up) isn't meaningful the way it is for
+    // an actual peripheral arming itself. User request (2026-07-16): "для
+    // RCC исключение, там куча разных EN которые относятся не к нему".
+    const defaultLabel = periphName === 'RCC' ? '' : (w.hasEnable ? w.enableLabel : '');
+    // a blank default still needs *some* label so graphviz reserves a real
+    // text anchor to clone from — a lone space renders as nothing visible.
+    const id = `pe_${idPrefix}_${a}_${b}_w`;
+    lines.push(dotEdge(a, b, { label: defaultLabel || ' ', id }));
+    details.push({ id, defaultLabel, detail: w.detail });
+  }
+
+  if (r.detail) {
+    const id = `pe_${idPrefix}_${b}_${a}_r`;
+    lines.push(dotEdge(b, a, { style: 'dashed', label: ' ', id }));
+    details.push({ id, defaultLabel: '', detail: r.detail });
+  }
+
+  return { lines, details };
 }
-const dotArmEdge = (fnKey, periphName) =>
-  dotEdge(fnId(fnKey), periphId(periphName), { style: 'dashed', label: 'взводит' });
-const dotTriggerEdge = (periphName, fnKey) =>
-  dotEdge(periphId(periphName), fnId(fnKey), { penwidth: 2.2, label: 'прерывание' });
+
+// A DMA channel's data source/destination — a wholly different relationship
+// from the plain register read/write edges above ("who touched this
+// register" vs "where does the data physically end up") — so it gets its own
+// color rather than reusing solid=write/dashed=read, which would otherwise
+// read as just another access to the channel's own registers. Direction
+// follows the transfer's real direction (source -> channel -> destination),
+// not read/write of CPAR/CMAR themselves. label is the register the address
+// came from (CPAR/CMAR), shown small and always-visible — there's only ever
+// one line here, unlike the periph access edges' hover-detail stack, so it
+// doesn't need the same hide-until-hover treatment.
+const DMA_FLOW_COLOR = '#0d9488';
+function dotDmaFlowEdge(fromId, toId, label, id) {
+  return dotEdge(fromId, toId, { style: 'dashed', label, id, color: DMA_FLOW_COLOR });
+}
+
+// Splices each periph edge's full register/flag breakdown into its already-
+// rendered SVG group as a hidden sibling of the (short, static) label text —
+// see dotPeriphAccessEdges/periphDirDetail for why the breakdown never goes
+// through graphviz's own label layout in the first place (tall multi-line
+// labels drift away from long edges under neato). `details` is the
+// {id, defaultLabel, detail} list assembleLevel0/buildFunctionDiagram
+// collected while building the edges themselves, so this only ever has to
+// re-find each edge's *own* label text, not guess at one.
+// Revealed by pure CSS (.periph-detail/.periph-default, keyed off the .hl
+// class the existing hover system already toggles) — no client JS needed for
+// the swap itself.
+// Perpendicular push, off graphviz's own on-the-line anchor point — a
+// peripheral and its own ISR is the classic short edge (see dotEdge's `len`
+// comment), and `len` is only a spring *preference*, not a hard constraint,
+// so a short-enough edge still crowds a label against the nearby node even
+// with it set. Same perpendicular-offset idea bendOneEdge already uses to
+// bow anti-parallel edge pairs, applied here to text position instead of the
+// path curve. Two tiers, not one flat distance (2026-07-16, after "стало
+// лучше" on the first flat-16 version, then "по умолчанию можно ближе на
+// 50%, а при разворачивании — больше строк, надо отдалить"): the
+// always-visible default label sits close (PUSH_NEAR), the hover-revealed
+// detail stack sits further out, growing with how many lines it has to fit
+// (PUSH_NEAR + PUSH_PER_LINE * lines) — a lone one-line register still gets
+// a real, visible offset (not zero), a five-register RCC edge gets
+// noticeably more room.
+const PERIPH_LABEL_PUSH_NEAR = 8;
+const PERIPH_LABEL_PUSH_PER_LINE = 6;
+// Direction comes from the path's *local* segment nearest the label's own
+// point, not the overall start-to-end chord — a short, simple edge (a single
+// Q bezier) has its tangent-at-midpoint exactly equal to the chord (a
+// property of quadratic beziers), so the two agree there, but a longer edge
+// routed around other nodes can have several segments whose local direction
+// differs noticeably from the overall chord; using the far-away endpoints in
+// that case pushes in a direction that doesn't actually clear the curve
+// nearby. dot/neato path `d` strings interleave on-curve points with bezier
+// control points, but treating all of them as vertices of a polyline is a
+// fine approximation for direction purposes here — this only picks the
+// segment, not the vertices' data.
+function pathPoints(pathD) {
+  const nums = pathD && pathD.match(/-?\d+(?:\.\d+)?/g);
+  if (!nums || nums.length < 4) return null;
+  const pts = [];
+  for (let i = 0; i + 1 < nums.length; i += 2) pts.push([parseFloat(nums[i]), parseFloat(nums[i + 1])]);
+  return pts;
+}
+function pushLabelPerp(pathD, x0, y0, dist) {
+  const pts = pathPoints(pathD);
+  if (!pts || pts.length < 2) return { x: x0, y: y0 };
+  let best = null, bestDist = Infinity;
+  for (let i = 0; i + 1 < pts.length; i++) {
+    const [x1, y1] = pts[i], [x2, y2] = pts[i + 1];
+    const d = Math.hypot((x1 + x2) / 2 - x0, (y1 + y2) / 2 - y0);
+    if (d < bestDist) { bestDist = d; best = [x1, y1, x2, y2]; }
+  }
+  const [x1, y1, x2, y2] = best;
+  const dx = x2 - x1, dy = y2 - y1;
+  const len = Math.hypot(dx, dy);
+  if (len < 1) return { x: x0, y: y0 };
+  return { x: x0 + (-dy / len) * dist, y: y0 + (dx / len) * dist };
+}
+function injectPeriphDetailLabels(svg, details) {
+  if (!details.length) return svg;
+  for (const { id, detail } of details) {
+    const re = new RegExp(`(<g id="${id}" class="edge">[\\s\\S]*?)(<text([^>]*)>([^<]*)<\\/text>)`);
+    const m = svg.match(re);
+    if (!m) continue;
+    const attrs = m[3];
+    const yMatch = attrs.match(/ y="([^"]+)"/);
+    const xMatch = attrs.match(/ x="([^"]+)"/);
+    if (!yMatch || !xMatch) continue;
+    const origX = parseFloat(xMatch[1]), origY = parseFloat(yMatch[1]);
+    const pathMatch = m[1].match(/<path\b[^>]*\bd="([^"]+)"/);
+    const pathD = pathMatch && pathMatch[1];
+    const lines = detail.split('\\n');
+    const near = pushLabelPerp(pathD, origX, origY, PERIPH_LABEL_PUSH_NEAR);
+    const far = pushLabelPerp(pathD, origX, origY, PERIPH_LABEL_PUSH_NEAR + PERIPH_LABEL_PUSH_PER_LINE * lines.length);
+    const defaultAttrs = attrs
+      .replace(/ x="[^"]+"/, ` x="${near.x.toFixed(2)}"`)
+      .replace(/ y="[^"]+"/, ` y="${near.y.toFixed(2)}"`);
+    const dy = 12;
+    const baseY = far.y - dy * (lines.length - 1) / 2;
+    const detailBaseAttrs = attrs.replace(/ x="[^"]+"/, ` x="${far.x.toFixed(2)}"`);
+    const detailTexts = lines.map((line, i) => {
+      const lineAttrs = detailBaseAttrs.replace(/ y="[^"]+"/, ` y="${(baseY + dy * i).toFixed(2)}"`);
+      return `<text class="periph-detail"${lineAttrs}>${dotEsc(line)}</text>`;
+    }).join('');
+    const replacement = m[1] + `<text class="periph-default"${defaultAttrs}>${m[4]}</text>` + detailTexts;
+    svg = svg.slice(0, m.index) + replacement + svg.slice(m.index + m[0].length);
+  }
+  return svg;
+}
+// Two edges between the exact same pair of nodes but opposite direction (a
+// write-direction periph/var access edge and its read-direction sibling)
+// otherwise draw as one perfectly straight, perfectly coincident line —
+// nothing in plain DOT tells them apart, so the pair reads as a single
+// misleadingly-bidirectional arrow. Pinning each to a different corner of
+// the node via tailport/headport was tried and made things *worse*: every
+// edge touching a node converges on the same few fixed corners, so a busy
+// node ends up with a pile-up of overlapping arrowheads there instead of a
+// clean center attachment. This instead nudges each half of a real
+// anti-parallel *pair*, after graphviz has already laid the graph out, into
+// a gentle bow — the endpoints stay exactly where graphviz put them (the
+// node's own default center-ish anchor), only the middle of the line moves,
+// mirroring the natural curve graphviz's own obstacle-routing already gives
+// *some* edges on these diagrams (any edge threading past a busy node is
+// already bowed for exactly this reason, just not deliberately, and not for
+// this one). The arrowhead is rotated to match the new approach angle —
+// that's the correct look for a bent edge, not a compromise.
+//
+// No explicit left/right sign is passed in on purpose: the reverse edge of
+// a pair runs the *same* physical line from the opposite end, so its own
+// (dx,dy) — and therefore its own perpendicular — already point the other
+// way of their own accord. An earlier version multiplied in an extra
+// lexical-order-based sign on top of that and the two flips cancelled out,
+// bowing both edges to the same side instead of apart (measured: identical
+// control-point x within 0.4px of each other).
+function bendOneEdge(pathD, body) {
+  const nums = pathD.match(/-?\d+(?:\.\d+)?/g);
+  if (!nums || nums.length < 4) return null;
+  const x1 = parseFloat(nums[0]), y1 = parseFloat(nums[1]);
+  const x2 = parseFloat(nums[nums.length - 2]), y2 = parseFloat(nums[nums.length - 1]);
+  const dx = x2 - x1, dy = y2 - y1;
+  const len = Math.hypot(dx, dy);
+  if (len < 1) return null; // coincident nodes — nothing sane to bend
+  const bend = Math.min(18, len * 0.16);
+  const cx = (x1 + x2) / 2 + (-dy / len) * bend, cy = (y1 + y2) / 2 + (dx / len) * bend;
+  const newD = `M${x1.toFixed(2)},${y1.toFixed(2)} Q${cx.toFixed(2)},${cy.toFixed(2)} ${x2.toFixed(2)},${y2.toFixed(2)}`;
+  let out = body.replace(/(<path\b[^>]*\bd=")([^"]+)(")/, (_, pre, _old, post) => pre + newD + post);
+
+  // rotate the arrowhead (if any — dir=none links have none) to match the
+  // new tangent at the head: a quadratic bezier's tangent there points from
+  // the control point straight to the endpoint.
+  const polyM = out.match(/<polygon\b[^>]*\bpoints="([^"]+)"[^>]*\/>/);
+  if (polyM) {
+    const rot = Math.atan2(y2 - cy, x2 - cx) - Math.atan2(dy, dx);
+    const cos = Math.cos(rot), sin = Math.sin(rot);
+    const pts = polyM[1].trim().split(/\s+/).map(p => {
+      const [px, py] = p.split(',').map(Number);
+      const rx = px - x2, ry = py - y2;
+      return `${(x2 + rx * cos - ry * sin).toFixed(2)},${(y2 + rx * sin + ry * cos).toFixed(2)}`;
+    }).join(' ');
+    out = out.replace(/(<polygon\b[^>]*\bpoints=")([^"]+)(")/, (_, pre, _old, post) => pre + pts + post);
+  }
+
+  // the label (if any) was placed by graphviz for the *straight* line —
+  // shift it by the same offset the control point moved off the straight-
+  // line midpoint, or it's left stranded where the line used to run instead
+  // of following the curve it's actually sitting on now.
+  const midX = (x1 + x2) / 2, midY = (y1 + y2) / 2;
+  const offX = cx - midX, offY = cy - midY;
+  out = out.replace(/(<text\b[^>]*\bx=")([^"]+)("[^>]*\by=")([^"]+)(")/g, (_, pre1, xVal, mid, yVal, post) =>
+    `${pre1}${(parseFloat(xVal) + offX).toFixed(2)}${mid}${(parseFloat(yVal) + offY).toFixed(2)}${post}`);
+
+  return out;
+}
+function bendAntiParallelEdges(svg) {
+  const groupRe = /<g id="[^"]*" class="edge">[\s\S]*?<\/g>/g;
+  const found = [];
+  let m;
+  while ((m = groupRe.exec(svg))) {
+    const body = m[0];
+    const titleM = body.match(/<title>([^<]+)<\/title>/);
+    const pathM = body.match(/<path\b[^>]*\bd="([^"]+)"[^>]*\/>/);
+    if (!titleM || !pathM) continue;
+    const parts = titleM[1].split('&#45;&gt;');
+    if (parts.length !== 2) continue;
+    found.push({ start: m.index, end: m.index + body.length, body, from: parts[0], to: parts[1], pathD: pathM[1] });
+  }
+  const pairKeys = new Set(found.map(e => `${e.from}>${e.to}`));
+  let out = svg;
+  // walk backwards so earlier splice offsets stay valid as later ones are rewritten
+  for (let i = found.length - 1; i >= 0; i--) {
+    const e = found[i];
+    if (!pairKeys.has(`${e.to}>${e.from}`)) continue; // no reverse edge — nothing to separate from
+    const bent = bendOneEdge(e.pathD, e.body);
+    if (!bent) continue;
+    out = out.slice(0, e.start) + bent + out.slice(e.end);
+  }
+  return out;
+}
 // plain call graph edge — dashed, control transfer rather than data
 const dotCallEdge = (fromKey, toKey) => dotEdge(fnId(fromKey), fnId(toKey), { style: 'dashed' });
 const dotExtCallEdge = (fromKey, name) => dotEdge(fnId(fromKey), extId(name), { style: 'dashed' });
+// split rather than dir=both for the same reason as dotPeriphAccessEdges —
+// a var that's both read and written gets its own write edge and read edge
 function dotAccessEdges(fnKey, varKey, mode) {
   const a = fnId(fnKey), b = varId(varKey);
   if (mode === 'w') return [dotEdge(a, b)];
-  if (mode === 'rw') return [dotEdge(a, b, { dir: 'both' })];
+  if (mode === 'rw') return [dotEdge(a, b), dotEdge(b, a)];
   return [dotEdge(b, a)];
 }
 
@@ -1461,8 +2112,13 @@ async function renderDotAll(coreNodeLines, coreEdgeLines, varNodeLines = [], var
 }
 
 // Level 0: entry points (main + ISRs), the peripherals they arm/drive, the
-// hardware trigger back into ISRs, and the globals they exchange data through
-// — directly (solid) or somewhere inside their call trees (dashed). Variables
+// hardware trigger back into ISRs, and the globals they exchange data
+// through. Peripheral edges are solid for a write, dashed for a read
+// (see dotPeriphAccessEdges); global-variable edges instead use solid/dashed
+// for directly-in-the-entry's-own-body vs somewhere-down-its-call-tree (see
+// dotAccessLink) — variables have no single "direction" of their own at this
+// level (always written by one entry, read by another), so read/write isn't
+// available as an encoding there the way it is for peripherals. Variables
 // sharing the exact same set of writer/reader entry points are bundled into
 // one collapsible "data channel" node instead of one node each, so a dozen
 // buffers that all flow main -> DMA1_Channel2_IRQHandler read as a single
@@ -1475,10 +2131,21 @@ async function renderDotAll(coreNodeLines, coreEdgeLines, varNodeLines = [], var
 // to leave one-time boot/setup calls unvisited entirely. "direct" only ever
 // means "the entry key itself", regardless of seeding — matches the original
 // solid/dashed convention (dotAccessLink et al) untouched.
-function aggregateEntryInfo(entries, seedFn) {
-  const varInfo = new Map(), periphInfo = new Map(), periphFieldInfo = new Map(), armInfo = new Map();
+// includeOwnDirect(e) controls whether e's *own* body (not what it calls) is
+// absorbed at all — always true for the plain "all"/"cyclic" aggregations
+// (an entry's own direct code has always counted as part of it, regardless
+// of loop-seeding, since day one of the cyclic filter). setupInfo needs it
+// false for ISRs specifically: an ISR has no setup phase of its own (see
+// buildLevel0Diagram), so *nothing* about it — not even its own body — may
+// leak into the setup aggregation, or its own direct accesses would show up
+// as "touched during both setup and runtime" (the overlap variant) purely
+// because the same unconditional absorb ran in both aggregations.
+function aggregateEntryInfo(entries, seedFn, includeOwnDirect = () => true) {
+  const varInfo = new Map(), periphInfo = new Map(), periphFieldInfo = new Map();
+  const periphFlagInfo = new Map(), periphAddrRefInfo = new Map(), armInfo = new Map();
   for (const e of entries) {
-    const vAcc = new Map(), pAcc = new Map(), aAcc = new Set(), pFields = new Map();
+    const vAcc = new Map(), pAcc = new Map(), aAcc = new Set(), pFields = new Map(), pFlags = new Map();
+    const pAddrRefs = new Map();
     const seen = new Set([e.key]);
     function absorb(k, direct) {
       const f = funcs.get(k);
@@ -1502,9 +2169,28 @@ function aggregateEntryInfo(entries, seedFn) {
         if (!rf) { rf = new Map(); pFields.set(pk, rf); }
         for (const [reg, m] of fields) rf.set(reg, mergeMode(rf.get(reg), m));
       }
+      for (const [pk, fields] of f.periphFlags) {
+        let rf = pFlags.get(pk);
+        if (!rf) { rf = new Map(); pFlags.set(pk, rf); }
+        for (const [reg, { r, w }] of fields) {
+          if (!rf.has(reg)) rf.set(reg, { r: new Set(), w: new Map() });
+          const cur = rf.get(reg);
+          for (const fl of r) cur.r.add(fl);
+          for (const [fl, pol] of w) mergeFlagPolarity(cur.w, fl, pol);
+        }
+      }
+      for (const [pk, refs] of f.periphAddrRefs) {
+        let ra = pAddrRefs.get(pk);
+        if (!ra) { ra = new Map(); pAddrRefs.set(pk, ra); }
+        // last absorbed write wins on a conflict (e.g. two setup paths
+        // pointing the same channel at different buffers) — not modeled as
+        // multiple candidates, just picks one deterministically; real
+        // firmware only ever sets a channel's CPAR/CMAR from one place.
+        for (const [field, ref] of refs) ra.set(field, ref);
+      }
       for (const pk of f.arms) aAcc.add(pk);
     }
-    absorb(e.key, true);
+    if (includeOwnDirect(e)) absorb(e.key, true);
     const queue = [];
     for (const seed of seedFn(e)) if (!seen.has(seed)) { seen.add(seed); queue.push(seed); }
     while (queue.length) {
@@ -1516,9 +2202,11 @@ function aggregateEntryInfo(entries, seedFn) {
     varInfo.set(e.key, vAcc);
     periphInfo.set(e.key, pAcc);
     periphFieldInfo.set(e.key, pFields);
+    periphFlagInfo.set(e.key, pFlags);
+    periphAddrRefInfo.set(e.key, pAddrRefs);
     armInfo.set(e.key, aAcc);
   }
-  return { varInfo, periphInfo, periphFieldInfo, armInfo };
+  return { varInfo, periphInfo, periphFieldInfo, periphFlagInfo, periphAddrRefInfo, armInfo };
 }
 
 // Builds one Level 0 variant's node/edge lines from an aggregateEntryInfo()
@@ -1526,8 +2214,8 @@ function aggregateEntryInfo(entries, seedFn) {
 // from colliding with the *other* variant's when both sets of extraNodes get
 // merged into one page (same bundle-count coincidence would otherwise mean
 // two totally different variable lists sharing one id and one tooltip).
-function assembleLevel0(entries, info, idPrefix) {
-  const { varInfo, periphInfo, periphFieldInfo, armInfo } = info;
+function assembleLevel0(entries, info, idPrefix, includeDma = false) {
+  const { varInfo, periphInfo, periphFieldInfo, periphFlagInfo, periphAddrRefInfo } = info;
 
   const allVarKeys = new Set();
   for (const acc of varInfo.values()) for (const vk of acc.keys()) allVarKeys.add(vk);
@@ -1557,12 +2245,18 @@ function assembleLevel0(entries, info, idPrefix) {
     varCapNote = `показаны ${LEVEL0_MAX_UNITS} самых используемых каналов данных из ${total}`;
   }
 
+  // A peripheral earns a node purely by real register access now — arming it
+  // (calling NVIC_EnableIRQ) is no longer enough on its own, now that arming
+  // has its own honest home (the synthetic NVIC node, fed by periphInfo the
+  // same as any real peripheral — see analyzeFunction's armCalls handling).
+  // Dropped the armInfo-based addition here that used to pull a purely-armed
+  // target peripheral onto the diagram even with zero register access
+  // reachable anywhere (2026-07-16, "простая логика с включением периферии,
+  // а не прерываниями").
   const usedPeriphs = new Set();
   for (const e of entries) {
     for (const pk of periphInfo.get(e.key).keys()) usedPeriphs.add(pk);
-    for (const pk of armInfo.get(e.key)) usedPeriphs.add(pk);
   }
-  for (const p of peripherals.values()) if (p.isrTargets.size) usedPeriphs.add(p.name);
 
   const LEVEL0_MAX_PERIPHS = 40;
   let periphList = [...usedPeriphs].map(n => peripherals.get(n)).filter(Boolean);
@@ -1579,7 +2273,13 @@ function assembleLevel0(entries, info, idPrefix) {
   const edgeLines = [];
   const varNodeLines = [];
   const varEdgeLines = [];
-  for (const e of entries) nodeLines.push(dotFnNode(e));
+  // an entry only earns a node once something actually connects to it in
+  // *this* variant — e.g. an ISR that never runs during setup has nothing to
+  // show on the "однократное" diagram at all, so it shouldn't sit there as a
+  // disconnected box either. Populated below as edges are actually drawn,
+  // then applied once at the end (dotFnNode lines are emitted after periph/
+  // var/trigger edges now, not before).
+  const connectedEntries = new Set();
   for (const p of periphList) nodeLines.push(dotPeriphNode(p));
 
   function bundleDownstream(b) {
@@ -1602,26 +2302,111 @@ function assembleLevel0(entries, info, idPrefix) {
     for (const ek of b.involved) {
       const a = varInfo.get(ek).get(vk);
       varEdgeLines.push(dotAccessLink(ek, varId(vk), a.direct, downstream));
+      connectedEntries.add(ek);
     }
   }
 
+  const edgeDetails = [];
   for (const e of entries) {
     const pAcc = periphInfo.get(e.key);
     const pFields = periphFieldInfo.get(e.key);
+    const pFlags = periphFlagInfo.get(e.key);
     for (const p of periphList) {
       const a = pAcc.get(p.name);
       if (!a) continue;
-      const mode = a.r && a.w ? 'rw' : a.w ? 'w' : 'r';
-      edgeLines.push(dotPeriphAccessEdge(e.key, p.name, mode, a.direct, pFields.get(p.name)));
-    }
-    const aAcc = armInfo.get(e.key);
-    for (const p of periphList) {
-      if (aAcc.has(p.name)) edgeLines.push(dotArmEdge(e.key, p.name));
+      const { lines, details } = dotPeriphAccessEdges(
+        e.key, p.name, pFields.get(p.name), pFlags.get(p.name), idPrefix);
+      if (lines.length) connectedEntries.add(e.key);
+      edgeLines.push(...lines);
+      edgeDetails.push(...details);
     }
   }
-  for (const p of periphList) {
-    for (const isrKey of p.isrTargets) {
-      if (funcs.has(isrKey)) edgeLines.push(dotTriggerEdge(p.name, isrKey));
+
+  // DMA channel data-flow edges — see resolveAddrExpr/periphAddrRefInfo:
+  // which peripheral/global buffer a channel's CPAR/CMAR resolves to, and
+  // (via the CCR DIR bit) which direction the transfer runs. This is a
+  // hardware-wiring fact about the channel itself, not something scoped to
+  // whichever entry happens to reach the assignment that set it up — so it's
+  // drawn once per channel, merged across every entry in this variant,
+  // rather than once per entry the way periph access edges above are (which
+  // would just draw the exact same wiring redundantly for every entry that
+  // happens to reach dma_init/u1_kick).
+  let hasDma = false;
+  if (includeDma) {
+    const singletonVarKeys = new Set(singletons.map(b => b.vars[0]));
+    const forcedDmaIds = new Set();
+    // resolves a CPAR/CMAR ref to a node id, forcing a node onto the diagram
+    // if the target isn't on it already — always the entity's own regular id
+    // (periphId/varId), never a synthetic one, since graph-data.js already
+    // carries full hover metadata (label, type, readers/writers, ...) for
+    // *every* peripheral/var in the whole project, not just ones some
+    // diagram happens to draw a node for — reusing the real id gets that
+    // metadata for free. Safe to reuse unconditionally: a peripheral only
+    // ever has the one id anywhere on the page; a var's id is only ever a
+    // real node when it earned its own singleton via the normal cross-entry
+    // filter (showVars) — a var folded into a multi-var bundle has no node
+    // of its own under its own id (only the bundle's bnd_N id exists), so
+    // there's nothing to collide with.
+    function resolveDmaRef(ref) {
+      if (!ref) return null;
+      if (ref.kind === 'periph') {
+        const target = peripherals.get(ref.name);
+        if (!target) return null;
+        const id = periphId(ref.name);
+        if (!periphList.includes(target) && !forcedDmaIds.has(id)) {
+          nodeLines.push(dotPeriphNode(target));
+          forcedDmaIds.add(id);
+        }
+        return id;
+      }
+      const v = varDefs.get(ref.key);
+      if (!v) return null;
+      const id = varId(ref.key);
+      if (!singletonVarKeys.has(ref.key) && !forcedDmaIds.has(id)) {
+        varNodeLines.push(dotVarNode(v, { tiered: true }));
+        forcedDmaIds.add(id);
+      }
+      return id;
+    }
+    for (const p of periphList) {
+      const refs = new Map();
+      let ccrDir; // undefined | 'set' | 'clear' | 'both'
+      for (const e of entries) {
+        const eRefs = periphAddrRefInfo.get(e.key).get(p.name);
+        if (eRefs) for (const [field, ref] of eRefs) refs.set(field, ref);
+        const dirFlags = periphFlagInfo.get(e.key).get(p.name)?.get('CCR')?.w;
+        if (dirFlags) {
+          for (const [fl, pol] of dirFlags) {
+            if (!/_DIR$/.test(fl)) continue;
+            ccrDir = ccrDir && ccrDir !== pol ? 'both' : pol;
+          }
+        }
+      }
+      const cparRef = refs.get('CPAR'), cmarRef = refs.get('CMAR');
+      if (!cparRef && !cmarRef) continue;
+      // DMA_CCR_DIR set (or set-and-cleared, i.e. genuinely armed at some
+      // point — see periphDirDetail's identical 'both' handling for enable
+      // bits) means memory -> peripheral (TX); unset/absent is the STM32
+      // default, peripheral -> memory (RX).
+      const isTx = ccrDir === 'set' || ccrDir === 'both';
+      const periphSideId = resolveDmaRef(cparRef);
+      const memSideId = resolveDmaRef(cmarRef);
+      if (!periphSideId && !memSideId) continue;
+      const channelId = periphId(p.name);
+      // any edge touching a var-kind endpoint has to land in varEdgeLines,
+      // not edgeLines — renderDotAll's "_novars" render drops varNodeLines
+      // (and the singleton var nodes the normal filter already added) but
+      // keeps edgeLines verbatim, so an edge into a var node left in
+      // edgeLines would dangle in that render.
+      const push = (ref, line) => (ref.kind === 'var' ? varEdgeLines : edgeLines).push(line);
+      hasDma = true;
+      if (isTx) {
+        if (memSideId) push(cmarRef, dotDmaFlowEdge(memSideId, channelId, 'CMAR', `dma_${idPrefix}_${channelId}_cmar`));
+        if (periphSideId) push(cparRef, dotDmaFlowEdge(channelId, periphSideId, 'CPAR', `dma_${idPrefix}_${channelId}_cpar`));
+      } else {
+        if (periphSideId) push(cparRef, dotDmaFlowEdge(periphSideId, channelId, 'CPAR', `dma_${idPrefix}_${channelId}_cpar`));
+        if (memSideId) push(cmarRef, dotDmaFlowEdge(channelId, memSideId, 'CMAR', `dma_${idPrefix}_${channelId}_cmar`));
+      }
     }
   }
 
@@ -1636,6 +2421,7 @@ function assembleLevel0(entries, info, idPrefix) {
     for (const ek of b.involved) {
       const allDirect = b.vars.every(vk => (varInfo.get(ek).get(vk) || {}).direct);
       varEdgeLines.push(dotAccessLink(ek, id, allDirect, downstream));
+      connectedEntries.add(ek);
     }
     extraNodes[id] = {
       label: `${vars.length} перем.`, kind: 'gvar',
@@ -1643,8 +2429,144 @@ function assembleLevel0(entries, info, idPrefix) {
     };
   }
 
+  const entryLines = entries.filter(e => connectedEntries.has(e.key)).map(e => dotFnNode(e));
+  nodeLines.unshift(...entryLines);
+
   const note = [varCapNote, periphCapNote].filter(Boolean).join('; ');
-  return { nodeLines, edgeLines, varNodeLines, varEdgeLines, extraNodes, note };
+  return { nodeLines, edgeLines, varNodeLines, varEdgeLines, extraNodes, note, edgeDetails, hasDma };
+}
+
+// inserts a variant suffix (e.g. "_cyclic") before the trailing "_novars"
+// segment rather than after it — renderDotAll's own keys are "<engine>" /
+// "<engine>_novars", and wireDiagramToolbar/setupEngineSwitchable build the
+// combined key client-side as "<engine>_<variant>_novars", not
+// "<engine>_novars_<variant>"
+function withVariantSuffix(key, suffix) {
+  return key.endsWith('_novars') ? key.slice(0, -'_novars'.length) + suffix + '_novars' : key + suffix;
+}
+
+// Every peripheral name / var key touched *anywhere* across all entries in
+// an aggregateEntryInfo() result — the same union buildLevel0Diagram's
+// usedPeriphs computes, but pulled out standalone so the cyclic/setup
+// variants below can compare at the *whole-diagram* identity of a
+// peripheral, not per-entry. Per-entry comparison was tried first and was
+// wrong: a peripheral cyclically touched by one ISR and only-at-setup
+// touched by main (two different entries) never shares a single entry key,
+// so a per-entry "is this key present for the same entry in both maps" check
+// never finds the overlap at all — it has to be asked at the level of "is
+// this peripheral touched anywhere in each reachability set", independent of
+// which entry did the touching.
+// excludeOwnDirect skips anything only known through an entry's *own* inline
+// code (a.direct) — used for the overlap computation in buildLevel0Diagram,
+// where that inline code is the one thing that's identical evidence in both
+// the cyclic and setup aggregations (analyzeFunction has no notion of "this
+// statement is before vs inside the loop", only aggregateEntryInfo's seedFn
+// distinguishes *calls* that way — see aggregateEntryInfo's own comment). A
+// peripheral main pokes directly is never *provably* touched twice just
+// because it shows up on both sides; only a genuinely separate cyclic-only
+// callee and setup-only callee both touching it is real double-evidence.
+// armInfo has no such distinction recorded at all (a plain Set, arm calls
+// were never split direct-vs-indirect) — left unfiltered either way, since
+// arming is near-always a true one-time setup fact rather than the source of
+// false positives this guards against.
+function usedNames(info, entries, includeIsrTriggers = false, excludeOwnDirect = false) {
+  const periphs = new Set(), vars = new Set();
+  for (const e of entries) {
+    for (const [pk, a] of info.periphInfo.get(e.key)) {
+      if (excludeOwnDirect && a.direct) continue;
+      periphs.add(pk);
+    }
+    for (const pk of info.armInfo.get(e.key)) periphs.add(pk);
+    for (const [vk, a] of info.varInfo.get(e.key)) {
+      if (excludeOwnDirect && a.direct) continue;
+      vars.add(vk);
+    }
+  }
+  // firing an interrupt at all is itself cyclic/runtime behavior — a
+  // peripheral that's *only* known through triggering an ISR (no direct
+  // register access anywhere) still counts toward "cyclic" for the
+  // exclusive/overlap set math below. (The diagram used to also draw a
+  // visible "прерывание" trigger edge for this fact; that edge was dropped
+  // per user request 2026-07-16 as redundant with the ISR's own name, but
+  // the underlying fact still matters for this classification.)
+  if (includeIsrTriggers) {
+    for (const p of peripherals.values()) if (p.isrTargets.size) periphs.add(p.name);
+  }
+  return { periphs, vars };
+}
+
+// Rebuilds an aggregateEntryInfo()-shaped structure containing only the given
+// peripheral names / var keys, merging entryA's and entryB's per-key values
+// (r/w/direct flags, register maps, flag sets) wherever both happen to touch
+// the same one — used for the overlap variant, where a peripheral's write
+// might come from setup and its read from a cyclic path, and both facts are
+// worth keeping rather than picking one side arbitrarily.
+function mergeFilteredInfo(entries, allowedPeriphs, allowedVars, ...infos) {
+  const varInfo = new Map(), periphInfo = new Map(), periphFieldInfo = new Map();
+  const periphFlagInfo = new Map(), periphAddrRefInfo = new Map(), armInfo = new Map();
+  for (const e of entries) {
+    const vAcc = new Map(), pAcc = new Map(), aAcc = new Set(), pFields = new Map(), pFlags = new Map();
+    const pAddrRefs = new Map();
+    for (const info of infos) {
+      for (const [vk, a] of info.varInfo.get(e.key)) {
+        if (!allowedVars.has(vk)) continue;
+        const cur = vAcc.get(vk) || { r: false, w: false, direct: false };
+        cur.r ||= a.r; cur.w ||= a.w; cur.direct ||= a.direct;
+        vAcc.set(vk, cur);
+      }
+      for (const [pk, a] of info.periphInfo.get(e.key)) {
+        if (!allowedPeriphs.has(pk)) continue;
+        const cur = pAcc.get(pk) || { r: false, w: false, direct: false };
+        cur.r ||= a.r; cur.w ||= a.w; cur.direct ||= a.direct;
+        pAcc.set(pk, cur);
+      }
+      for (const [pk, fields] of info.periphFieldInfo.get(e.key)) {
+        if (!allowedPeriphs.has(pk)) continue;
+        let rf = pFields.get(pk);
+        if (!rf) { rf = new Map(); pFields.set(pk, rf); }
+        for (const [reg, m] of fields) rf.set(reg, mergeMode(rf.get(reg), m));
+      }
+      for (const [pk, fields] of info.periphFlagInfo.get(e.key)) {
+        if (!allowedPeriphs.has(pk)) continue;
+        let rf = pFlags.get(pk);
+        if (!rf) { rf = new Map(); pFlags.set(pk, rf); }
+        for (const [reg, { r, w }] of fields) {
+          if (!rf.has(reg)) rf.set(reg, { r: new Set(), w: new Map() });
+          const cur = rf.get(reg);
+          for (const fl of r) cur.r.add(fl);
+          for (const [fl, pol] of w) mergeFlagPolarity(cur.w, fl, pol);
+        }
+      }
+      for (const [pk, refs] of info.periphAddrRefInfo.get(e.key)) {
+        if (!allowedPeriphs.has(pk)) continue;
+        let ra = pAddrRefs.get(pk);
+        if (!ra) { ra = new Map(); pAddrRefs.set(pk, ra); }
+        for (const [field, ref] of refs) ra.set(field, ref);
+      }
+      for (const pk of info.armInfo.get(e.key)) if (allowedPeriphs.has(pk)) aAcc.add(pk);
+    }
+    varInfo.set(e.key, vAcc);
+    periphInfo.set(e.key, pAcc);
+    periphFieldInfo.set(e.key, pFields);
+    periphFlagInfo.set(e.key, pFlags);
+    periphAddrRefInfo.set(e.key, pAddrRefs);
+    armInfo.set(e.key, aAcc);
+  }
+  // a peripheral allowed in purely for triggering an ISR (see usedNames'
+  // includeIsrTriggers) has no periphInfo/armInfo entry anywhere above — it
+  // was never actually *accessed*, just wired to an interrupt — so without
+  // this it would never appear as a node at all (assembleLevel0 builds its
+  // periphList from periphInfo/armInfo keys). A no-access placeholder on the
+  // first entry is enough: assembleLevel0 doesn't care which entry key holds
+  // it, only that the name is present in periphInfo *somewhere*.
+  if (entries.length) {
+    const anchor = periphInfo.get(entries[0].key);
+    for (const name of allowedPeriphs) {
+      const hasAny = [...periphInfo.values()].some(m => m.has(name)) || [...armInfo.values()].some(s => s.has(name));
+      if (!hasAny) anchor.set(name, { r: false, w: false, direct: false });
+    }
+  }
+  return { varInfo, periphInfo, periphFieldInfo, periphFlagInfo, periphAddrRefInfo, armInfo };
 }
 
 async function buildLevel0Diagram() {
@@ -1653,35 +2575,107 @@ async function buildLevel0Diagram() {
 
   const allInfo = aggregateEntryInfo(entries, e => [...e.calls]);
   const all = assembleLevel0(entries, allInfo, 'a');
-  const { svgs, hasVars, testRawDot } = await renderDotAll(all.nodeLines, all.edgeLines, all.varNodeLines, all.varEdgeLines);
+  const { svgs: rawSvgs, hasVars, testRawDot } = await renderDotAll(all.nodeLines, all.edgeLines, all.varNodeLines, all.varEdgeLines);
+  const svgs = {};
+  for (const [k, v] of Object.entries(rawSvgs)) {
+    svgs[k] = injectPeriphDetailLabels(bendAntiParallelEdges(v), all.edgeDetails);
+  }
+  // "DMA-потоки" toggle: a second, independently pre-rendered layout per
+  // variant with the CPAR/CMAR source/destination edges (and whatever
+  // peripheral/var nodes they force onto the diagram) included — same
+  // pre-render-both-states approach as the vars/novars split in renderDotAll
+  // (adding the nodes to an existing layout with CSS visibility instead would
+  // leave them wherever spring layout put them for the *other* state, not
+  // room genuinely freed/reserved for them). off by default (see diagramId0
+  // below) so a project with no DMA usage never even shows the checkbox.
+  let hasDma = false;
+  async function renderDmaVariant(info, idPrefix, suffix) {
+    const v = assembleLevel0(entries, info, idPrefix, true);
+    if (!v.hasDma) return;
+    hasDma = true;
+    const r = await renderDotAll(v.nodeLines, v.edgeLines, v.varNodeLines, v.varEdgeLines);
+    for (const [k, val] of Object.entries(r.svgs)) {
+      svgs[withVariantSuffix(k, suffix + '_dma')] = injectPeriphDetailLabels(bendAntiParallelEdges(val), v.edgeDetails);
+    }
+  }
+  await renderDmaVariant(allInfo, 'a', '');
 
-  // "cyclic-only": entries whose own top-level infinite loop was found (see
-  // findTopLevelInfiniteLoop) are seeded from *just* that loop's own calls
-  // instead of their whole call tree, so one-time setup (main's clock/GPIO/
-  // peripheral init, all made *before* the loop) is never visited at all —
-  // an entry with no detected loop falls back to its whole tree rather than
-  // silently vanishing. ISRs always use their whole tree: an ISR firing at
-  // all *is* the cyclic/runtime behavior, it has no "setup phase" of its own.
+  // Two independent seeds, each rendered as its own *inclusive* reachability
+  // diagram — not as a set-difference against the other. An entry's own
+  // directly-written body (e.g. main poking a register itself, not through a
+  // helper call) has no loop/no-loop split at our granularity: analyzeFunction
+  // only tracks loop-membership for *calls* (loopCallNames), never for
+  // individual register accesses written inline. So main's own direct
+  // accesses always land in both aggregations below identically — treating
+  // "exactly one checkbox checked" as an exclusive set (cyclic-and-not-setup)
+  // was tried and silently dropped every peripheral main touches directly,
+  // since those can never be exclusive to either side. Rendering each seed's
+  // full reachable set independently avoids that trap entirely.
+  //
+  // cyclic seed: entries whose own top-level infinite loop was found (see
+  // findTopLevelInfiniteLoop) start from *just* that loop's own calls instead
+  // of their whole call tree; an entry with no detected loop falls back to
+  // its whole tree rather than silently vanishing. ISRs always use their
+  // whole tree: an ISR firing at all *is* the cyclic/runtime behavior, it has
+  // no "setup phase" of its own — so it never contributes to the setup seed.
   const cyclicInfo = aggregateEntryInfo(entries, e => (e.isISR ? [...e.calls] : (e.hasLoop ? [...e.loopCalls] : [...e.calls])));
-  const cyclic = assembleLevel0(entries, cyclicInfo, 'c');
-  const cyclicRender = await renderDotAll(cyclic.nodeLines, cyclic.edgeLines, cyclic.varNodeLines, cyclic.varEdgeLines);
-  for (const [k, v] of Object.entries(cyclicRender.svgs)) svgs[`${k}_cyclic`.replace('_novars_cyclic', '_cyclic_novars')] = v;
-  // "_novars_cyclic" -> "_cyclic_novars": renderDotAll's own keys are
-  // "<engine>"/"<engine>_novars"; appending "_cyclic" after the fact needs to
-  // land the segment in the same order wireDiagramToolbar/setupEngineSwitchable
-  // build it in client-side (<engine>_cyclic_novars, not <engine>_novars_cyclic)
+  // setup seed: an entry's own direct calls that are *not* inside its loop —
+  // exactly the one-time boot-phase calls (main's clock/GPIO/peripheral init).
+  const setupInfo = aggregateEntryInfo(
+    entries,
+    e => (e.isISR ? [] : [...e.calls].filter(c => !e.loopCalls.has(c))),
+    e => !e.isISR,
+  );
 
-  // TEMPORARY: same shape either way ({withVars, noVars}), just also split by
-  // the cyclic toggle now — see wireNeatoModeTester in viewer.js, which reads
-  // both checkboxes to pick the right one of these four.
-  const combinedTestRawDot = testRawDot ? { all: testRawDot, cyclic: cyclicRender.testRawDot } : undefined;
+  async function renderVariant(info, idPrefix, suffix) {
+    const v = assembleLevel0(entries, info, idPrefix);
+    const r = await renderDotAll(v.nodeLines, v.edgeLines, v.varNodeLines, v.varEdgeLines);
+    for (const [k, val] of Object.entries(r.svgs)) {
+      svgs[withVariantSuffix(k, suffix)] = injectPeriphDetailLabels(bendAntiParallelEdges(val), v.edgeDetails);
+    }
+    return { v, r };
+  }
+
+  const { v: cyclic, r: cyclicRender } = await renderVariant(cyclicInfo, 'c', '_cyclic');
+  await renderDmaVariant(cyclicInfo, 'c', '_cyclic');
+  const { v: setupOnly, r: setupRender } = await renderVariant(setupInfo, 's', '_setuponly');
+  await renderDmaVariant(setupInfo, 's', '_setuponly');
+
+  // "neither checked" is the one case worth computing as a genuine
+  // set relationship — peripherals/vars reachable from *both* seeds above,
+  // i.e. touched during setup and again at runtime (e.g. a clock register
+  // poked once at boot and again later). Compared at whole-diagram identity
+  // (usedNames), not per-entry — the same peripheral is often cyclic-touched
+  // by one entry (an ISR) and setup-touched by a completely different one
+  // (main), so a per-entry check would never find the overlap.
+  // excludeOwnDirect=true on both sides: an entry's own inline code (main
+  // poking a register directly, not through a helper) is identical evidence
+  // in *both* aggregations regardless of when it actually ran (see usedNames'
+  // own comment) — without this, virtually everything main touches directly
+  // ends up flagged "overlap" purely from that ambiguity, not because it was
+  // provably touched at both setup and runtime.
+  const cyclicUsed = usedNames(cyclicInfo, entries, true, true);
+  const setupUsed = usedNames(setupInfo, entries, false, true);
+  const overlapPeriphs = new Set([...cyclicUsed.periphs].filter(n => setupUsed.periphs.has(n)));
+  const overlapVars = new Set([...cyclicUsed.vars].filter(n => setupUsed.vars.has(n)));
+  const overlapInfo = mergeFilteredInfo(entries, overlapPeriphs, overlapVars, cyclicInfo, setupInfo);
+  const { v: overlap, r: overlapRender } = await renderVariant(overlapInfo, 'o', '_overlap');
+  await renderDmaVariant(overlapInfo, 'o', '_overlap');
+
+  // TEMPORARY: same shape either way ({withVars, noVars}), just split four
+  // ways now — see wireNeatoModeTester in viewer.js, which reads both
+  // checkboxes to pick the right one of these variants.
+  const combinedTestRawDot = testRawDot
+    ? { all: testRawDot, cyclic: cyclicRender.testRawDot, setuponly: setupRender.testRawDot, overlap: overlapRender.testRawDot }
+    : undefined;
 
   return {
     svgs,
     varsToggle: hasVars,
+    dmaToggle: hasDma,
     cyclicToggle: entries.some(e => e.isISR || e.hasLoop),
-    note: [all.note, cyclic.note].filter(Boolean).join('; '),
-    extraNodes: { ...all.extraNodes, ...cyclic.extraNodes },
+    note: [all.note, cyclic.note, setupOnly.note, overlap.note].filter(Boolean).join('; '),
+    extraNodes: { ...all.extraNodes, ...cyclic.extraNodes, ...setupOnly.extraNodes, ...overlap.extraNodes },
     testRawDot: combinedTestRawDot,
   };
 }
@@ -1721,12 +2715,26 @@ async function buildFunctionDiagram(fn) {
   }
   // peripherals this function touches directly, with the specific registers
   // on the edge — grouped with the variables (both are data access, both ride
-  // the "переменные" toggle) rather than the call nodes
-  for (const [pName, fields] of fn.periphFields) {
+  // the "переменные" toggle) rather than the call nodes. No longer unioned
+  // with fn.arms (2026-07-16): a peripheral this function only arms via
+  // NVIC_EnableIRQ, with no register access of its own, now shows up via its
+  // edge to the synthetic NVIC node instead (NVIC itself already appears
+  // here through fn.periphFields, same as any real peripheral — see
+  // analyzeFunction's armCalls handling) — unioning fn.arms in on top of that
+  // would draw an orphaned peripheral node with zero edges, now that
+  // dotPeriphAccessEdges no longer draws anything for arm-only evidence.
+  const periphNames = new Set(fn.periphFields.keys());
+  const edgeDetails = [];
+  for (const pName of periphNames) {
     varNodeLines.push(dotPeriphRelNode(pName));
-    varEdgeLines.push(dotPeriphAccessEdge(fn.key, pName, periphAggMode(fields), true, fields));
+    const { lines, details } = dotPeriphAccessEdges(
+      fn.key, pName, fn.periphFields.get(pName), fn.periphFlags.get(pName), 'fn');
+    varEdgeLines.push(...lines);
+    edgeDetails.push(...details);
   }
-  const { svgs, hasVars } = await renderDotAll(nodeLines, edgeLines, varNodeLines, varEdgeLines);
+  const { svgs: rawSvgs, hasVars } = await renderDotAll(nodeLines, edgeLines, varNodeLines, varEdgeLines);
+  const svgs = {};
+  for (const [k, v] of Object.entries(rawSvgs)) svgs[k] = injectPeriphDetailLabels(bendAntiParallelEdges(v), edgeDetails);
   // neato, not dot: the client-side chain-expansion in viewer.js pins
   // already-visible nodes at their current coordinates on every re-layout
   // (via pos="x,y!") so clicking one more hop doesn't reshuffle everything
@@ -1861,6 +2869,14 @@ const CSS = `
      only ever hides the rendered text, so nothing reflows on hover. */
   svg g.edge > text { opacity: 0; }
   svg g.edge.hl > text { opacity: 1 !important; }
+  /* "_EN" (see dotPeriphAccessEdges) is the one edge-label exception to
+     the hide-by-default rule above — a short, static hint some periph edges
+     (ones touching an "enable"-shaped bit, or a direct NVIC_EnableIRQ arm)
+     carry even at rest. It steps aside for its own .periph-detail siblings
+     (the full register/flag breakdown, still governed by the plain rules
+     above) only while the edge itself is actually highlighted. */
+  svg g.edge > text.periph-default { opacity: 1; }
+  svg g.edge.hl > text.periph-default { opacity: 0 !important; }
   .trailbar { font-size: 0.85rem; color: #52525b; margin: 0 0 14px; }
   .trailbar a { color: #2563eb; text-decoration: none; }
   .trailbar a:hover { text-decoration: underline; }
@@ -1881,12 +2897,12 @@ const LEGEND = `
 const LEGEND0 = `
 <div class="legend">
   <span>точка входа <b>&mdash;</b> переменная — связь без стрелки: эти данные всегда идут в обе стороны между разными точками входа (иначе переменная не попала бы на этот уровень), указывать направление незачем</span>
-  <span>точка входа <b>&rarr;</b> периферия = <b>запись</b>, обратная стрелка = <b>чтение</b>, <b>&harr;</b> = обе</span>
-  <span>сплошная линия — точка входа обращается сама (в своём теле), пунктирная — где-то внутри функций, которые она вызывает</span>
+  <span>точка входа <b>&rarr;</b> периферия, <b>сплошная</b> линия = <b>запись</b>; периферия <b>&rarr;</b> точка входа, <b>пунктирная</b> линия = <b>чтение</b>; обе стрелки сразу = и то, и другое</span>
+  <span>для переменных стрелок нет (см. выше), но сплошная/пунктирная сохраняет старый смысл: точка входа обращается сама (в своём теле) / где-то внутри функций, которые она вызывает</span>
   <span><span class="chip" style="background:#e0e7ff;border-color:#4338ca"></span>&#11039; периферия (регистры вида <code>X-&gt;поле</code>)</span>
-  <span><b>&#8943;&gt;</b> «взводит» — вызов NVIC_EnableIRQ на эту периферию</span>
-  <span><b>=&gt;</b> «прерывание» — периферия вызывает обработчик по её имени</span>
+  <span><b>&rarr;</b> «<i>РЕГИСТР</i>_EN» (например «CCR_EN») — та же сплошная (запись) стрелка, когда включается конкретный бит; голое «_EN» — включение только вызовом NVIC_EnableIRQ, без своего регистра; «~ИМЯ» (например «~CCR_EN») в подробностях по наведению — бит только выключается здесь, нигде не включается</span>
   <span>цилиндр с несколькими именами — переменные, связанные с одним и тем же набором точек входа, собранные в один жгут</span>
+  <span><span class="chip" style="background:#fff;border-color:#0d9488;border-style:dashed"></span>DMA-потоки (чекбокс «DMA-потоки») — куда канал DMA пишет данные и откуда их берёт (CPAR/CMAR), направление по биту DIR; отдельный цвет, чтобы не путать с чтением/записью регистров выше</span>
   <span class="muted">наведите курсор — подсветятся связи; клик — закрепить подсветку; двойной клик — перейти; клик по пустому месту — снять</span>
 </div>`;
 
@@ -1927,7 +2943,7 @@ ${body}
 // page-wide nav) since they're properties of this one diagram, not a
 // page-wide setting; varsToggle is only worth showing on diagrams that
 // actually mix in variable nodes (not aggregate/include, which are file-only).
-function diagramBlockSvg(svgs, { defaultEngine = 'neato', varsToggle = true, cyclicToggle = false, diagramId = 'gv', focus, testRawDot } = {}) {
+function diagramBlockSvg(svgs, { defaultEngine = 'neato', varsToggle = true, cyclicToggle = false, dmaToggle = false, diagramId = 'gv', focus, testRawDot } = {}) {
   return `<div class="diagram-wrap">
 <div class="diagram" data-engine="graphviz" data-cur-engine="${defaultEngine}" data-diagram-id="${diagramId}"${focus ? ` data-focus="${focus}"` : ''} tabindex="-1">
 <div class="zoombar">
@@ -1939,7 +2955,8 @@ function diagramBlockSvg(svgs, { defaultEngine = 'neato', varsToggle = true, cyc
 ${testRawDot ? `<script type="application/json" class="test-raw-dot">${JSON.stringify(testRawDot)}</script>` : ''}
 </div>
 <div class="diagram-toolbar">
-${varsToggle ? '  <label class="gv-ctrl"><input type="checkbox" class="gv-vars-toggle" checked> переменные</label>\n' : ''}${cyclicToggle ? '  <label class="gv-ctrl"><input type="checkbox" class="gv-cyclic-toggle"> только цикличное</label>\n' : ''}  <select class="gv-engine-select">
+${varsToggle ? '  <label class="gv-ctrl"><input type="checkbox" class="gv-vars-toggle" checked> переменные</label>\n' : ''}${cyclicToggle ? `  <label class="gv-ctrl"><input type="checkbox" class="gv-cyclic-toggle" checked> цикличное</label>
+  <label class="gv-ctrl"><input type="checkbox" class="gv-setup-toggle" checked> однократное</label>\n` : ''}${dmaToggle ? '  <label class="gv-ctrl"><input type="checkbox" class="gv-dma-toggle"> DMA-потоки</label>\n' : ''}  <select class="gv-engine-select">
     <option value="neato"${defaultEngine === 'neato' ? ' selected' : ''}>органично</option>
     <option value="dot"${defaultEngine === 'dot' ? ' selected' : ''}>иерархично</option>
     <option value="fdp"${defaultEngine === 'fdp' ? ' selected' : ''}>силовое</option>
@@ -2013,13 +3030,25 @@ fs.copyFileSync(path.join(here, 'viewer.js'), path.join(outDir, 'app.js'));
       calls: [...fn.calls].map(fnId),
       callers: [...fn.callers].map(fnId),
       access: [...fn.access.entries()].map(([vk, mode]) => ({ v: varId(vk), mode })),
-      // peripherals touched directly, with per-register detail — lets the
-      // client rebuild the "Связи" diagram show e.g. "UART2: CR1 (запись)"
-      // exactly as the build-time SVG does (see dotPeriphRelNode)
+      // peripherals touched directly, with per-register (and, where a named
+      // bit was found, per-bit) detail — lets the client rebuild the "Связи"
+      // diagram with the same access edge and hover-reveal the build-time SVG
+      // uses (see dotPeriphRelNode/dotPeriphAccessEdges). No longer unioned
+      // with fn.arms (2026-07-16) — arming shows up through the synthetic
+      // NVIC peripheral's own periphFields entry instead, same as any real
+      // peripheral (see analyzeFunction's armCalls handling), not as a
+      // special addendum here.
       periph: fn.periphFields.size
-        ? [...fn.periphFields.entries()].map(([name, fields]) => ({
+        ? [...fn.periphFields.keys()].map(name => ({
             id: periphId(name), name,
-            regs: [...fields.entries()].map(([reg, mode]) => ({ reg, mode })),
+            regs: [...fn.periphFields.get(name).entries()].map(([reg, mode]) => {
+              const flags = fn.periphFlags.get(name)?.get(reg);
+              return {
+                reg, mode,
+                rFlags: flags && flags.r.size ? [...flags.r] : undefined,
+                wFlags: flags && flags.w.size ? [...flags.w] : undefined,
+              };
+            }),
           }))
         : undefined,
     };
@@ -2081,7 +3110,7 @@ fs.copyFileSync(path.join(here, 'viewer.js'), path.join(outDir, 'app.js'));
 
   const level0 = await buildLevel0Diagram();
   const level0Diagram = level0
-    ? diagramBlockSvg(level0.svgs, { diagramId: 'level0', varsToggle: level0.varsToggle, cyclicToggle: level0.cyclicToggle, testRawDot: level0.testRawDot })
+    ? diagramBlockSvg(level0.svgs, { diagramId: 'level0', varsToggle: level0.varsToggle, cyclicToggle: level0.cyclicToggle, dmaToggle: level0.dmaToggle, testRawDot: level0.testRawDot })
     : '';
   const overview = await buildOverviewDiagram();
   const overviewDiagram = diagramBlockSvg(overview.svgs, { diagramId: 'overview', varsToggle: overview.varsToggle });
@@ -2097,8 +3126,9 @@ ${level0 ? `
 <h2>Уровень 0 — точки входа, периферия и обмен данными</h2>
 <p class="muted">main и обработчики прерываний; шестиугольники — периферия (регистровые блоки вида <code>X-&gt;поле</code>),
 серые блоки — переменные с одинаковыми писателями/читателями, свёрнутые в один жгут (клик разворачивает).
-Сплошная связь — точка входа обращается сама, пунктирная — где-то внутри её вызовов;
-пунктир с подписью «взводит» — вызов NVIC_EnableIRQ; жирная стрелка «прерывание» — периферия вызывает обработчик по имени.
+Периферия: сплошная стрелка (точка входа &rarr; периферия) = запись, пунктирная (периферия &rarr; точка входа) = чтение;
+подпись вида «CCR_EN» на сплошной стрелке — включение конкретного бита в этом регистре; голое «_EN» — включение только вызовом NVIC_EnableIRQ, без своего регистра.
+Для переменных сплошная/пунктирная линия значит другое: точка входа обращается сама / где-то внутри её вызовов.
 Двойной клик по функции — спуск на уровень ниже (связи + блок-схема алгоритма).${level0.note ? ` Здесь ${level0.note}.` : ''}</p>
 ${LEGEND0}
 ${level0Diagram}

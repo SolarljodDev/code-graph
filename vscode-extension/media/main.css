@@ -1,0 +1,116 @@
+html, body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: var(--vscode-editor-background);
+  color: var(--vscode-foreground);
+  font-family: var(--vscode-font-family);
+}
+
+#status {
+  padding: 16px;
+  font-size: 13px;
+  opacity: 0.8;
+}
+
+/* functions stack top-to-bottom in file order; positioning is a CSS
+   transform (translate+scale) on #inner via graph-view.js's setupPanZoom —
+   overflow stays hidden (not auto) since native scrolling no longer applies,
+   panning/zooming handles all of it (wheel = zoom, left-drag = pan). */
+#viewport {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  display: none;
+}
+#inner { width: 100%; }
+
+.fn-block {
+  border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  padding-bottom: 18px;
+}
+.fn-block:first-child { border-top: none; }
+
+/* Used to stay pinned via position:sticky while #viewport scrolled
+   natively; now that panning is a CSS transform on #inner (setupPanZoom in
+   graph-view.js, see #viewport above), sticky no longer has a scroll
+   container to stick within, so this is now just a plain header. */
+.fn-head {
+  z-index: 2;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  color: var(--vscode-descriptionForeground);
+  background: var(--vscode-editor-background);
+  border-bottom: 1px solid transparent;
+}
+.fn-block.active > .fn-head {
+  color: var(--vscode-foreground);
+  border-bottom-color: var(--vscode-focusBorder, #007acc);
+  box-shadow: inset 3px 0 0 var(--vscode-focusBorder, #007acc);
+}
+
+.fn-body { padding: 8px 6px 0; text-align: center; }
+.fn-body svg { max-width: 100%; height: auto; display: inline-block; }
+
+.fn-note {
+  padding: 6px 10px 2px;
+  font-size: 11px;
+  font-style: italic;
+  opacity: 0.55;
+  text-align: left;
+}
+
+/* Node colors derive from VS Code's own theme palette (semantic --vscode-*
+   vars), so the diagram follows whatever theme is active — dark, light, or
+   custom — instead of a hard-coded pair. The plain hex rule declared first is
+   a fallback for engines without color-mix(); the color-mix() rule wins where
+   supported (an unsupported value is dropped, not applied). Generated SVG
+   paints shapes as <polygon>/<ellipse>; the kind class selects the rule. */
+#inner svg g.node { transition: opacity .13s; cursor: pointer; }
+
+#inner svg g.node.cfgstmt polygon { fill: #f8fafc; stroke: #94a3b8; }
+#inner svg g.node.cfgstmt polygon {
+  fill: color-mix(in srgb, var(--vscode-descriptionForeground, #94a3b8) 30%, var(--vscode-editor-background));
+  stroke: var(--vscode-descriptionForeground, #94a3b8);
+}
+#inner svg g.node.cfgcall polygon { fill: #dbeafe; stroke: #2563eb; }
+#inner svg g.node.cfgcall polygon {
+  fill: color-mix(in srgb, var(--vscode-charts-blue, #2563eb) 45%, var(--vscode-editor-background));
+  stroke: var(--vscode-charts-blue, #2563eb);
+}
+#inner svg g.node.cfgcond polygon { fill: #fef3c7; stroke: #d97706; }
+#inner svg g.node.cfgcond polygon {
+  fill: color-mix(in srgb, var(--vscode-charts-orange, #d97706) 45%, var(--vscode-editor-background));
+  stroke: var(--vscode-charts-orange, #d97706);
+}
+#inner svg g.node.cfgterm ellipse { fill: #e2e8f0; stroke: #64748b; }
+#inner svg g.node.cfgterm ellipse {
+  fill: color-mix(in srgb, var(--vscode-foreground, #64748b) 26%, var(--vscode-editor-background));
+  stroke: var(--vscode-descriptionForeground, #64748b);
+}
+#inner svg g.node.cfgjump ellipse { fill: #fce7f3; stroke: #db2777; }
+#inner svg g.node.cfgjump ellipse {
+  fill: color-mix(in srgb, var(--vscode-charts-purple, #db2777) 45%, var(--vscode-editor-background));
+  stroke: var(--vscode-charts-purple, #db2777);
+}
+
+/* focus (from a 'locate' message): dim everything else in that function's
+   svg, keep only the located node lit. Deliberately node-only — edges are
+   never marked .hl, so they dim along with everything else; there's no
+   edge-based expansion to a neighborhood here, just the one node. */
+#inner svg.dim g.node:not(.hl) { opacity: 0.18; }
+#inner svg.dim g.edge { opacity: 0.12; }
+#inner svg g.node.hl path,
+#inner svg g.node.hl polygon,
+#inner svg g.node.hl ellipse { stroke-width: 2.5px; }
+#inner svg g.node.hl > polygon,
+#inner svg g.node.hl > ellipse {
+  filter: drop-shadow(0 0 3px var(--vscode-focusBorder, #007acc));
+}
+
+/* edge/label ink follows the theme (graphviz emits black) */
+#inner svg text { fill: var(--vscode-foreground); }
+#inner svg g.edge path { stroke: var(--vscode-foreground); opacity: 0.7; }
+#inner svg g.edge polygon { fill: var(--vscode-foreground); stroke: var(--vscode-foreground); opacity: 0.7; }

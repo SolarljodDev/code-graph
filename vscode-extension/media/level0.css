@@ -1,0 +1,83 @@
+/* Level-0-specific node colors — theme-aware color-mix(), same convention
+   main.css already uses for CFG node kinds. Any shape tag graphviz might use
+   for a class (polygon for box/hexagon, path for cylinder) is covered. */
+
+html, body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: var(--vscode-editor-background);
+  color: var(--vscode-foreground);
+  font-family: var(--vscode-font-family);
+}
+
+#status { padding: 16px; font-size: 13px; opacity: 0.8; }
+#status.error { color: var(--vscode-errorForeground); }
+
+#viewport { position: absolute; inset: 0; display: none; flex-direction: column; }
+#viewport.ready { display: flex; }
+#legend-wrap { padding: 6px 10px 0; flex: none; }
+.diagram-wrap { position: relative; flex: 1 1 auto; min-height: 0; }
+.diagram-wrap .diagram { position: absolute; inset: 0; }
+
+svg g.node.entry path,
+svg g.node.entry polygon {
+  fill: color-mix(in srgb, var(--vscode-charts-green, #16a34a) 45%, var(--vscode-editor-background));
+  stroke: var(--vscode-charts-green, #16a34a);
+}
+svg g.node.isr path,
+svg g.node.isr polygon {
+  fill: color-mix(in srgb, var(--vscode-charts-red, #dc2626) 45%, var(--vscode-editor-background));
+  stroke: var(--vscode-charts-red, #dc2626);
+}
+svg g.node.periph path,
+svg g.node.periph polygon {
+  fill: color-mix(in srgb, var(--vscode-charts-purple, #4338ca) 38%, var(--vscode-editor-background));
+  stroke: var(--vscode-charts-purple, #4338ca);
+}
+svg g.node.periphhot path,
+svg g.node.periphhot polygon {
+  fill: color-mix(in srgb, var(--vscode-charts-purple, #3730a3) 55%, var(--vscode-editor-background));
+  stroke: var(--vscode-charts-purple, #3730a3);
+  stroke-width: 2px;
+}
+svg g.node.gvar path,
+svg g.node.gvar polygon {
+  fill: color-mix(in srgb, var(--vscode-charts-yellow, #b45309) 48%, var(--vscode-editor-background));
+  stroke: var(--vscode-charts-yellow, #b45309);
+}
+svg g.node.gvarhot path,
+svg g.node.gvarhot polygon {
+  fill: color-mix(in srgb, var(--vscode-charts-yellow, #92400e) 62%, var(--vscode-editor-background));
+  stroke: var(--vscode-charts-yellow, #92400e);
+  stroke-width: 2px;
+}
+/* "minor" here just means "smaller bundle" (every var shown already crosses
+   entry points), so it stays legible rather than fading toward invisible. */
+svg g.node.gvarminor path,
+svg g.node.gvarminor polygon {
+  fill: color-mix(in srgb, var(--vscode-charts-yellow, #ca8a04) 32%, var(--vscode-editor-background));
+  stroke: var(--vscode-charts-yellow, #ca8a04);
+}
+svg g.node.ghost path,
+svg g.node.ghost polygon {
+  fill: color-mix(in srgb, var(--vscode-descriptionForeground, #a1a1aa) 26%, var(--vscode-editor-background));
+  stroke: var(--vscode-descriptionForeground, #a1a1aa);
+}
+
+/* DMA source/destination edges (dotDmaFlowEdge in level0-analyzer.mjs) — a
+   dedicated color, distinct from the plain register read/write edges, so
+   "this is where the data physically goes" doesn't read as just another
+   register access. Needs !important-level specificity (via the extra
+   .dma-flow class, not the !important keyword) to win over graph-view.css's
+   generic `svg g.edge path { stroke: var(--vscode-foreground); }` default. */
+svg g.edge.dma-flow path {
+  stroke: color-mix(in srgb, #0d9488 70%, var(--vscode-editor-background));
+  opacity: 0.9;
+}
+svg g.edge.dma-flow polygon {
+  fill: color-mix(in srgb, #0d9488 70%, var(--vscode-editor-background));
+  stroke: color-mix(in srgb, #0d9488 70%, var(--vscode-editor-background));
+  opacity: 0.9;
+}
