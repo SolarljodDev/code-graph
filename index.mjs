@@ -288,6 +288,11 @@ const DMA_BUS_RE = /^DMA[0-9]+$/;
 function analyzeFunction(funcNode) {
   const declarator = funcNode.childForFieldName('declarator');
   const locals = new Set();
+  // a local pointer's own initializer, resolved one level deep — see
+  // resolveLocalAlias — so `X->CMAR = m->data` can be traced through
+  // `U1Msg *m = &u1_q[u1_q_tail];` back to `u1_q`, the same way a direct
+  // `X->CMAR = u1_rx_buf` already resolves. name -> {kind, name/key, field}
+  const localAliases = new Map();
   if (declarator) {
     walkTree(declarator, n => {
       if (n.type === 'parameter_declaration') {
@@ -303,6 +308,11 @@ function analyzeFunction(funcNode) {
         for (const d of childrenForField(n, 'declarator')) {
           const nm = findNameInDeclarator(d);
           if (nm) locals.add(nm);
+          if (nm && d.type === 'init_declarator') {
+            const value = d.childForFieldName('value');
+            const ref = value && resolveAddrExpr(value);
+            if (ref) localAliases.set(nm, ref);
+          }
         }
       }
     });
@@ -449,7 +459,7 @@ function analyzeFunction(funcNode) {
             } else if (op === '=' && right) {
               addFlagNames('w', right, 'set');
               if (field === 'CPAR' || field === 'CMAR') {
-                const ref = resolveAddrExpr(right);
+                const ref = resolveLocalAlias(resolveAddrExpr(right), locals, localAliases);
                 if (ref) {
                   let am = derefAddrRefs.get(name);
                   if (!am) { am = new Map(); derefAddrRefs.set(name, am); }
@@ -500,18 +510,22 @@ function analyzeFunction(funcNode) {
   return { calls, armCalls, derefNames, derefFields, derefFlags, derefAddrRefs, access, signature, loopCallNames, hasLoop };
 }
 
-// Strips a DMA CPAR/CMAR assignment's right-hand side down to the expression
-// that actually names the source/destination address — casts
-// (`(uint32_t)...`) and parens first, then, if what's left is `&something`,
-// unwraps that one layer too (both `X->CPAR = (uint32_t)&USART1->DR` and
+// Strips a DMA CPAR/CMAR assignment's right-hand side (or a local pointer's
+// own initializer — see resolveLocalAlias) down to the expression that
+// actually names the source/destination address — casts (`(uint32_t)...`)
+// and parens first, then, if what's left is `&something`, unwraps that one
+// layer too (both `X->CPAR = (uint32_t)&USART1->DR` and
 // `X->CPAR = &USART1->DR` name the same target either way; a plain
 // `X->CMAR = u1_rx_buf` never had a `&` in the first place — arrays decay to
-// a pointer on their own). What remains is classified: a `->` field access
-// names the peripheral it's rooted at (the specific field doesn't matter —
-// the peripheral is the whole point of the node), a bare identifier names a
-// var. Anything else (`m->data` off a local pointer, as in u1_kick — the
-// queue-slot address isn't known until runtime) resolves to null; this never
-// tries to trace a local variable's own prior assignment.
+// a pointer on their own), then unwraps one `[index]` layer the same way
+// (`&u1_q[u1_q_tail]` names the array `u1_q`, whichever slot). What remains
+// is classified: a `->` field access names the peripheral it's rooted at
+// (`field` is kept too, for the hover-detail label — see dotDmaFlowEdge) and
+// a bare identifier names a var — this doesn't yet know whether that base
+// name is itself a global or a local pointer/array (e.g. `m` in `m->data`,
+// off a local `U1Msg *m = &u1_q[...]`); the caller resolves that ambiguity
+// via resolveLocalAlias, since only it has the enclosing function's
+// `locals`/`localAliases`.
 function resolveAddrExpr(node) {
   let n = node;
   for (;;) {
@@ -525,12 +539,33 @@ function resolveAddrExpr(node) {
     while (n && n.type === 'parenthesized_expression') n = n.namedChildren[0];
   }
   if (!n) return null;
+  if (n.type === 'subscript_expression') {
+    n = n.childForFieldName('argument');
+    while (n && n.type === 'parenthesized_expression') n = n.namedChildren[0];
+  }
+  if (!n) return null;
   if (n.type === 'field_expression' && n.childForFieldName('operator')?.text === '->') {
     const base = n.childForFieldName('argument');
-    return base && base.type === 'identifier' ? { kind: 'periph', name: base.text } : null;
+    return base && base.type === 'identifier'
+      ? { kind: 'periph', name: base.text, field: n.childForFieldName('field')?.text }
+      : null;
   }
   if (n.type === 'identifier') return { kind: 'var', name: n.text };
   return null;
+}
+// Follows resolveAddrExpr's result one step further when it turns out to
+// name a local, not a real global/peripheral — `m->data` off
+// `U1Msg *m = &u1_q[u1_q_tail];` first resolves (structurally) to
+// {kind:'periph', name:'m', field:'data'}, since resolveAddrExpr alone can't
+// tell a peripheral register block apart from a local struct pointer by AST
+// shape; `m` being in `locals` is exactly that tell. localAliases (built once
+// per function, see analyzeFunction) already carries `m`'s own resolved
+// initializer, one level deep — not re-resolved recursively here, so a local
+// pointer assigned from *another* local pointer's value is left unresolved
+// (vanishingly rare, and not worth a fixed-point loop for).
+function resolveLocalAlias(ref, locals, localAliases) {
+  if (!ref) return null;
+  return locals.has(ref.name) ? (localAliases.get(ref.name) || null) : ref;
 }
 
 // A while/for statement that never terminates by its own condition — the
@@ -740,6 +775,9 @@ function buildCfg(body) {
       }
 
       case 'return_statement': {
+        // bare `return;` (no value) carries no information worth showing —
+        // route straight into конец instead of drawing a return bubble.
+        if (!s.namedChildren.length) return { entry: ctx.exitId, exits: [] };
         const id = mkNode('ret', trunc(s.text, 42));
         mkEdge(id, ctx.exitId);
         return { entry: id, exits: [] };
@@ -1667,10 +1705,17 @@ function periphDirDetail(fields, flags, dir, cap = 6) {
         // bits: Map(flagName -> 'set'|'clear'|'both') — a bit only ever
         // cleared here (`&= ~FLAG`, never `|= FLAG` anywhere in the same
         // tree) gets a literal ~ prefix so it reads as "turned off", not
-        // "turned on"; 'set' and 'both' (armed at least once, even if also
-        // disarmed elsewhere — the disable-then-rearm restart idiom, e.g.
-        // u1_kick's `CCR &= ~DMA_CCR_EN; ...; CCR |= DMA_CCR_EN;`) render
-        // plain, since the bit genuinely does get set somewhere.
+        // "turned on". 'both' (armed at least once, even if also disarmed
+        // elsewhere — the disable-then-rearm restart idiom, e.g. u1_kick's
+        // `CCR &= ~DMA_CCR_EN; ...; CCR |= DMA_CCR_EN;`) shows *both* forms,
+        // clear before set — that's the actual disable-then-rearm sequence
+        // for the common case where they're both in the one function this
+        // detail is for; across a whole reachable call tree there's no
+        // single well-defined order (different callees, branches, ...), so
+        // this is a reasonable default reading, not a claimed causal fact.
+        // User request (2026-07-20): show "~_en и просто _en" — seeing only
+        // plain "EN" collapsed the two events into one and read as if the
+        // bit were never cleared at all.
         const sorted = [...bits.keys()].sort();
         if (!hasEnable) {
           // first enable-shaped bit found (regs already walked in sorted
@@ -1684,7 +1729,11 @@ function periphDirDetail(fields, flags, dir, cap = 6) {
           const enableBit = sorted.find(fl => isEnableFlagName(fl) && bits.get(fl) !== 'clear');
           if (enableBit) { hasEnable = true; enableLabel = shortFlagName(enableBit); }
         }
-        return sorted.map(fl => (bits.get(fl) === 'clear' ? '~' : '') + shortFlagName(fl)).join(', ');
+        return sorted.map(fl => {
+          const short = shortFlagName(fl);
+          const pol = bits.get(fl);
+          return pol === 'both' ? `~${short}, ${short}` : (pol === 'clear' ? '~' : '') + short;
+        }).join(', ');
       }
       const sorted = [...bits].sort();
       return sorted.map(shortFlagName).join(', ');
@@ -1836,12 +1885,21 @@ function dotPeriphAccessEdges(fnKey, periphName, fields, flags, idPrefix) {
 // read as just another access to the channel's own registers. Direction
 // follows the transfer's real direction (source -> channel -> destination),
 // not read/write of CPAR/CMAR themselves. label is the register the address
-// came from (CPAR/CMAR), shown small and always-visible — there's only ever
-// one line here, unlike the periph access edges' hover-detail stack, so it
-// doesn't need the same hide-until-hover treatment.
+// came from (CPAR/CMAR itself), shown small and always-visible; detail is
+// the *concrete* thing that register resolved to — the specific peripheral
+// register for a CPAR edge (e.g. "DR", so hovering "CPAR" answers "which
+// register on USART1 specifically" the same way an ordinary access edge's
+// hover reveals its own register breakdown — see periphDirDetail) or the
+// variable's own name for a CMAR edge (redundant with the destination node's
+// own label most of the time, but still useful when that node sits far from
+// the edge's own midpoint). Reuses the exact same hide-until-hover mechanism
+// as dotPeriphAccessEdges (.periph-detail/.periph-default, spliced in by
+// injectPeriphDetailLabels) — pass detail only when there's something worth
+// revealing; the caller skips the edgeDetails entry entirely otherwise.
 const DMA_FLOW_COLOR = '#0d9488';
-function dotDmaFlowEdge(fromId, toId, label, id) {
-  return dotEdge(fromId, toId, { style: 'dashed', label, id, color: DMA_FLOW_COLOR });
+function dotDmaFlowEdge(fromId, toId, label, id, detail) {
+  const line = dotEdge(fromId, toId, { style: 'dashed', label, id, color: DMA_FLOW_COLOR });
+  return { line, detail: detail ? { id, defaultLabel: label, detail } : null };
 }
 
 // Splices each periph edge's full register/flag breakdown into its already-
@@ -2214,13 +2272,33 @@ function aggregateEntryInfo(entries, seedFn, includeOwnDirect = () => true) {
 // from colliding with the *other* variant's when both sets of extraNodes get
 // merged into one page (same bundle-count coincidence would otherwise mean
 // two totally different variable lists sharing one id and one tooltip).
-function assembleLevel0(entries, info, idPrefix, includeDma = false) {
-  const { varInfo, periphInfo, periphFieldInfo, periphFlagInfo, periphAddrRefInfo } = info;
+function assembleLevel0(entries, info, idPrefix, includeDma = false, dmaFacts = null) {
+  const { varInfo, periphInfo, periphFieldInfo, periphFlagInfo } = info;
+
+  // A var CMAR resolves to must never also qualify as a normal cross-entry
+  // singleton/bundle var (below) — if it did, resolveDmaRef's own
+  // reader/writer edges got skipped as a would-be duplicate of the
+  // singleton's, but the singleton's edges live in the vars-gated bucket
+  // (varEdgeLines), so unchecking "переменные" silently dropped them —
+  // exactly the buffer-to-function edges "DMA-потоки" exists to show. Bug
+  // found by the user 2026-07-20: u1_q happens to also pass the normal
+  // "written by one entry, read by a different one" filter (uart1_send
+  // writes it, u1_kick reads it), so its reader/writer edges vanished under
+  // "переменные" off even though the node itself (forced core) stayed.
+  // Excluding it here instead means every DMA-target var is *always*
+  // handled by resolveDmaRef's own path, never the singleton/bundle one, so
+  // there's no duplicate to guard against and nothing var-toggle-gated.
+  const dmaTargetVarKeys = new Set();
+  if (includeDma && dmaFacts) {
+    for (const refs of dmaFacts.addrRefs.values()) {
+      for (const ref of refs.values()) if (ref.kind === 'var') dmaTargetVarKeys.add(ref.key);
+    }
+  }
 
   const allVarKeys = new Set();
   for (const acc of varInfo.values()) for (const vk of acc.keys()) allVarKeys.add(vk);
   const showVars = [...allVarKeys].filter(vk => {
-    if (!varDefs.has(vk)) return false;
+    if (!varDefs.has(vk) || dmaTargetVarKeys.has(vk)) return false;
     const accs = entries.filter(e => varInfo.get(e.key).has(vk));
     return accs.some(e1 => varInfo.get(e1.key).get(vk).w &&
       accs.some(e2 => e2 !== e1 && varInfo.get(e2.key).get(vk).r));
@@ -2322,18 +2400,19 @@ function assembleLevel0(entries, info, idPrefix, includeDma = false) {
     }
   }
 
-  // DMA channel data-flow edges — see resolveAddrExpr/periphAddrRefInfo:
-  // which peripheral/global buffer a channel's CPAR/CMAR resolves to, and
-  // (via the CCR DIR bit) which direction the transfer runs. This is a
-  // hardware-wiring fact about the channel itself, not something scoped to
-  // whichever entry happens to reach the assignment that set it up — so it's
-  // drawn once per channel, merged across every entry in this variant,
-  // rather than once per entry the way periph access edges above are (which
-  // would just draw the exact same wiring redundantly for every entry that
-  // happens to reach dma_init/u1_kick).
+  // DMA channel data-flow edges — see resolveAddrExpr/computeDmaFacts: which
+  // peripheral/global buffer a channel's CPAR/CMAR resolves to, and (via the
+  // CCR DIR bit) which direction the transfer runs. dmaFacts is precomputed
+  // once (from the unfiltered "all" reachability, see buildLevel0Diagram) and
+  // shared by every variant's DMA render — not recomputed from *this*
+  // variant's own (possibly filtered) info, because the wiring is a hardware
+  // fact about the channel, not "cyclic" vs "setup" runtime behavior: it's
+  // normally poked once in dma_init, which the cyclic-only filtered variant
+  // deliberately never reaches, and re-deriving it per variant used to mean
+  // checking "DMA-потоки" while only "цикличное" was checked silently showed
+  // nothing at all.
   let hasDma = false;
   if (includeDma) {
-    const singletonVarKeys = new Set(singletons.map(b => b.vars[0]));
     const forcedDmaIds = new Set();
     // resolves a CPAR/CMAR ref to a node id, forcing a node onto the diagram
     // if the target isn't on it already — always the entity's own regular id
@@ -2341,12 +2420,15 @@ function assembleLevel0(entries, info, idPrefix, includeDma = false) {
     // carries full hover metadata (label, type, readers/writers, ...) for
     // *every* peripheral/var in the whole project, not just ones some
     // diagram happens to draw a node for — reusing the real id gets that
-    // metadata for free. Safe to reuse unconditionally: a peripheral only
-    // ever has the one id anywhere on the page; a var's id is only ever a
-    // real node when it earned its own singleton via the normal cross-entry
-    // filter (showVars) — a var folded into a multi-var bundle has no node
-    // of its own under its own id (only the bundle's bnd_N id exists), so
-    // there's nothing to collide with.
+    // metadata for free. Pushed onto nodeLines (the core bucket) even for a
+    // var, not varNodeLines — a DMA buffer should stay visible under
+    // "DMA-потоки" regardless of the separate "переменные" toggle (user
+    // request 2026-07-20: unchecking "переменные" was hiding DMA buffers
+    // too, since they used to live in the same vars-gated bucket as the
+    // normal cross-entry variable bundles). A var CMAR resolves to can never
+    // also be a normal singleton/bundle var (dmaTargetVarKeys excludes it
+    // from showVars above), so there's no duplicate node/edge case to guard
+    // against here.
     function resolveDmaRef(ref) {
       if (!ref) return null;
       if (ref.kind === 'periph') {
@@ -2362,50 +2444,64 @@ function assembleLevel0(entries, info, idPrefix, includeDma = false) {
       const v = varDefs.get(ref.key);
       if (!v) return null;
       const id = varId(ref.key);
-      if (!singletonVarKeys.has(ref.key) && !forcedDmaIds.has(id)) {
-        varNodeLines.push(dotVarNode(v, { tiered: true }));
+      if (!forcedDmaIds.has(id)) {
+        nodeLines.push(dotVarNode(v, { tiered: true }));
         forcedDmaIds.add(id);
+        // DMA hardware writes this buffer directly — the code itself never
+        // assigns to it (a TX buffer only ever gets *read* out to the
+        // peripheral; an RX buffer only ever gets *read* back by whoever
+        // parses it), so it never earns the normal cross-entry "written by
+        // one entry, read by a different one" filter (showVars) on its own.
+        // Wired up here exactly like a normal singleton var (dotAccessLink),
+        // so hovering it shows the functions that actually read/write it,
+        // not just the DMA channel it's plumbed into — user request
+        // 2026-07-20.
+        for (const e of entries) {
+          const a = varInfo.get(e.key)?.get(ref.key);
+          if (!a) continue;
+          edgeLines.push(dotAccessLink(e.key, id, a.direct, false));
+          connectedEntries.add(e.key);
+        }
       }
       return id;
     }
     for (const p of periphList) {
-      const refs = new Map();
-      let ccrDir; // undefined | 'set' | 'clear' | 'both'
-      for (const e of entries) {
-        const eRefs = periphAddrRefInfo.get(e.key).get(p.name);
-        if (eRefs) for (const [field, ref] of eRefs) refs.set(field, ref);
-        const dirFlags = periphFlagInfo.get(e.key).get(p.name)?.get('CCR')?.w;
-        if (dirFlags) {
-          for (const [fl, pol] of dirFlags) {
-            if (!/_DIR$/.test(fl)) continue;
-            ccrDir = ccrDir && ccrDir !== pol ? 'both' : pol;
-          }
-        }
-      }
+      const refs = dmaFacts.addrRefs.get(p.name);
+      if (!refs) continue;
       const cparRef = refs.get('CPAR'), cmarRef = refs.get('CMAR');
       if (!cparRef && !cmarRef) continue;
       // DMA_CCR_DIR set (or set-and-cleared, i.e. genuinely armed at some
       // point — see periphDirDetail's identical 'both' handling for enable
       // bits) means memory -> peripheral (TX); unset/absent is the STM32
       // default, peripheral -> memory (RX).
+      const ccrDir = dmaFacts.ccrDir.get(p.name);
       const isTx = ccrDir === 'set' || ccrDir === 'both';
       const periphSideId = resolveDmaRef(cparRef);
       const memSideId = resolveDmaRef(cmarRef);
       if (!periphSideId && !memSideId) continue;
       const channelId = periphId(p.name);
-      // any edge touching a var-kind endpoint has to land in varEdgeLines,
-      // not edgeLines — renderDotAll's "_novars" render drops varNodeLines
-      // (and the singleton var nodes the normal filter already added) but
-      // keeps edgeLines verbatim, so an edge into a var node left in
-      // edgeLines would dangle in that render.
-      const push = (ref, line) => (ref.kind === 'var' ? varEdgeLines : edgeLines).push(line);
+      // the concrete thing a ref resolved to, revealed on hover — the
+      // specific register for a peripheral ref (dotDmaFlowEdge's own comment
+      // explains why CMAR gets one too, not just CPAR).
+      function detailFor(ref) {
+        if (ref.kind === 'periph') return ref.field || '';
+        return varDefs.get(ref.key)?.name || '';
+      }
+      // Always core (edgeLines), never varEdgeLines — same reasoning as
+      // resolveDmaRef pushing var nodes onto nodeLines instead of
+      // varNodeLines: a DMA edge (and the buffer it points at) is controlled
+      // by "DMA-потоки" alone, not by "переменные" too.
+      const push = (ref, edge) => {
+        edgeLines.push(edge.line);
+        if (edge.detail) edgeDetails.push(edge.detail);
+      };
       hasDma = true;
       if (isTx) {
-        if (memSideId) push(cmarRef, dotDmaFlowEdge(memSideId, channelId, 'CMAR', `dma_${idPrefix}_${channelId}_cmar`));
-        if (periphSideId) push(cparRef, dotDmaFlowEdge(channelId, periphSideId, 'CPAR', `dma_${idPrefix}_${channelId}_cpar`));
+        if (memSideId) push(cmarRef, dotDmaFlowEdge(memSideId, channelId, 'CMAR', `dma_${idPrefix}_${channelId}_cmar`, detailFor(cmarRef)));
+        if (periphSideId) push(cparRef, dotDmaFlowEdge(channelId, periphSideId, 'CPAR', `dma_${idPrefix}_${channelId}_cpar`, detailFor(cparRef)));
       } else {
-        if (periphSideId) push(cparRef, dotDmaFlowEdge(periphSideId, channelId, 'CPAR', `dma_${idPrefix}_${channelId}_cpar`));
-        if (memSideId) push(cmarRef, dotDmaFlowEdge(channelId, memSideId, 'CMAR', `dma_${idPrefix}_${channelId}_cmar`));
+        if (periphSideId) push(cparRef, dotDmaFlowEdge(periphSideId, channelId, 'CPAR', `dma_${idPrefix}_${channelId}_cpar`, detailFor(cparRef)));
+        if (memSideId) push(cmarRef, dotDmaFlowEdge(channelId, memSideId, 'CMAR', `dma_${idPrefix}_${channelId}_cmar`, detailFor(cmarRef)));
       }
     }
   }
@@ -2469,6 +2565,41 @@ function withVariantSuffix(key, suffix) {
 // were never split direct-vs-indirect) — left unfiltered either way, since
 // arming is near-always a true one-time setup fact rather than the source of
 // false positives this guards against.
+// A DMA channel's CPAR/CMAR wiring and its CCR DIR bit are a fact about the
+// channel's hardware setup, not about "cyclic" vs "setup" runtime behavior —
+// the address is normally poked once at boot (dma_init), which is exactly
+// the code the cyclic-only filtered variant deliberately excludes. Computing
+// this from each filtered variant's own (restricted) periphAddrRefInfo/
+// periphFlagInfo — as assembleLevel0 originally did — meant checking
+// "DMA-потоки" while "цикличное" was the only filter on silently showed
+// nothing at all, with no indication why (dma_init is never reachable from
+// any entry's *cyclic* seed). Computed once here from the fullest
+// reachability available (the unfiltered "all" aggregation) and reused by
+// every variant's DMA render instead, so the wiring facts don't flicker in
+// and out as the cyclic/setup/overlap checkboxes change — only which
+// peripherals/entries are otherwise on the diagram does that.
+function computeDmaFacts(entries, info) {
+  const addrRefs = new Map(); // peripheral name -> Map(field -> ref)
+  const ccrDir = new Map();   // peripheral name -> 'set' | 'clear' | 'both'
+  for (const e of entries) {
+    for (const [pk, refs] of info.periphAddrRefInfo.get(e.key)) {
+      let m = addrRefs.get(pk);
+      if (!m) { m = new Map(); addrRefs.set(pk, m); }
+      for (const [field, ref] of refs) m.set(field, ref);
+    }
+    for (const [pk, fields] of info.periphFlagInfo.get(e.key)) {
+      const ccrW = fields.get('CCR')?.w;
+      if (!ccrW) continue;
+      for (const [fl, pol] of ccrW) {
+        if (!/_DIR$/.test(fl)) continue;
+        const prev = ccrDir.get(pk);
+        ccrDir.set(pk, prev && prev !== pol ? 'both' : pol);
+      }
+    }
+  }
+  return { addrRefs, ccrDir };
+}
+
 function usedNames(info, entries, includeIsrTriggers = false, excludeOwnDirect = false) {
   const periphs = new Set(), vars = new Set();
   for (const e of entries) {
@@ -2580,26 +2711,6 @@ async function buildLevel0Diagram() {
   for (const [k, v] of Object.entries(rawSvgs)) {
     svgs[k] = injectPeriphDetailLabels(bendAntiParallelEdges(v), all.edgeDetails);
   }
-  // "DMA-потоки" toggle: a second, independently pre-rendered layout per
-  // variant with the CPAR/CMAR source/destination edges (and whatever
-  // peripheral/var nodes they force onto the diagram) included — same
-  // pre-render-both-states approach as the vars/novars split in renderDotAll
-  // (adding the nodes to an existing layout with CSS visibility instead would
-  // leave them wherever spring layout put them for the *other* state, not
-  // room genuinely freed/reserved for them). off by default (see diagramId0
-  // below) so a project with no DMA usage never even shows the checkbox.
-  let hasDma = false;
-  async function renderDmaVariant(info, idPrefix, suffix) {
-    const v = assembleLevel0(entries, info, idPrefix, true);
-    if (!v.hasDma) return;
-    hasDma = true;
-    const r = await renderDotAll(v.nodeLines, v.edgeLines, v.varNodeLines, v.varEdgeLines);
-    for (const [k, val] of Object.entries(r.svgs)) {
-      svgs[withVariantSuffix(k, suffix + '_dma')] = injectPeriphDetailLabels(bendAntiParallelEdges(val), v.edgeDetails);
-    }
-  }
-  await renderDmaVariant(allInfo, 'a', '');
-
   // Two independent seeds, each rendered as its own *inclusive* reachability
   // diagram — not as a set-difference against the other. An entry's own
   // directly-written body (e.g. main poking a register itself, not through a
@@ -2627,6 +2738,44 @@ async function buildLevel0Diagram() {
     e => !e.isISR,
   );
 
+  // "DMA-потоки" is a dedicated filter restricted to *cyclic* (runtime)
+  // reachability, not all/setup — it used to include whatever touched a DMA
+  // channel from *any* reachable code, which pulled main in via dma_init's
+  // one-time CPAR/CMAR setup even though main itself never does anything
+  // cyclic with the channel; that setup-only edge was the whole reason the
+  // diagram needed a wiring fact in the first place, but showing main as a
+  // full node alongside the ISRs "ломает вид" (user feedback 2026-07-20) —
+  // main's *own* setup-time relationship to a channel isn't the interesting
+  // runtime picture DMA-потоки is trying to show. dmaFacts itself (the
+  // actual CPAR/CMAR wiring) still has to come from allInfo regardless —
+  // dma_init is never cyclic-reachable, so that part of computeDmaFacts
+  // would find nothing at all if it were restricted the same way — only
+  // *which entries/peripherals count as connected* is restricted here, via
+  // the same mergeFilteredInfo mechanism "overlap" below uses, sourced from
+  // cyclicInfo instead of allInfo.
+  const dmaFacts = computeDmaFacts(entries, allInfo);
+  const dmaOnlyPeriphs = new Set(), dmaOnlyVars = new Set();
+  for (const [channelName, refs] of dmaFacts.addrRefs) {
+    dmaOnlyPeriphs.add(channelName);
+    for (const ref of refs.values()) {
+      if (ref.kind === 'periph') dmaOnlyPeriphs.add(ref.name);
+      else dmaOnlyVars.add(ref.key);
+    }
+  }
+  // off by default (no DMA usage anywhere in the project) so the checkbox
+  // never shows at all — see dmaToggle in the return value below.
+  let hasDma = false;
+  let dmaOnly = null;
+  if (dmaOnlyPeriphs.size) {
+    hasDma = true;
+    const dmaOnlyInfo = mergeFilteredInfo(entries, dmaOnlyPeriphs, dmaOnlyVars, cyclicInfo);
+    dmaOnly = assembleLevel0(entries, dmaOnlyInfo, 'd', true, dmaFacts);
+    const r = await renderDotAll(dmaOnly.nodeLines, dmaOnly.edgeLines, dmaOnly.varNodeLines, dmaOnly.varEdgeLines);
+    for (const [k, val] of Object.entries(r.svgs)) {
+      svgs[withVariantSuffix(k, '_dmaonly')] = injectPeriphDetailLabels(bendAntiParallelEdges(val), dmaOnly.edgeDetails);
+    }
+  }
+
   async function renderVariant(info, idPrefix, suffix) {
     const v = assembleLevel0(entries, info, idPrefix);
     const r = await renderDotAll(v.nodeLines, v.edgeLines, v.varNodeLines, v.varEdgeLines);
@@ -2637,9 +2786,7 @@ async function buildLevel0Diagram() {
   }
 
   const { v: cyclic, r: cyclicRender } = await renderVariant(cyclicInfo, 'c', '_cyclic');
-  await renderDmaVariant(cyclicInfo, 'c', '_cyclic');
   const { v: setupOnly, r: setupRender } = await renderVariant(setupInfo, 's', '_setuponly');
-  await renderDmaVariant(setupInfo, 's', '_setuponly');
 
   // "neither checked" is the one case worth computing as a genuine
   // set relationship — peripherals/vars reachable from *both* seeds above,
@@ -2660,7 +2807,6 @@ async function buildLevel0Diagram() {
   const overlapVars = new Set([...cyclicUsed.vars].filter(n => setupUsed.vars.has(n)));
   const overlapInfo = mergeFilteredInfo(entries, overlapPeriphs, overlapVars, cyclicInfo, setupInfo);
   const { v: overlap, r: overlapRender } = await renderVariant(overlapInfo, 'o', '_overlap');
-  await renderDmaVariant(overlapInfo, 'o', '_overlap');
 
   // TEMPORARY: same shape either way ({withVars, noVars}), just split four
   // ways now — see wireNeatoModeTester in viewer.js, which reads both
@@ -2675,7 +2821,10 @@ async function buildLevel0Diagram() {
     dmaToggle: hasDma,
     cyclicToggle: entries.some(e => e.isISR || e.hasLoop),
     note: [all.note, cyclic.note, setupOnly.note, overlap.note].filter(Boolean).join('; '),
-    extraNodes: { ...all.extraNodes, ...cyclic.extraNodes, ...setupOnly.extraNodes, ...overlap.extraNodes },
+    extraNodes: {
+      ...all.extraNodes, ...cyclic.extraNodes, ...setupOnly.extraNodes, ...overlap.extraNodes,
+      ...(dmaOnly ? dmaOnly.extraNodes : {}),
+    },
     testRawDot: combinedTestRawDot,
   };
 }
@@ -2791,6 +2940,7 @@ const CSS = `
     padding: 4px 8px; border-radius: 6px; border: 1px solid #d4d4d8; font-size: 0.82em; }
   .diagram-toolbar select { border: 1px solid #d4d4d8; border-radius: 4px; font-size: 0.95em; }
   .gv-ctrl { display: flex; align-items: center; gap: 4px; cursor: pointer; white-space: nowrap; }
+  .gv-ctrl:has(input:disabled) { opacity: 0.45; cursor: default; }
   .diagram.maximized { position: fixed; inset: 0; z-index: 1000; max-height: none;
     width: 100vw; height: 100vh; border-radius: 0; }
   .diagram-wrap:has(.diagram.maximized) .maxbtn,
@@ -2877,6 +3027,10 @@ const CSS = `
      above) only while the edge itself is actually highlighted. */
   svg g.edge > text.periph-default { opacity: 1; }
   svg g.edge.hl > text.periph-default { opacity: 0 !important; }
+  /* CFG "Алгоритм" diagrams (cfg_*) only ever draw plain control-flow labels
+     (да/нет/case values) — never periph register-access clutter — so the
+     hide-until-hover rule above doesn't apply to them. */
+  .diagram[data-diagram-id^="cfg_"] svg g.edge > text { opacity: 1; }
   .trailbar { font-size: 0.85rem; color: #52525b; margin: 0 0 14px; }
   .trailbar a { color: #2563eb; text-decoration: none; }
   .trailbar a:hover { text-decoration: underline; }
@@ -2902,7 +3056,7 @@ const LEGEND0 = `
   <span><span class="chip" style="background:#e0e7ff;border-color:#4338ca"></span>&#11039; периферия (регистры вида <code>X-&gt;поле</code>)</span>
   <span><b>&rarr;</b> «<i>РЕГИСТР</i>_EN» (например «CCR_EN») — та же сплошная (запись) стрелка, когда включается конкретный бит; голое «_EN» — включение только вызовом NVIC_EnableIRQ, без своего регистра; «~ИМЯ» (например «~CCR_EN») в подробностях по наведению — бит только выключается здесь, нигде не включается</span>
   <span>цилиндр с несколькими именами — переменные, связанные с одним и тем же набором точек входа, собранные в один жгут</span>
-  <span><span class="chip" style="background:#fff;border-color:#0d9488;border-style:dashed"></span>DMA-потоки (чекбокс «DMA-потоки») — куда канал DMA пишет данные и откуда их берёт (CPAR/CMAR), направление по биту DIR; отдельный цвет, чтобы не путать с чтением/записью регистров выше</span>
+  <span><span class="chip" style="background:#fff;border-color:#0d9488;border-style:dashed"></span>чекбокс «DMA-потоки» (доступен только при включённом «цикличное») — отдельный вид: только каналы DMA, куда/откуда они пишут (CPAR/CMAR, направление по биту DIR) и точки входа, которые касаются их в цикличном поведении — без точек входа, связанных только через однократную настройку</span>
   <span class="muted">наведите курсор — подсветятся связи; клик — закрепить подсветку; двойной клик — перейти; клик по пустому месту — снять</span>
 </div>`;
 

@@ -28,6 +28,14 @@
   // "DMA-потоки" — off by default (unlike vars/cyclic/setup): the
   // source/destination edges are extra detail most views don't need.
   let dmaOn = false;
+  // Handle returned by hover.setupGraphvizSvg for whichever <svg> is
+  // currently shown — reassigned on every swap() since toggling a checkbox
+  // replaces the element (and its closure-held highlight state) wholesale.
+  let svgApi = null;
+  // Name from the last symbolSelect/symbolClear message (extension.js, on
+  // text-editor selection) — reapplied after swap() so toggling a checkbox
+  // doesn't drop the current code-selection shading.
+  let lastSymbolName = null;
 
   const hover = GraphView.createHoverSystem({
     nodeInfoFor: (id) => nodeInfo[id],
@@ -47,33 +55,57 @@
   // key order matches level0-analyzer.mjs's buildLevel0Diagram: "neato",
   // "neato_novars", "neato_cyclic", "neato_cyclic_novars",
   // "neato_setuponly", "neato_setuponly_novars", "neato_overlap",
-  // "neato_overlap_novars", each optionally also with a "_dma" segment
-  // inserted right before a trailing "_novars" (see withVariantSuffix in
-  // level0-analyzer.mjs) — filter segment, then _dma, then novars.
+  // "neato_overlap_novars" -- filter segment always comes before novars.
   function filterSuffix() {
     if (cyclicOn && setupOn) return '';
     if (cyclicOn) return '_cyclic';
     if (setupOn) return '_setuponly';
     return '_overlap';
   }
+  // "DMA-потоки" (CPAR/CMAR data-flow edges plus their channel/buffer nodes,
+  // tagged .dma-flow -- see level0-analyzer.mjs's assembleLevel0 /
+  // resolveDmaRef) is baked directly into the cyclic/setup-only renders now,
+  // not a separate re-laid-out graph -- the checkbox just masks/unmasks
+  // those elements in place (level0.css), no swap() needed (user request
+  // 2026-07-20). Only the cyclic/setup-only variants carry any .dma-flow
+  // elements at all -- toggling while viewing the default "all" or overlap
+  // combination is a harmless no-op, same as toggling "переменные" on a
+  // variant that happens to have none.
+  function applyDmaMask(svg) {
+    if (svg) svg.classList.toggle('dma-hidden', !dmaOn);
+  }
   function swap() {
-    const filterBase = 'neato' + filterSuffix();
-    const dmaBase = filterBase + (dmaOn ? '_dma' : '');
-    const key = dmaBase + (showVars ? '' : '_novars');
+    const base = 'neato' + filterSuffix();
+    const key = base + (showVars ? '' : '_novars');
     // a variant with nothing to hide behind "переменные" never gets its own
     // "_novars" render (renderDotAll's hasVars gate) — fall back to that
-    // same filtered variant's with-vars render. Same idea one level up for
-    // "DMA-потоки": a filter with no DMA edges at all never gets its own
-    // "_dma" render (assembleLevel0's hasDma gate) — fall back to that
-    // filter's plain render rather than all the way to the unfiltered
-    // "neato" diagram.
-    const svgText = svgs[key] || svgs[dmaBase] || svgs[filterBase] || svgs.neato;
+    // same filtered variant's with-vars render.
+    const svgText = svgs[key] || svgs[base] || svgs.neato;
     if (!svgText) return;
     const doc = new DOMParser().parseFromString(svgText, 'image/svg+xml');
     const next = document.importNode(doc.documentElement, true);
     const old = inner.querySelector('svg');
     if (old) old.replaceWith(next); else inner.appendChild(next);
-    hover.setupGraphvizSvg(next);
+    svgApi = hover.setupGraphvizSvg(next);
+    applyDmaMask(next);
+    if (lastSymbolName) applySymbolSelect(lastSymbolName);
+  }
+
+  // Selecting a variable/function name in the editor (extension.js) pins the
+  // matching node exactly as a manual click would — same fade/hl styling,
+  // same "click empty background to release" escape hatch. Matched by
+  // nodeInfo's label (the human-readable name), not by node id: ids are an
+  // internal hash/kind scheme (fnId/varId/periphId) the webview has no
+  // reason to know, while label is exactly the identifier text VS Code
+  // reports as selected.
+  function applySymbolSelect(name) {
+    lastSymbolName = name;
+    if (!svgApi) return;
+    if (!name) { svgApi.clearExternal(); return; }
+    let key = null;
+    for (const k in nodeInfo) { if (nodeInfo[k].label === name) { key = k; break; } }
+    if (!key) { svgApi.clearExternal(); return; }
+    svgApi.selectExternal(key);
   }
 
   function render(msg) {
@@ -132,7 +164,7 @@
   dmaCheckbox.addEventListener('change', () => {
     dmaOn = dmaCheckbox.checked;
     GraphView.storageSet('cg_level0_dma', dmaOn ? '1' : '0');
-    swap();
+    applyDmaMask(inner.querySelector('svg'));
   });
   refreshBtn.addEventListener('click', () => {
     showStatus('Пересканирование проекта…');
@@ -148,12 +180,15 @@
 
   GraphView.setupPanZoom(diagram);
   GraphView.installKeyboardShortcuts();
+  GraphView.wirePersistentDetails(document.getElementById('legend-details'), 'cg_level0_legend');
 
   window.addEventListener('message', (ev) => {
     const msg = ev.data;
     if (msg.type === 'render') render(msg);
     else if (msg.type === 'status') showStatus(msg.text, false);
     else if (msg.type === 'error') showStatus(msg.text, true);
+    else if (msg.type === 'symbolSelect') applySymbolSelect(msg.name);
+    else if (msg.type === 'symbolClear') applySymbolSelect(null);
   });
 
   vscode.postMessage({ type: 'ready' });

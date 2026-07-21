@@ -22,6 +22,23 @@
     try { localStorage.setItem(key, value); } catch (e) { memoryStorage.set(key, String(value)); }
   }
 
+  // Wires a <details> element's open/closed state to localStorage — used for
+  // the level-0 legend, whose explanatory text eats a lot of vertical space
+  // once you already know how to read the diagram (user request 2026-07-20).
+  // Defaults to open (nothing saved yet) so a first-time user still sees the
+  // explanation; only stays collapsed across reloads once someone's actually
+  // collapsed it. Native <details>/<summary> instead of custom show/hide JS —
+  // free disclosure triangle, keyboard toggling, and no extra state to track
+  // beyond persisting the one `open` property the element already has.
+  function wirePersistentDetails(details, key) {
+    if (!details) return;
+    const saved = storageGet(key);
+    if (saved !== null) details.open = saved === '1';
+    details.addEventListener('toggle', () => {
+      storageSet(key, details.open ? '1' : '0');
+    });
+  }
+
   // --- pan/zoom ---------------------------------------------------------
   // Position within a diagram is tracked as an explicit translate + scale on
   // .inner rather than native scrollLeft/scrollTop — see viewer.js's own
@@ -90,15 +107,28 @@
       const { z } = getTransform(inner);
       setTransform(inner, z, drag.tx + dx, drag.ty + dy);
     });
-    const endDrag = () => {
+    const endDrag = (ev) => {
       if (!drag) return;
       if (drag.moved) {
         diagram.classList.remove('panning');
         if (diagram.hasPointerCapture && diagram.hasPointerCapture(drag.id)) {
           diagram.releasePointerCapture(drag.id);
         }
-        const swallow = ev2 => { ev2.stopPropagation(); diagram.removeEventListener('click', swallow, true); };
-        diagram.addEventListener('click', swallow, true);
+        // Only guard against the release also reading as a click on whatever
+        // node/edge it landed on (those have their own click-to-navigate/lock
+        // behavior a post-pan release shouldn't retrigger) — pointer capture
+        // makes ev.target here always `diagram` itself, so elementFromPoint is
+        // needed to find what's actually under the cursor. Plain UI elsewhere
+        // in the diagram (a function-name header, empty background) has no
+        // such click to protect against, and swallowing indiscriminately there
+        // used to eat real clicks after ordinary mouse jitter — any real click
+        // has a few px of movement between press and release, which was all
+        // it took to cross DRAG_THRESHOLD and mark this a "drag".
+        const under = ev && typeof ev.clientX === 'number' ? document.elementFromPoint(ev.clientX, ev.clientY) : null;
+        if (under && under.closest('g.node, g.edge')) {
+          const swallow = ev2 => { ev2.stopPropagation(); diagram.removeEventListener('click', swallow, true); };
+          diagram.addEventListener('click', swallow, true);
+        }
       }
       drag = null;
     };
@@ -212,6 +242,41 @@
 
   // --- hover tooltip + highlight ------------------------------------------
 
+  // An SVG path with fill="none" only hit-tests its actually-painted stroke
+  // — for a dashed edge (stroke-dasharray) that's the dash segments alone,
+  // not the gaps between them, and the whole line is often just ~1px wide
+  // to begin with. In practice that means a good fraction of careful,
+  // deliberate hover attempts land in a gap or just off the line and
+  // silently do nothing — no cursor change, no highlight, nothing to tell
+  // you why (user report 2026-07-21: "I really did hover over it and there
+  // was no caption at all"). Standard SVG fix: a wider, solid, fully
+  // transparent duplicate path laid over the real one purely for hit-testing
+  // — invisible, but hovering anywhere within its fatter stroke still
+  // triggers the *edge group's* own mouseenter/mouseleave (attached to the
+  // <g>, not this path specifically), so no listener wiring changes needed
+  // elsewhere. Node hit-testing has no equivalent problem: their shapes are
+  // filled, not just stroked, so the whole interior already counts as paint.
+  const EDGE_HIT_STROKE_WIDTH = 10;
+  function widenEdgeHitArea(edgeGroup) {
+    const path = edgeGroup.querySelector('path');
+    if (!path) return;
+    const hit = path.cloneNode(false);
+    hit.removeAttribute('stroke-dasharray');
+    hit.setAttribute('stroke', 'transparent');
+    hit.setAttribute('stroke-width', String(EDGE_HIT_STROKE_WIDTH));
+    hit.setAttribute('fill', 'none');
+    // Presentation attributes alone aren't enough — graph-view.css's own
+    // `svg g.edge path { stroke: var(--vscode-foreground); }` (an ordinary
+    // author rule) outranks a bare attribute in the cascade and paints this
+    // "invisible" duplicate solid and visible, and `svg g.edge.hl path
+    // { stroke-width: 2.5px !important }` would shrink its hoverable width
+    // the instant hover starts — ending the hover, which restores the width,
+    // which restarts hover, forever (both bugs from user report 2026-07-21).
+    // This class is how graph-view.css opts it out of both.
+    hit.setAttribute('class', 'edge-hit');
+    path.after(hit);
+  }
+
   const DEFAULT_KIND_LABEL = {
     fn: 'функция', entry: 'точка входа', isr: 'обработчик прерывания',
     gvar: 'глобальная переменная', gvolatile: 'volatile-глобальная',
@@ -291,6 +356,7 @@
         const title = el.querySelector('title');
         const parts = title ? title.textContent.split('->') : null;
         if (parts && parts.length === 2) edges.push({ el, from: parts[0], to: parts[1] });
+        widenEdgeHitArea(el);
       });
 
       let locked = null;
@@ -362,16 +428,33 @@
         });
       }
       svg.addEventListener('click', () => { if (locked) { locked = null; clearHighlight(); } });
+
+      // External driver (code-selection shading, see level0.js) — plays by
+      // the same "locked" rule as a manual click-pin: hover elsewhere is
+      // ignored while it holds, and clicking empty background releases it,
+      // same as clicking a pinned node again.
+      return {
+        selectExternal(key) {
+          if (!nodeEls.has(key)) { this.clearExternal(); return false; }
+          locked = key;
+          clearHighlight();
+          highlightNode(key);
+          return true;
+        },
+        clearExternal() {
+          if (locked) { locked = null; clearHighlight(); }
+        },
+      };
     }
 
     return { setupGraphvizSvg, hideTip };
   }
 
   window.GraphView = {
-    storageGet, storageSet,
+    storageGet, storageSet, wirePersistentDetails,
     getTransform, setTransform, applyZoom, setupPanZoom,
     contentBox, wholeBox, selectionBox, fitToView, homeFit, centerOn,
     setMaximized, toggleMaximize, installKeyboardShortcuts,
-    createHoverSystem,
+    createHoverSystem, widenEdgeHitArea,
   };
 })();

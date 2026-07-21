@@ -13,11 +13,14 @@ const { pathToFileURL } = require('url');
 let analyzer = null;          // lazily-imported ESM module
 let panel = null;             // vscode.WebviewPanel («Алгоритмы»)
 let sourceUri = null;         // document currently mirrored in the panel
+let sourceFsPath = null;      // doc.uri.fsPath for sourceUri — avoids re-parsing the string form
 let lastFunctions = null;     // analyzeAllFunctions() result for sourceUri
 let editDebounce = null;
 let cursorDecoration = null;  // vscode.TextEditorDecorationType
+let selectionDebounce = null;
 
 const EDIT_DEBOUNCE_MS = 300;
+const SELECTION_DEBOUNCE_MS = 150;
 
 async function ensureAnalyzer(context) {
   if (analyzer) return analyzer;
@@ -46,20 +49,22 @@ async function ensureLevel0Analyzer(context) {
   return level0Analyzer;
 }
 
-// Whole-workspace scan — deliberately not wired to onDidChangeTextDocument
-// like the single-file CFG ribbon (scheduleReanalyze): reparsing every .c/.h
-// file in the project on every keystroke would be far too expensive. Runs on
-// panel open/refresh and (debounced) on save — see onDidSaveTextDocument in
-// activate().
-async function scanWorkspaceLevel0(context) {
-  if (!level0Panel) return;
-  level0Panel.webview.postMessage({ type: 'status', text: 'Сканирование проекта…' });
+// Result of the last successful whole-project scan (buildLevel0's return
+// value — svgs/nodeInfo for «Уровень 0», plus usageByVar for «Алгоритмы»'s
+// "other places this variable appears" lookup). Shared between both panels
+// so a variable-selection lookup doesn't force its own separate scan when
+// «Уровень 0» already has fresh data, and vice versa. Cleared on save (see
+// onDidSaveTextDocument in activate()); rebuilt lazily by whichever panel
+// asks for it next.
+let workspaceIndexCache = null;
+let workspaceIndexPromise = null;
+
+async function buildWorkspaceIndex(context) {
   let uris;
   try {
     uris = await vscode.workspace.findFiles('**/*.{c,h}', LEVEL0_EXCLUDE_GLOB);
   } catch (e) {
-    level0Panel.webview.postMessage({ type: 'error', text: 'Не удалось найти файлы проекта: ' + e.message });
-    return;
+    throw new Error('Не удалось найти файлы проекта: ' + e.message);
   }
   const files = [];
   for (const uri of uris) {
@@ -71,13 +76,46 @@ async function scanWorkspaceLevel0(context) {
       // the analyzer's own per-file parse-failure skip.
     }
   }
-  let level0;
   try {
     const mod = await ensureLevel0Analyzer(context);
-    level0 = await mod.buildLevel0({ files });
+    return await mod.buildLevel0({ files });
+  } catch (e) {
+    throw new Error('Ошибка анализа: ' + e.message);
+  }
+}
+
+// Cache-or-build: concurrent callers (e.g. «Алгоритмы» looking up a variable
+// right as «Уровень 0» opens) share the one in-flight scan instead of
+// kicking off two.
+function ensureWorkspaceIndex(context) {
+  if (workspaceIndexCache) return Promise.resolve(workspaceIndexCache);
+  if (!workspaceIndexPromise) {
+    workspaceIndexPromise = buildWorkspaceIndex(context)
+      .then((idx) => { workspaceIndexCache = idx; return idx; })
+      .finally(() => { workspaceIndexPromise = null; });
+  }
+  return workspaceIndexPromise;
+}
+
+function refreshWorkspaceIndex(context) {
+  workspaceIndexCache = null;
+  return ensureWorkspaceIndex(context);
+}
+
+// Whole-workspace scan — deliberately not wired to onDidChangeTextDocument
+// like the single-file CFG ribbon (scheduleReanalyze): reparsing every .c/.h
+// file in the project on every keystroke would be far too expensive. Runs on
+// panel open/refresh and (debounced) on save — see onDidSaveTextDocument in
+// activate().
+async function scanWorkspaceLevel0(context) {
+  if (!level0Panel) return;
+  level0Panel.webview.postMessage({ type: 'status', text: 'Сканирование проекта…' });
+  let level0;
+  try {
+    level0 = await refreshWorkspaceIndex(context);
   } catch (e) {
     console.error('code-graph level0 build failed:', e);
-    level0Panel.webview.postMessage({ type: 'error', text: 'Ошибка анализа: ' + e.message });
+    level0Panel.webview.postMessage({ type: 'error', text: e.message });
     return;
   }
   if (!level0) {
@@ -109,15 +147,18 @@ function getLevel0Html(webview, context) {
   <div id="status">Сканирование проекта…</div>
   <div id="viewport">
     <div id="legend-wrap">
-      <div class="legend">
-        <span>точка входа <b>&mdash;</b> переменная — связь без стрелки: эти данные всегда идут в обе стороны между разными точками входа</span>
-        <span>точка входа <b>&rarr;</b> периферия, <b>сплошная</b> = <b>запись</b>; периферия <b>&rarr;</b> точка входа, <b>пунктирная</b> = <b>чтение</b>; обе сразу = и то, и другое</span>
-        <span><span class="chip" style="background:#e0e7ff;border-color:#4338ca"></span>&#11039; периферия (регистры вида <code>X-&gt;поле</code>)</span>
-        <span>подпись вида «РЕГИСТР_EN» на сплошной стрелке — включение конкретного бита; голое «_EN» — включение только вызовом NVIC_EnableIRQ; «~ИМЯ» в подробностях по наведению — бит только выключается здесь, нигде не включается</span>
-        <span>цилиндр с несколькими именами — переменные с одинаковым набором точек входа, собранные в один жгут</span>
-        <span><span class="chip" style="background:#fff;border-color:#0d9488;border-style:dashed"></span>DMA-потоки (чекбокс «DMA-потоки») — куда канал DMA пишет данные и откуда их берёт (CPAR/CMAR), направление по биту DIR</span>
-        <span class="muted">наведите курсор — подсветятся связи; клик — закрепить; двойной клик по функции — перейти к коду и открыть «Алгоритмы»; клик по пустому месту — снять; колесо — зум, ЛКМ на пустом месте — перетаскивание</span>
-      </div>
+      <details class="legend-details" id="legend-details" open>
+        <summary>Легенда</summary>
+        <div class="legend">
+          <span>точка входа <b>&mdash;</b> переменная — связь без стрелки: эти данные всегда идут в обе стороны между разными точками входа</span>
+          <span>точка входа <b>&rarr;</b> периферия, <b>сплошная</b> = <b>запись</b>; периферия <b>&rarr;</b> точка входа, <b>пунктирная</b> = <b>чтение</b>; обе сразу = и то, и другое</span>
+          <span><span class="chip" style="background:#e0e7ff;border-color:#4338ca"></span>&#11039; периферия (регистры вида <code>X-&gt;поле</code>)</span>
+          <span>подпись вида «РЕГИСТР_EN» на сплошной стрелке — включение конкретного бита; голое «_EN» — включение только вызовом NVIC_EnableIRQ; «~ИМЯ» в подробностях по наведению — бит только выключается здесь, нигде не включается</span>
+          <span>цилиндр с несколькими именами — переменные с одинаковым набором точек входа, собранные в один жгут</span>
+          <span><span class="chip" style="background:#fff;border-color:#0d9488;border-style:dashed"></span>чекбокс «DMA-потоки» — показывает/прячет потоки данных DMA (CPAR/CMAR, направление по биту DIR) поверх обычных видов «цикличное»/«однократное»; снятая галка просто прячет эти стрелки и их узлы на месте, без перестроения графа</span>
+          <span class="muted">наведите курсор — подсветятся связи; клик — закрепить; двойной клик по функции — перейти к коду и открыть «Алгоритмы»; клик по пустому месту — снять; колесо — зум, ЛКМ на пустом месте — перетаскивание</span>
+        </div>
+      </details>
       <div class="level0-note muted" style="display:none"></div>
     </div>
     <div class="diagram-wrap">
@@ -194,6 +235,191 @@ async function navigateToFunctionAndShowCfg(context, filePath, startLine) {
   locateCursorInGraph();
 }
 
+// --- «Связи»: interactive caller/callee chain for one function --------------
+//
+// A VS Code-side port of the CLI's per-function "Связи" page (index.mjs's
+// graph-data.js + viewer.js's setupRelationsDiagram). Deliberately NOT a
+// client-side re-layout like the web version (which loads graphviz-wasm.js
+// *in the browser*): every click round-trips to the host, which rebuilds the
+// dot subgraph against the cached workspace index (level0Analyzer.relations)
+// and re-renders via the same Node graphviz-wasm every other diagram here
+// uses — consistent with the rest of the extension, and no wasm-unsafe-eval
+// CSP hole needed in the webview. Scoped down from the CLI on purpose (user
+// decision 2026-07-20): dot only, no neato/fdp engine switch or position
+// pinning — see renderRelations in level0-analyzer.mjs for the full
+// rationale.
+let relPanel = null; // vscode.WebviewPanel («Связи»)
+// Interaction state for whatever function is currently focused — mirrors
+// viewer.js's setupRelationsDiagram closure state, just living on the host
+// instead of in the webview. lastDepthOf is the previous render's depthOf
+// (id -> {side, depth}), needed to replay viewer.js's own click decision
+// (collapse the deepest pick vs. drill into a new one) using only the
+// clicked id the webview sends — see the 'expand' message handler below.
+let relState = null; // { focusId, upPath, downPath, showVars, lastOrder, lastDepthOf } | null
+
+function getRelHtml(webview, context) {
+  const media = (f) =>
+    webview.asWebviewUri(vscode.Uri.file(path.join(context.extensionPath, 'media', f)));
+  const nonce = String(Math.random()).slice(2);
+  const csp = [
+    `default-src 'none'`,
+    `img-src ${webview.cspSource} data:`,
+    `style-src ${webview.cspSource} 'unsafe-inline'`,
+    `script-src 'nonce-${nonce}'`,
+  ].join('; ');
+  return `<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="${csp}">
+  <link rel="stylesheet" href="${media('graph-view.css')}">
+  <link rel="stylesheet" href="${media('level0.css')}">
+  <link rel="stylesheet" href="${media('relations.css')}">
+</head>
+<body>
+  <div id="status">Загрузка…</div>
+  <div id="viewport">
+    <div id="legend-wrap">
+      <span class="muted">клик по функции — раскрыть вызовы дальше; повторный клик по последней раскрытой — свернуть; двойной клик — перейти к коду; клик по пустому месту — снять подсветку</span>
+    </div>
+    <div class="diagram-wrap">
+      <div class="diagram" id="diagram" tabindex="-1">
+        <div class="zoombar">
+          <button id="zoom-in" title="Увеличить">+</button>
+          <button id="zoom-out" title="Уменьшить">&minus;</button>
+        </div>
+        <div class="inner"></div>
+      </div>
+      <div class="diagram-toolbar" id="toolbar">
+        <label class="gv-ctrl"><input type="checkbox" id="vars-toggle" checked> переменные</label>
+        <button class="maxbtn" id="max-btn" title="На весь экран (F)">&#9974;</button>
+      </div>
+    </div>
+  </div>
+  <script nonce="${nonce}" src="${media('graph-view.js')}"></script>
+  <script nonce="${nonce}" src="${media('relations.js')}"></script>
+</body>
+</html>`;
+}
+
+function openRelPanel(context) {
+  if (relPanel) { relPanel.reveal(vscode.ViewColumn.Beside); return; }
+  relPanel = vscode.window.createWebviewPanel(
+    'codeGraphRelations',
+    'Связи',
+    { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
+    {
+      enableScripts: true,
+      retainContextWhenHidden: true,
+      localResourceRoots: [vscode.Uri.file(path.join(context.extensionPath, 'media'))],
+    }
+  );
+  relPanel.webview.html = getRelHtml(relPanel.webview, context);
+  relPanel.webview.onDidReceiveMessage((msg) => {
+    if (msg.type === 'ready') {
+      if (relState) renderRelationsAndPost(context);
+    } else if (msg.type === 'expand' && msg.id) {
+      applyRelationsExpand(msg.id);
+      renderRelationsAndPost(context);
+    } else if (msg.type === 'toggleVars' && relState) {
+      relState.showVars = !!msg.show;
+      renderRelationsAndPost(context);
+    } else if (msg.type === 'navigate' && msg.file && typeof msg.startLine === 'number') {
+      // Same as «Уровень 0»'s own double-click (navigateFn below): jump to
+      // the source AND surface/refresh «Алгоритмы» focused on that function
+      // — the double-click's whole point is "take me to this function", and
+      // that means both places it's shown, not just the editor (user request
+      // 2026-07-21: equivalent to running Ctrl+Alt+G right after the jump).
+      navigateToFunctionAndShowCfg(context, msg.file, msg.startLine);
+    }
+  });
+  relPanel.onDidDispose(() => { relPanel = null; relState = null; });
+}
+
+// Replays viewer.js's own click decision — re-clicking the current deepest
+// pick on a side collapses one level, anything else (a new pick, or an
+// earlier ancestor on that same chain) drops everything past it and drills
+// in — using lastDepthOf (this function's own previous render) instead of a
+// client-side depthOf, since that state lives here now, not in the webview.
+function applyRelationsExpand(id) {
+  if (!relState || !relState.lastDepthOf) return;
+  const pos = relState.lastDepthOf.get(id);
+  if (!pos) return; // focus itself, or a var/periph node — nothing to expand
+  const path = pos.side === 'up' ? relState.upPath : relState.downPath;
+  const idx = path.indexOf(id);
+  if (idx !== -1 && idx === path.length - 1) {
+    path.splice(idx, 1);
+  } else {
+    path.length = pos.depth;
+    path.push(id);
+  }
+}
+
+async function renderRelationsAndPost(context) {
+  if (!relPanel || !relState) return;
+  let G;
+  try {
+    const idx = await ensureWorkspaceIndex(context);
+    G = idx && idx.relations;
+  } catch (e) {
+    relPanel.webview.postMessage({ type: 'error', text: 'Ошибка анализа: ' + e.message });
+    return;
+  }
+  if (!G || !G[relState.focusId]) {
+    relPanel.webview.postMessage({ type: 'error', text: 'Функция не найдена в текущем скане проекта. Нажмите «Обновить» на «Уровне 0» (если он открыт) и попробуйте снова.' });
+    return;
+  }
+  let result;
+  try {
+    const mod = await ensureLevel0Analyzer(context);
+    result = await mod.renderRelations({
+      G, focusId: relState.focusId, upPath: relState.upPath, downPath: relState.downPath,
+      showVars: relState.showVars, prevOrder: relState.lastOrder,
+    });
+  } catch (e) {
+    console.error('code-graph relations render failed:', e);
+    relPanel.webview.postMessage({ type: 'error', text: 'Ошибка построения диаграммы: ' + e.message });
+    return;
+  }
+  relState.lastOrder = result.newOrder;
+  relState.lastDepthOf = result.depthOf;
+  relPanel.webview.postMessage({
+    type: 'render',
+    svg: result.svg,
+    fullColor: [...result.fullColor],
+    depthOf: Object.fromEntries(result.depthOf),
+    nodeInfo: result.nodeInfo,
+    showVars: relState.showVars,
+    title: G[relState.focusId].label,
+  });
+}
+
+// Entry point — «Алгоритмы»'s left-click on a function's own name (main.js's
+// .fn-head), not a click on a CFG node. `file` is the basename
+// (path.basename) the click came from; resolveFunctionId matches it against
+// the workspace-wide relations graph the same way level0-analyzer.mjs's own
+// funcKey scheme does internally.
+async function openRelationsFor(context, name, file) {
+  openRelPanel(context);
+  relPanel.webview.postMessage({ type: 'status', text: 'Загрузка…' });
+  let idx, mod;
+  try {
+    idx = await ensureWorkspaceIndex(context);
+    mod = await ensureLevel0Analyzer(context);
+  } catch (e) {
+    relPanel.webview.postMessage({ type: 'error', text: 'Ошибка анализа: ' + e.message });
+    return;
+  }
+  const G = idx && idx.relations;
+  const focusId = G && mod.resolveFunctionId(G, name, file);
+  if (!focusId) {
+    relPanel.webview.postMessage({ type: 'error', text: `Не удалось найти «${name}» в текущем скане проекта.` });
+    return;
+  }
+  relState = { focusId, upPath: [], downPath: [], showVars: true, lastOrder: null, lastDepthOf: null };
+  await renderRelationsAndPost(context);
+}
+
 function cEditor() {
   const ed = vscode.window.activeTextEditor;
   return ed && ed.document.languageId === 'c' ? ed : null;
@@ -212,6 +438,7 @@ async function renderAll(context, editor) {
     return;
   }
   sourceUri = doc.uri.toString();
+  sourceFsPath = doc.uri.fsPath;
   lastFunctions = res.functions;
   panel.webview.postMessage({ type: 'renderAll', functions: res.functions });
 }
@@ -219,6 +446,81 @@ async function renderAll(context, editor) {
 function scheduleReanalyze(context, editor) {
   clearTimeout(editDebounce);
   editDebounce = setTimeout(() => renderAll(context, editor), EDIT_DEBOUNCE_MS);
+}
+
+// Selecting a bare identifier in a C file broadcasts it to whichever graph
+// panels are open, so they can shade out everything unrelated to it — a
+// variable name dims every CFG block / level-0 node that doesn't reference
+// it, a function name dims everything that doesn't call it. Deliberately not
+// wired through findNodeForLine/locateCursorInGraph (that's the cursor-line
+// -> single-node "locate" action, a different one-shot gesture) — this is
+// name-based and works across the whole ribbon/diagram at once, and the
+// receiving webview decides variable-vs-function role itself from data it
+// already has (see level0.js/main.js), since only it knows which reading
+// applies. Only a real, non-empty selection whose text is exactly one
+// identifier counts; anything else (cursor move, multi-token selection,
+// string/number literal) clears instead.
+function extractSelectedIdentifier(editor) {
+  const sel = editor.selection;
+  if (sel.isEmpty) return null;
+  const text = editor.document.getText(sel);
+  return /^[A-Za-z_]\w*$/.test(text) ? text : null;
+}
+
+// Guards the async "other places" lookup below: only the reply matching the
+// latest request is allowed to reach the webview, so a slow scan for an
+// earlier name can't clobber a newer one that resolved faster (or arrives
+// from cache). Shared by both triggers (editor selection and a graph-side
+// right-click — see the 'lookupOtherPlaces' message in openPanel).
+let otherPlacesSeq = 0;
+
+// Every function anywhere in the project that reads/writes this variable —
+// rides on ensureWorkspaceIndex's cache rather than a caller-specific scan,
+// so this only pays whole-project-scan cost once regardless of how many
+// times it's asked. Deliberately NOT filtered to "other files only": a
+// `static` file-scope variable (like dwin.c's s_relay) can *only* ever be
+// used within its own file, so excluding the current file left the list
+// empty for exactly the variables most worth looking up — the ribbon's own
+// shading is easy to miss on a long file, and this list's whole point is a
+// precise, clickable jump target, not "only what the shading can't already
+// show" (user report 2026-07-20: right-clicking a variable used nine times
+// in the same file still said "found nowhere else").
+async function lookupOtherPlaces(context, name) {
+  const idx = await ensureWorkspaceIndex(context);
+  return (idx && idx.usageByVar && idx.usageByVar[name]) || [];
+}
+
+function broadcastSymbolSelection(context, editor) {
+  if (!editor || editor.document.languageId !== 'c') return;
+  const name = extractSelectedIdentifier(editor);
+  const inRibbonDoc = panel && editor.document.uri.toString() === sourceUri;
+  if (!name) {
+    otherPlacesSeq++; // invalidates any in-flight lookup
+    const msg = { type: 'symbolClear' };
+    if (inRibbonDoc) panel.webview.postMessage(msg);
+    if (level0Panel) level0Panel.webview.postMessage(msg);
+    return;
+  }
+  const msg = { type: 'symbolSelect', name };
+  // "Алгоритмы" mirrors exactly one document (sourceUri) — a selection in any
+  // other editor doesn't correspond to anything in its ribbon.
+  if (inRibbonDoc) panel.webview.postMessage(msg);
+  // "Уровень 0" spans the whole project and matches purely by name, so any
+  // C-file selection is relevant to it.
+  if (level0Panel) level0Panel.webview.postMessage(msg);
+
+  // The in-ribbon shading above is instant either way; this just fills in
+  // the side list a beat later once the (possibly freshly-scanned) index
+  // resolves, so it's not worth blocking the message above on it.
+  if (inRibbonDoc) {
+    const seq = ++otherPlacesSeq;
+    lookupOtherPlaces(context, name).then((places) => {
+      if (seq !== otherPlacesSeq || !panel) return;
+      panel.webview.postMessage({ type: 'symbolOtherPlaces', name, places });
+    }).catch((e) => {
+      console.error('code-graph workspace index build failed:', e);
+    });
+  }
 }
 
 // The smallest CFG node (of the function enclosing `line`) that covers it —
@@ -268,6 +570,13 @@ function getHtml(webview, context) {
 <body>
   <div id="status">Откройте C-файл — появится лента алгоритмов функций.</div>
   <div id="viewport" class="diagram" tabindex="-1"><div id="inner" class="inner"></div></div>
+  <div id="other-places" class="other-places" style="display:none">
+    <div class="op-head">
+      <span class="op-title"></span>
+      <button id="op-close" title="Скрыть">&times;</button>
+    </div>
+    <div class="op-list"></div>
+  </div>
   <script nonce="${nonce}" src="${media('graph-view.js')}"></script>
   <script nonce="${nonce}" src="${media('main.js')}"></script>
 </body>
@@ -293,9 +602,33 @@ function openPanel(context) {
       if (ed) renderAll(context, ed);
     } else if (msg.type === 'navigate' && typeof msg.startLine === 'number') {
       revealLine(msg.startLine, msg.endLine);
+    } else if (msg.type === 'navigateOther' && msg.filePath && typeof msg.startLine === 'number') {
+      // A cross-file "other place this variable appears" entry — just jump
+      // there in a normal editor tab; unlike navigateFn (level0's
+      // double-click), this deliberately doesn't also open/refocus a CFG
+      // panel for that function, per user request 2026-07-20.
+      revealLine(msg.startLine, msg.startLine, vscode.Uri.file(msg.filePath).toString());
+    } else if (msg.type === 'lookupOtherPlaces' && msg.name) {
+      // Right-click on a variable token in the graph itself (main.js's
+      // tokenizeNodeText) — the same lookup broadcastSymbolSelection does
+      // for an editor-side selection, just triggered from the diagram
+      // instead, per user request 2026-07-20.
+      const seq = ++otherPlacesSeq;
+      lookupOtherPlaces(context, msg.name).then((places) => {
+        if (seq !== otherPlacesSeq || !panel) return;
+        panel.webview.postMessage({ type: 'symbolOtherPlaces', name: msg.name, places, explicit: true });
+      }).catch((e) => {
+        console.error('code-graph workspace index build failed:', e);
+      });
+    } else if (msg.type === 'openRelations' && msg.functionName && sourceFsPath) {
+      const file = path.basename(sourceFsPath);
+      openRelationsFor(context, msg.functionName, file).catch((e) => {
+        console.error('code-graph openRelationsFor failed:', e);
+        vscode.window.showErrorMessage('Не удалось открыть «Связи»: ' + e.message);
+      });
     }
   });
-  panel.onDidDispose(() => { panel = null; sourceUri = null; lastFunctions = null; });
+  panel.onDidDispose(() => { panel = null; sourceUri = null; sourceFsPath = null; lastFunctions = null; });
 }
 
 // Jump the editor to [startLine, endLine] and briefly mark it so the clicked
@@ -352,14 +685,24 @@ function activate(context) {
       const ed = cEditor();
       if (ed && e.document === ed.document) scheduleReanalyze(context, ed);
     }),
-    // Re-scan is only worth its cost while the panel is actually open —
+    vscode.window.onDidChangeTextEditorSelection((e) => {
+      clearTimeout(selectionDebounce);
+      selectionDebounce = setTimeout(() => broadcastSymbolSelection(context, e.textEditor), SELECTION_DEBOUNCE_MS);
+    }),
+    // Re-scan is only worth its cost while a panel that needs it is open —
     // and debounced separately from the single-file CFG ribbon's much
     // shorter EDIT_DEBOUNCE_MS, since this reparses the whole project.
+    // «Алгоритмы»-only (no «Уровень 0») still drops the stale cache so the
+    // next variable-selection lookup rebuilds it lazily, without paying for
+    // an eager rescan nothing's currently asking for.
     vscode.workspace.onDidSaveTextDocument((doc) => {
-      if (!level0Panel) return;
+      if (!level0Panel && !panel) return;
       if (!/\.(c|h)$/i.test(doc.fileName)) return;
       clearTimeout(level0SaveDebounce);
-      level0SaveDebounce = setTimeout(() => scanWorkspaceLevel0(context), LEVEL0_SAVE_DEBOUNCE_MS);
+      level0SaveDebounce = setTimeout(() => {
+        if (level0Panel) scanWorkspaceLevel0(context);
+        else workspaceIndexCache = null;
+      }, LEVEL0_SAVE_DEBOUNCE_MS);
     })
   );
 }

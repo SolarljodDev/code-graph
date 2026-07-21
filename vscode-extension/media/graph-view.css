@@ -42,6 +42,7 @@
   font-size: 0.85em;
 }
 .gv-ctrl { display: flex; align-items: center; gap: 4px; cursor: pointer; white-space: nowrap; }
+.gv-ctrl:has(input:disabled) { opacity: 0.45; cursor: default; }
 
 .diagram.maximized {
   position: fixed; inset: 0; z-index: 1000;
@@ -56,8 +57,27 @@ body.diagram-maximized { overflow: hidden; }
 .diagram.loading { cursor: wait; }
 .diagram.loading .inner { opacity: .6; transition: opacity .15s; }
 
+.legend-details { margin: 4px 0; }
+.legend-details > summary {
+  cursor: pointer;
+  list-style: none;
+  display: inline-flex; align-items: center; gap: 4px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.82rem;
+  padding: 2px 0;
+  user-select: none;
+}
+.legend-details > summary::-webkit-details-marker { display: none; }
+.legend-details > summary::before {
+  content: '▸';
+  display: inline-block;
+  font-size: 0.75em;
+  transition: transform .12s;
+}
+.legend-details[open] > summary::before { transform: rotate(90deg); }
+.legend-details > summary:hover { color: var(--vscode-foreground); }
 .legend {
-  display: flex; gap: 12px; flex-wrap: wrap; margin: 8px 0 12px;
+  display: flex; gap: 12px; flex-wrap: wrap; margin: 6px 0 12px;
   font-size: 0.82rem; color: var(--vscode-descriptionForeground); align-items: center;
 }
 .chip { display: inline-block; width: 13px; height: 13px; border-radius: 4px; vertical-align: -2px; margin-right: 5px; border: 1.5px solid; }
@@ -86,23 +106,42 @@ svg g.node.hl > polygon, svg g.node.hl > ellipse, svg g.node.hl > path {
 svg g.edge, svg g.edge * { transition: opacity .13s; }
 svg.fade g.edge { opacity: .15; }
 svg.fade g.edge.hl { opacity: 1 !important; }
-svg g.edge.hl path { stroke-width: 2.5px !important; }
+/* :not(.edge-hit) — widenEdgeHitArea's own invisible hit-testing duplicate
+   (see graph-view.js) must never have its stroke-width changed by hover:
+   thickening it here would shrink back down once .hl drops, right where the
+   cursor still sits, ending the very hover that just started it — forever. */
+svg g.edge.hl path:not(.edge-hit) { stroke-width: 2.5px !important; }
 svg g.edge.hl polygon { stroke-width: 2.5px !important; }
 
 /* register-access labels only earn their keep once that specific edge is
    highlighted — at rest, every peripheral's incoming edges showing their
    full register list at once would clutter the whole diagram permanently.
    Graphviz still lays the label out (reserves space, routes the edge around
-   it); this only hides the rendered text, so nothing reflows on hover. */
-svg g.edge > text { opacity: 0; }
-svg g.edge.hl > text { opacity: 1 !important; }
+   it); this only hides the rendered text, so nothing reflows on hover.
+   Scoped to #diagram (the level-0 peripheral view) — the CFG ribbon
+   (#viewport) has no register-access clutter problem and needs its
+   да/нет/case labels visible at rest. */
+#diagram svg g.edge > text { opacity: 0; }
+#diagram svg g.edge.hl > text { opacity: 1 !important; }
 /* "_EN"-style default label is the one exception — a short static hint some
    periph edges carry even at rest; steps aside for the fuller
    .periph-detail breakdown only while the edge itself is highlighted. */
-svg g.edge > text.periph-default { opacity: 1; }
-svg g.edge.hl > text.periph-default { opacity: 0 !important; }
+#diagram svg g.edge > text.periph-default { opacity: 1; }
+#diagram svg g.edge.hl > text.periph-default { opacity: 0 !important; }
+/* the whole-detail-fits-in-the-default case (injectPeriphDetailLabels in
+   level0-analyzer.mjs) — no .periph-detail exists to swap in on hover, so
+   this one never hides; the general g.edge.hl > text rule above already
+   wants it visible on hover too, nothing here needs to fight that. */
+#diagram svg g.edge > text.periph-static { opacity: 1; }
 
 /* edge/label ink follows the theme (graphviz emits black) */
 svg text { fill: var(--vscode-foreground); }
-svg g.edge path { stroke: var(--vscode-foreground); opacity: 0.7; }
+svg g.edge path:not(.edge-hit) { stroke: var(--vscode-foreground); opacity: 0.7; }
 svg g.edge polygon { fill: var(--vscode-foreground); stroke: var(--vscode-foreground); opacity: 0.7; }
+
+/* widenEdgeHitArea's invisible hit-testing duplicate path (graph-view.js) —
+   a plain attribute (stroke="transparent") isn't enough on its own since an
+   ordinary author rule like the one above outranks it in the cascade, which
+   is exactly what made this "invisible" element paint solid and visible
+   (user report 2026-07-21). !important here is load-bearing, not decoration. */
+svg .edge-hit { stroke: transparent !important; fill: none !important; }

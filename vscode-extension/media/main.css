@@ -39,7 +39,13 @@ html, body {
 .fn-head {
   z-index: 2;
   padding: 5px 10px;
-  font-size: 12px;
+  /* matches the generated graph's own node-label size: graphviz emits
+     font-size="14.00" inside an SVG whose width/viewBox pair is scaled at
+     96/72 (px-per-pt) — i.e. the node text always renders at 14pt on
+     screen, whatever the diagram's zoom level. CSS "pt" is that same
+     96/72 conversion, so 14pt here tracks it exactly instead of an
+     eyeballed px guess. */
+  font-size: 14pt;
   font-family: var(--vscode-editor-font-family, monospace);
   color: var(--vscode-descriptionForeground);
   background: var(--vscode-editor-background);
@@ -110,7 +116,113 @@ html, body {
   filter: drop-shadow(0 0 3px var(--vscode-focusBorder, #007acc));
 }
 
+/* code-selection shading (a variable/function selected in the editor —
+   see extension.js's broadcastSymbolSelection and main.js's
+   applySymbolHighlight): same visual language as .dim/.hl above, own class
+   names so it doesn't fight the cursor-driven 'locate' single-node
+   highlight over the same ribbon. */
+#inner svg.sym-dim g.node:not(.sym-hl) { opacity: 0.18; }
+#inner svg.sym-dim g.edge { opacity: 0.12; }
+#inner svg g.node.sym-hl path,
+#inner svg g.node.sym-hl polygon,
+#inner svg g.node.sym-hl ellipse { stroke-width: 2.5px; }
+#inner svg g.node.sym-hl > polygon,
+#inner svg g.node.sym-hl > ellipse {
+  filter: drop-shadow(0 0 3px var(--vscode-charts-orange, #d97706));
+}
+
 /* edge/label ink follows the theme (graphviz emits black) */
 #inner svg text { fill: var(--vscode-foreground); }
 #inner svg g.edge path { stroke: var(--vscode-foreground); opacity: 0.7; }
 #inner svg g.edge polygon { fill: var(--vscode-foreground); stroke: var(--vscode-foreground); opacity: 0.7; }
+
+/* per-identifier click targets carved out of node labels (main.js's
+   tokenizeNodeText) — a dotted underline hints they're clickable (right-click
+   for "other places"), without the strong visual weight a full underline/box
+   would add across every word in every block. */
+#inner svg .cg-var-token {
+  cursor: context-menu;
+  text-decoration: underline dotted;
+  text-decoration-color: var(--vscode-descriptionForeground, currentColor);
+  text-underline-offset: 2px;
+}
+#inner svg .cg-var-token:hover { fill: var(--vscode-textLink-foreground, #3794ff); }
+
+/* "this variable also appears in..." side list (main.js's showOtherPlaces) —
+   a floating panel, not part of the ribbon's own pan/zoom transform, so it
+   stays put and readable regardless of where the diagram is scrolled/zoomed. */
+.other-places {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 5;
+  max-width: 280px;
+  max-height: min(60vh, 420px);
+  overflow-y: auto;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border, rgba(128,128,128,.35)));
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0,0,0,.25);
+  font-size: 12px;
+}
+.other-places .op-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,.35));
+  font-weight: 600;
+}
+.other-places .op-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.other-places #op-close {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+  opacity: 0.7;
+}
+.other-places #op-close:hover { opacity: 1; }
+.other-places .op-list { padding: 2px 0; }
+.other-places .op-item {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 5px 8px;
+  cursor: pointer;
+  border-bottom: 1px solid transparent;
+}
+.other-places .op-item:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+.other-places .op-fn {
+  font-family: var(--vscode-editor-font-family, monospace);
+  color: var(--vscode-foreground);
+}
+.other-places .op-loc {
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+}
+.other-places .op-empty {
+  padding: 8px;
+  color: var(--vscode-descriptionForeground);
+  font-style: italic;
+}
+.other-places .op-relations-btn {
+  display: block;
+  width: calc(100% - 16px);
+  margin: 6px 8px 8px;
+  padding: 5px 8px;
+  background: var(--vscode-button-secondaryBackground, rgba(128,128,128,.2));
+  color: var(--vscode-button-secondaryForeground, inherit);
+  border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border, rgba(128,128,128,.35)));
+  border-radius: 3px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.other-places .op-relations-btn:hover {
+  background: var(--vscode-button-secondaryHoverBackground, rgba(128,128,128,.3));
+}

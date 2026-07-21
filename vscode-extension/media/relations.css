@@ -1,0 +1,20 @@
+/* "Связи" panel — layout/legend/toolbar classes come from level0.css and
+   graph-view.css (both already linked — see getRelHtml in extension.js);
+   this file only adds what's unique to this diagram: a permanent-vs-hover
+   highlight distinction viewer.js's own "Связи" page also needs.
+
+   .fade/.hl (graph-view.css) already do exactly what's wanted here: .fade
+   dims everything, .hl marks it back to full opacity — except on every
+   *other* diagram .hl is a transient hover/pin state, while here it's a
+   permanent mark for the confirmed caller/callee chain (set once per
+   render in relations.js). Hovering an already-.hl element has no opacity
+   left to gain from that, so it gets a glow instead — same idea as the
+   opacity bump, just a different visual since there's nothing to restore. */
+svg g.node.hlring path,
+svg g.node.hlring polygon,
+svg g.node.hlring ellipse {
+  filter: drop-shadow(0 0 4px #2563eb) drop-shadow(0 0 4px #2563eb);
+}
+svg g.edge.hlring path {
+  filter: drop-shadow(0 0 3px #2563eb);
+}

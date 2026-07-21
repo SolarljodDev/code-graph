@@ -515,7 +515,9 @@
         // 'w' side is a Map now, keyed by set/clear polarity — see
         // mergeFlagPolarity there) — mirrors periphDirDetail exactly: a bit
         // only ever cleared here gets a ~ prefix and never counts as the
-        // edge's enable-default-label candidate.
+        // edge's enable-default-label candidate; 'both' (cleared and set,
+        // e.g. a disable-then-rearm restart in the same function) shows both
+        // forms, clear before set, instead of collapsing to one plain name.
         const flags = r.wFlags;
         if (!flags || !flags.length) return r.reg;
         const sortedFlags = [...flags].sort((a, b) => a[0].localeCompare(b[0]));
@@ -523,7 +525,10 @@
           const enableBit = sortedFlags.find(([fl, pol]) => isEnableFlagName(fl) && pol !== 'clear');
           if (enableBit) { hasEnable = true; enableLabel = shortFlagName(enableBit[0]); }
         }
-        return sortedFlags.map(([fl, pol]) => (pol === 'clear' ? '~' : '') + shortFlagName(fl)).join(', ');
+        return sortedFlags.map(([fl, pol]) => {
+          const short = shortFlagName(fl);
+          return pol === 'both' ? `~${short}, ${short}` : (pol === 'clear' ? '~' : '') + short;
+        }).join(', ');
       }
       const flags = r.rFlags;
       if (flags && flags.length) {
@@ -1222,45 +1227,40 @@
     // checked = that variant's own inclusive reachability diagram, neither
     // checked = their overlap (see buildLevel0Diagram in index.mjs)
     let cyclicOn = true, setupOn = true;
-    // "DMA-потоки" — off by default (unlike vars/cyclic/setup, which start
-    // checked): the source/destination edges are extra detail most views
-    // don't need, so they only appear once asked for. Independent of
-    // filterSuffix()/showVars, same as those two — see the key order comment
-    // below.
+    // "DMA-потоки" — off by default, and *exclusive*: when on, it replaces
+    // whichever of all/cyclic/setuponly/overlap is selected rather than
+    // layering DMA edges on top of it (that's what it used to do; combined
+    // with a filter it just showed that filter's entire usual content plus
+    // DMA wiring, which read as "a ton of unrelated stuff" — user feedback
+    // 2026-07-20). See dmaOnlyPeriphs/dmaOnlyVars in index.mjs's
+    // buildLevel0Diagram for what actually narrows the diagram down.
     let dmaOn = false;
     setupGraphvizSvg(diagram.querySelector('svg'));
 
     // key order matches how index.mjs's buildLevel0Diagram actually names the
     // extra variants: "<engine>", "<engine>_novars", "<engine>_cyclic",
     // "<engine>_cyclic_novars", "<engine>_setuponly", "<engine>_setuponly_novars",
-    // "<engine>_overlap", "<engine>_overlap_novars", each optionally also with
-    // a "_dma" segment inserted right before a trailing "_novars" (see
-    // withVariantSuffix in index.mjs) — filter segment, then _dma, then novars
+    // "<engine>_overlap", "<engine>_overlap_novars", "<engine>_dmaonly",
+    // "<engine>_dmaonly_novars" — filter segment always comes before novars.
     function filterSuffix() {
+      if (dmaOn) return '_dmaonly';
       if (cyclicOn && setupOn) return '';
       if (cyclicOn) return '_cyclic';
       if (setupOn) return '_setuponly';
       return '_overlap';
     }
     function swap() {
-      const filterBase = curEngine + filterSuffix();
-      const dmaBase = filterBase + (dmaOn ? '_dma' : '');
-      const key = dmaBase + (showVars ? '' : '_novars');
+      const base = curEngine + filterSuffix();
+      const key = base + (showVars ? '' : '_novars');
       // a variant with nothing to hide behind "переменные" (e.g. setup-only
       // reaches no global vars) never gets its own "_novars" render (see
       // renderDotAll's hasVars gate in index.mjs) — fall back to that same
       // filtered variant's with-vars render, not all the way to svgs[curEngine],
       // or unchecking "переменные" would silently jump back to the unfiltered
       // "all" diagram instead of just leaving this one's (empty) vars alone.
-      // Same idea one level up for "DMA-потоки": a filter this variant has no
-      // DMA edges at all in never gets its own "_dma" render (see
-      // assembleLevel0's hasDma gate) — fall back to that filter's plain
-      // render (dmaBase collapses to filterBase in the fallback chain) rather
-      // than all the way to the unfiltered engine default.
       const inner = diagram.querySelector('.inner');
       const old = inner.querySelector('svg');
-      const doc = new DOMParser().parseFromString(
-        svgs[key] || svgs[dmaBase] || svgs[filterBase] || svgs[curEngine], 'image/svg+xml');
+      const doc = new DOMParser().parseFromString(svgs[key] || svgs[base] || svgs[curEngine], 'image/svg+xml');
       const next = document.importNode(doc.documentElement, true);
       old.replaceWith(next);
       setupGraphvizSvg(next);
@@ -1363,6 +1363,31 @@
     const setupCheckbox = toolbar.querySelector('.gv-setup-toggle');
     if (!cyclicCheckbox || !setupCheckbox || !switcher.setCyclicOn) return;
     const cyclicKey = 'cg_cyclic_' + id, setupKey = 'cg_setup_' + id;
+    const dmaCheckbox = toolbar.querySelector('.gv-dma-toggle');
+    const dmaKey = 'cg_dma_' + id;
+
+    // "DMA-потоки" only makes sense restricted to циклично — the DMA-only
+    // view is sourced from cyclic reachability specifically (see
+    // buildLevel0Diagram in index.mjs), to drop main's one-time setup-time
+    // connection to a channel (dma_init) from what's otherwise meant to be
+    // "the runtime DMA picture"; showing main alongside the ISRs there read
+    // as clutter (user feedback 2026-07-20). So the checkbox is greyed out —
+    // and forced off — whenever циклично itself is off, rather than staying
+    // checkable and silently showing stale content; and, symmetrically,
+    // однократное is greyed out while DMA-потоки is on, since it has no
+    // effect on that view at all.
+    function applyDmaAvailability() {
+      if (!dmaCheckbox) return;
+      const available = cyclicCheckbox.checked;
+      dmaCheckbox.disabled = !available;
+      if (!available && dmaCheckbox.checked) {
+        dmaCheckbox.checked = false;
+        storageSet(dmaKey, '0');
+        switcher.setDmaOn(false);
+      }
+      setupCheckbox.disabled = dmaCheckbox.checked;
+    }
+
     const savedCyclic = storageGet(cyclicKey), savedSetup = storageGet(setupKey);
     if (savedCyclic !== null) cyclicCheckbox.checked = savedCyclic === '1';
     if (savedSetup !== null) setupCheckbox.checked = savedSetup === '1';
@@ -1371,21 +1396,22 @@
     cyclicCheckbox.addEventListener('change', () => {
       storageSet(cyclicKey, cyclicCheckbox.checked ? '1' : '0');
       switcher.setCyclicOn(cyclicCheckbox.checked);
+      applyDmaAvailability();
     });
     setupCheckbox.addEventListener('change', () => {
       storageSet(setupKey, setupCheckbox.checked ? '1' : '0');
       switcher.setSetupOn(setupCheckbox.checked);
     });
 
-    const dmaCheckbox = toolbar.querySelector('.gv-dma-toggle');
     if (!dmaCheckbox || !switcher.setDmaOn) return;
-    const dmaKey = 'cg_dma_' + id;
     const savedDma = storageGet(dmaKey);
     if (savedDma !== null) dmaCheckbox.checked = savedDma === '1';
     switcher.setDmaOn(dmaCheckbox.checked);
+    applyDmaAvailability();
     dmaCheckbox.addEventListener('change', () => {
       storageSet(dmaKey, dmaCheckbox.checked ? '1' : '0');
       switcher.setDmaOn(dmaCheckbox.checked);
+      applyDmaAvailability();
     });
   }
 

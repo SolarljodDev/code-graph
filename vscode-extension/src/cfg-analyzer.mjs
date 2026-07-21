@@ -28,7 +28,30 @@ function walkTree(node, cb) {
 const CFG_SHAPE = { term: 'ellipse', ret: 'ellipse', cond: 'diamond', loop: 'diamond', call: 'box', jump: 'ellipse' };
 const CFG_CLASS = { term: 'cfgterm', ret: 'cfgterm', cond: 'cfgcond', loop: 'cfgcond', call: 'cfgcall', jump: 'cfgjump' };
 
-function buildCfg(body) {
+// A loop body that does nothing — a bare `;` or empty `{}` — the spin-wait
+// idiom (`while (!ready) ;`). Drawing a dedicated node for it is pure noise.
+function isEmptyBody(node) {
+  if (!node) return true;
+  if (node.type === 'compound_statement' || node.type === 'expression_statement') return node.namedChildren.length === 0;
+  return false;
+}
+
+// A condition that's a compile-time-nonzero constant (`while (1)`,
+// `while (true)`) — the loop can only ever be left via an explicit break (or
+// a return/goto, handled elsewhere), so drawing the generic "нет" exit
+// fabricates a fall-through path the code can't actually take.
+function isAlwaysTruthy(condNode) {
+  if (!condNode) return false;
+  let inner = condNode;
+  while (inner.type === 'parenthesized_expression' && inner.namedChildren.length === 1) inner = inner.namedChildren[0];
+  if (inner.type === 'number_literal') {
+    const v = parseInt(inner.text, undefined);
+    return !Number.isNaN(v) && v !== 0;
+  }
+  return inner.type === 'identifier' && /^(true|TRUE)$/.test(inner.text);
+}
+
+function buildCfg(body, { startLabel, endLabel } = {}) {
   if (!body) return null;
   const nodes = [];
   const edges = [];
@@ -36,11 +59,16 @@ function buildCfg(body) {
 
   // node param is the tree-sitter node this CFG node came from (may be null for
   // the synthetic начало/конец terminals) — its row span drives line-mapping.
-  const mkNode = (kind, label, calls = [], node = null) => {
+  // `vars` defaults to every identifier under `node` (see identNames) — good
+  // enough for "does this block reference X" highlighting; callers that need
+  // a narrower scope (a for-loop's header without its body, say) pass an
+  // explicit Set instead.
+  const mkNode = (kind, label, calls = [], node = null, vars = null) => {
     const id = 'c' + seq++;
     const startLine = node ? node.startPosition.row : null;
     const endLine = node ? node.endPosition.row : null;
-    nodes.push({ id, kind, label, calls, startLine, endLine });
+    const varsOut = vars || (node ? identNames(node) : new Set());
+    nodes.push({ id, kind, label, calls, vars: varsOut, startLine, endLine });
     return id;
   };
   const mkEdge = (from, to, label) => { edges.push({ from, to, label: label || '' }); };
@@ -57,6 +85,18 @@ function buildCfg(body) {
         const f = x.childForFieldName('function');
         if (f && f.type === 'identifier') out.push(f.text);
       }
+    });
+    return out;
+  };
+  // Every identifier referenced under `n` — variable reads/writes, and
+  // (redundantly with callNames) call targets. Feeds the "select a variable
+  // in code -> highlight every CFG block that touches it" webview feature;
+  // the redundancy with call targets is harmless there since the webview
+  // checks calls first.
+  const identNames = (n) => {
+    const out = new Set();
+    walkTree(n, (x) => {
+      if (x.type === 'identifier') out.add(x.text);
     });
     return out;
   };
@@ -83,7 +123,11 @@ function buildCfg(body) {
         startPosition: { row: first.startPosition.row },
         endPosition: { row: last.endPosition.row },
       };
-      const id = mkNode('stmt', shown.join('\n'), [], spanNode);
+      // spanNode is synthetic (no .children) — identNames can't walk it, so
+      // union the real per-statement identifiers gathered before folding.
+      const vars = new Set();
+      for (const bn of blockNodes) for (const nm of identNames(bn)) vars.add(nm);
+      const id = mkNode('stmt', shown.join('\n'), [], spanNode, vars);
       if (!entry) entry = id;
       attach(pending, id);
       pending = [{ from: id }];
@@ -137,7 +181,8 @@ function buildCfg(body) {
         return buildSeq(s.namedChildren, ctx);
 
       case 'if_statement': {
-        const cond = mkNode('cond', trunc('if ' + (s.childForFieldName('condition')?.text ?? '')), [], s.childForFieldName('condition') || s);
+        const condNode = s.childForFieldName('condition') || s;
+        const cond = mkNode('cond', trunc('if ' + (s.childForFieldName('condition')?.text ?? '')), callNames(condNode), condNode);
         const exits = [];
         const cr = buildAny(s.childForFieldName('consequence'), ctx);
         if (cr && cr.entry) { mkEdge(cond, cr.entry, 'да'); exits.push(...cr.exits); }
@@ -154,19 +199,32 @@ function buildCfg(body) {
       }
 
       case 'while_statement': {
-        const cond = mkNode('loop', trunc('while ' + (s.childForFieldName('condition')?.text ?? '')), [], s.childForFieldName('condition') || s);
+        const condNode = s.childForFieldName('condition') || s;
+        const cond = mkNode('loop', trunc('while ' + (s.childForFieldName('condition')?.text ?? '')), callNames(condNode), condNode);
+        const bodyNode = s.childForFieldName('body');
         const breaks = [];
-        const br = buildAny(s.childForFieldName('body'), { ...ctx, breaks, continueTo: cond });
-        if (br && br.entry) {
-          mkEdge(cond, br.entry, 'да');
-          for (const e of br.exits) mkEdge(e.from, cond, e.label);
+        if (isEmptyBody(bodyNode)) {
+          // spin-wait idiom (`while (!ready) ;`) — see isEmptyBody; a
+          // self-loop on the condition itself says the same thing without a
+          // pointless intermediate node (user report 2026-07-20).
+          mkEdge(cond, cond, 'да');
+        } else {
+          const br = buildAny(bodyNode, { ...ctx, breaks, continueTo: cond });
+          if (br && br.entry) {
+            mkEdge(cond, br.entry, 'да');
+            for (const e of br.exits) mkEdge(e.from, cond, e.label);
+          }
         }
-        return { entry: cond, exits: [{ from: cond, label: 'нет' }, ...breaks] };
+        // see isAlwaysTruthy — `while (1)` etc. only exits via an explicit
+        // break, never the generic "нет" fall-through.
+        const exits = isAlwaysTruthy(condNode) ? [...breaks] : [{ from: cond, label: 'нет' }, ...breaks];
+        return { entry: cond, exits };
       }
 
       case 'do_statement': {
         const breaks = [];
-        const cond = mkNode('loop', trunc('while ' + (s.childForFieldName('condition')?.text ?? '')), [], s.childForFieldName('condition') || s);
+        const condNode = s.childForFieldName('condition') || s;
+        const cond = mkNode('loop', trunc('while ' + (s.childForFieldName('condition')?.text ?? '')), callNames(condNode), condNode);
         const br = buildAny(s.childForFieldName('body'), { ...ctx, breaks, continueTo: cond });
         let entry = cond;
         if (br && br.entry) {
@@ -180,7 +238,18 @@ function buildCfg(body) {
       case 'for_statement': {
         const bodyNode = s.childForFieldName('body');
         const header = bodyNode ? s.text.slice(0, bodyNode.startIndex - s.startIndex) : s.text;
-        const cond = mkNode('loop', trunc(header, 46), [], s);
+        // scope vars/calls to the init/condition/update clauses, not bodyNode
+        // (which mkNode's own node-based fallback would include via s) — a
+        // loop header shouldn't light up for every name used inside the loop.
+        const headerVars = new Set();
+        const headerCalls = [];
+        for (const field of ['initializer', 'condition', 'update']) {
+          const c = s.childForFieldName(field);
+          if (!c) continue;
+          for (const nm of identNames(c)) headerVars.add(nm);
+          headerCalls.push(...callNames(c));
+        }
+        const cond = mkNode('loop', trunc(header, 46), headerCalls, s, headerVars);
         const breaks = [];
         const br = buildAny(bodyNode, { ...ctx, breaks, continueTo: cond });
         if (br && br.entry) {
@@ -191,7 +260,8 @@ function buildCfg(body) {
       }
 
       case 'switch_statement': {
-        const sw = mkNode('cond', trunc('switch ' + (s.childForFieldName('condition')?.text ?? '')), [], s.childForFieldName('condition') || s);
+        const swCondNode = s.childForFieldName('condition') || s;
+        const sw = mkNode('cond', trunc('switch ' + (s.childForFieldName('condition')?.text ?? '')), callNames(swCondNode), swCondNode);
         const breaks = [];
         const bodyNode = s.childForFieldName('body');
         let fall = [];
@@ -217,6 +287,9 @@ function buildCfg(body) {
       }
 
       case 'return_statement': {
+        // bare `return;` (no value) carries no information worth showing —
+        // route straight into конец instead of drawing a return bubble.
+        if (!s.namedChildren.length) return { entry: ctx.exitId, exits: [] };
         const id = mkNode('ret', trunc(s.text, 42), [], s);
         mkEdge(id, ctx.exitId);
         return { entry: id, exits: [] };
@@ -259,17 +332,54 @@ function buildCfg(body) {
     }
   }
 
-  const startId = mkNode('term', 'начало');
+  const startId = mkNode('term', startLabel || 'начало');
   const exitId = mkNode('term', 'конец');
   const r = buildSeq(body.namedChildren, { exitId, breaks: null, continueTo: null });
   if (r.entry) mkEdge(startId, r.entry); else mkEdge(startId, exitId);
   for (const e of r.exits) mkEdge(e.from, exitId, e.label);
   for (const g of gotos) if (labelIds.has(g.name)) mkEdge(g.from, labelIds.get(g.name), 'goto');
 
+  // конец only earns its place when it's telling you something a `return`
+  // node doesn't already: if every path into it already passed through an
+  // explicit `return expr;` node (kind 'ret'), "return" already means "the
+  // function ends here" on its own — a trailing конец bubble right after is
+  // pure noise, so it (and the now-pointless edges into it) gets dropped
+  // entirely, leaving the return node(s) as natural leaves (user report
+  // 2026-07-20: first asked to relabel it to the return type instead of
+  // "конец", then decided even that's unnecessary — "и так понятно что
+  // ретерн это конец"). Likewise if nothing reaches конец at all — every
+  // path diverges into an unescapable `while (1)`-style loop, say — there's
+  // nothing to show there either: relabeling it to "return <type>" would
+  // fabricate a return the code can never actually perform (user report
+  // 2026-07-20: "return int" hanging off a while(1) with no break/return
+  // anywhere). Otherwise (a bare `return;`, or falling off the end of a
+  // reachable path without any return) конец is the only place that shows
+  // up at all, so it stays — relabeled to the return type when there is
+  // one, since that IS new information there.
+  const incoming = edges.filter((e) => e.to === exitId);
+  const allFromReturn = incoming.length > 0 &&
+    incoming.every((e) => nodes.find((nn) => nn.id === e.from)?.kind === 'ret');
+  let strippedExit = false;
+  if (incoming.length === 0 || allFromReturn) {
+    const exitIdx = nodes.findIndex((nn) => nn.id === exitId);
+    if (exitIdx !== -1) nodes.splice(exitIdx, 1);
+    for (let i = edges.length - 1; i >= 0; i--) if (edges[i].to === exitId) edges.splice(i, 1);
+    strippedExit = true;
+  } else if (endLabel) {
+    const exitNode = nodes.find((nn) => nn.id === exitId);
+    if (exitNode) exitNode.label = endLabel;
+  }
+
   // caller classifies by nodes.length (trivial <= 3, oversized > CFG_MAX_NODES)
   // and decides whether to render — so the stacked view can still show a
   // placeholder block for those, keeping the column aligned with the file.
-  return { nodes, edges };
+  // strippedExit tells the caller to count the dropped конец back in for
+  // that check: whether a diagram is "worth drawing" is about the function's
+  // control-flow complexity, not about how many decorative terminal nodes
+  // happened to survive — a straight-line function ending in `return x;`
+  // shouldn't flip from "draw it" to "trivial" purely because конец, above,
+  // decided it was redundant and removed itself.
+  return { nodes, edges, strippedExit };
 }
 
 // --- dot emission + graphviz render (ported from index.mjs) -----------------
@@ -316,33 +426,75 @@ function cfgToSvg(cfg) {
 
 // --- function lookup --------------------------------------------------------
 
-function functionDeclName(fnDefNode) {
-  // walk into the declarator to the function_declarator's identifier
+const labelTrunc = (s, n = 46) => {
+  const t = s.replace(/\s+/g, ' ').trim();
+  return t.length > n ? t.slice(0, n - 1) + '…' : t;
+};
+
+// Walks a function_definition's declarator down to its function_declarator
+// (through any wrapping pointer_declarator — `char *foo(int x)` nests one
+// around the function_declarator) — finds the name, the parameter_list, and
+// how many pointer_declarator layers were passed through on the way (needed
+// to reconstruct a pointer return type: tree-sitter's own `type` field only
+// ever holds the base type, e.g. "char" for "char *foo(...)", with the "*"
+// living on the declarator chain instead).
+function analyzeDeclarator(fnDefNode) {
   let decl = fnDefNode.childForFieldName('declarator');
   const seen = new Set();
+  let pointerDepth = 0;
   while (decl && !seen.has(decl.id)) {
     seen.add(decl.id);
+    if (decl.type === 'pointer_declarator') pointerDepth++;
     if (decl.type === 'function_declarator') {
       const d = decl.childForFieldName('declarator');
-      if (d && d.type === 'identifier') return d.text;
+      const params = decl.childForFieldName('parameters');
+      if (d && d.type === 'identifier') return { name: d.text, params, pointerDepth };
       decl = d;
       continue;
     }
     decl = decl.childForFieldName('declarator') || decl.namedChildren.find((c) => c.type.endsWith('declarator') || c.type === 'identifier');
   }
-  return null;
+  return { name: null, params: null, pointerDepth };
+}
+
+// Entry/exit terminal labels derived from the function's own signature — the
+// parameter list for "начало" (what comes in) and "return <type>" for
+// "конец" when the function actually returns something (user request
+// 2026-07-20), instead of the generic placeholder words. endLabel is only a
+// *candidate* here — buildCfg only actually applies it to конец when at
+// least one path reaches конец WITHOUT going through an explicit
+// `return expr;` node first (see buildCfg's own comment): when every path
+// already shows its return value via its own node, restating the type again
+// on конец read as a second, unrelated-looking return (user report
+// 2026-07-20, dbg_put_hex16: "return 4u;" immediately followed by
+// "return uint16_t").
+function signatureLabels(fnDefNode, declInfo) {
+  let startLabel = null;
+  const paramsText = declInfo.params ? declInfo.params.text.replace(/^\(|\)$/g, '').trim() : '';
+  if (paramsText && paramsText !== 'void') startLabel = labelTrunc(paramsText);
+
+  let endLabel = null;
+  const typeNode = fnDefNode.childForFieldName('type');
+  const returnType = (typeNode ? typeNode.text.trim() : '') + '*'.repeat(declInfo.pointerDepth);
+  if (returnType && returnType !== 'void') endLabel = labelTrunc('return ' + returnType);
+
+  return { startLabel, endLabel };
 }
 
 function collectFunctions(root) {
   const fns = [];
   walkTree(root, (n) => {
     if (n.type === 'function_definition') {
+      const declInfo = analyzeDeclarator(n);
+      const { startLabel, endLabel } = signatureLabels(n, declInfo);
       fns.push({
         node: n,
-        name: functionDeclName(n) || '(anon)',
+        name: declInfo.name || '(anon)',
         startLine: n.startPosition.row,
         endLine: n.endPosition.row,
         body: n.childForFieldName('body'),
+        startLabel,
+        endLabel,
       });
     }
   });
@@ -390,8 +542,8 @@ function describeFunction(fn) {
     edges: [],
   };
   if (!fn.body) return { ...base, kind: 'none' };
-  const cfg = buildCfg(fn.body);
-  const n = cfg.nodes.length;
+  const cfg = buildCfg(fn.body, { startLabel: fn.startLabel, endLabel: fn.endLabel });
+  const n = cfg.nodes.length + (cfg.strippedExit ? 1 : 0);
   if (n <= 3) return { ...base, kind: 'trivial' };
   if (n > CFG_MAX_NODES) return { ...base, kind: 'toobig' };
   const svg = cfgToSvg(cfg); // also assigns e.id on the edges
@@ -399,10 +551,18 @@ function describeFunction(fn) {
     ...base,
     kind: 'cfg',
     svg,
-    // per-node line span (0-based, matches VS Code's Position API)
+    // per-node line span (0-based, matches VS Code's Position API), plus the
+    // identifiers/calls it references — powers the webview's "select a
+    // variable/function in code -> highlight every block that touches it"
+    // feature. Arrays, not Sets: postMessage to a webview goes through
+    // structured clone across a process boundary that not every host is
+    // guaranteed to preserve Set through untouched.
     nodeLines: cfg.nodes
       .filter((x) => x.startLine != null)
-      .map((x) => ({ id: x.id, kind: x.kind, startLine: x.startLine, endLine: x.endLine })),
+      .map((x) => ({
+        id: x.id, kind: x.kind, startLine: x.startLine, endLine: x.endLine,
+        vars: [...x.vars], calls: x.calls,
+      })),
     edges: cfg.edges.map((e) => ({ id: e.id, from: e.from, to: e.to })),
   };
 }

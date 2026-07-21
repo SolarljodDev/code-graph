@@ -81,3 +81,12 @@ svg g.edge.dma-flow polygon {
   stroke: color-mix(in srgb, #0d9488 70%, var(--vscode-editor-background));
   opacity: 0.9;
 }
+
+/* "DMA-потоки" unchecked (level0.js's applyDmaMask) — the CPAR/CMAR edges
+   and their channel/buffer nodes are baked into the same циклично/однократно
+   renders as everything else now, not a separate graph (user request
+   2026-07-20), so unchecking just hides the .dma-flow-tagged elements in
+   place instead of swapping to a different SVG. */
+svg.dma-hidden .dma-flow {
+  display: none;
+}

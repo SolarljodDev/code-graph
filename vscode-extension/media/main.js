@@ -8,14 +8,59 @@
   const viewport = document.getElementById('viewport');
   const inner = document.getElementById('inner');
   const status = document.getElementById('status');
+  const otherPlacesEl = document.getElementById('other-places');
+  const opTitleEl = otherPlacesEl.querySelector('.op-title');
+  const opListEl = otherPlacesEl.querySelector('.op-list');
+  const opCloseBtn = document.getElementById('op-close');
 
   let blocks = []; // one entry per function block, in source order
+  // Name from the last symbolSelect/symbolClear message (extension.js, on
+  // text-editor selection) — reapplied after every renderAll (edits
+  // re-analyze the file and rebuild `blocks` from scratch).
+  let lastSymbolName = null;
 
   const KIND_NOTE = {
     trivial: 'тривиальный алгоритм',
     toobig: 'слишком большой для диаграммы',
     none: 'нет тела',
   };
+
+  // A CFG node's text can fold several statements together (see
+  // flushBlock in cfg-analyzer.mjs — up to 4 lines per node), and even a
+  // single line can name the same variable twice (`x = x + 1;`) — so
+  // per-node or per-line click targets aren't precise enough for "show me
+  // where else this variable is used" (user request 2026-07-20). Instead,
+  // every identifier occurrence becomes its own <tspan>: graphviz already
+  // renders each folded line as its own <text> element (one per BR-joined
+  // row — verified against actual output, not assumed), so splitting each
+  // one on word boundaries into plain-text runs and .cg-var-token <tspan>s
+  // is enough; no dot/graphviz-side markup changes needed. Identifier text
+  // is always [A-Za-z_]\w* (from tree-sitter), so it's regex-safe as-is —
+  // no escaping needed for the alternation below.
+  function tokenizeNodeText(g, vars, calls) {
+    const names = new Set([...(vars || []), ...(calls || [])]);
+    if (!names.size) return;
+    const rx = new RegExp('\\b(' + [...names].sort((a, b) => b.length - a.length).join('|') + ')\\b', 'g');
+    for (const textEl of g.querySelectorAll('text')) {
+      const original = textEl.textContent;
+      if (!rx.test(original)) continue;
+      rx.lastIndex = 0;
+      const frag = document.createDocumentFragment();
+      let last = 0, m;
+      while ((m = rx.exec(original))) {
+        if (m.index > last) frag.appendChild(document.createTextNode(original.slice(last, m.index)));
+        const tspan = document.createElementNS('http://www.w3.org/2000/svg', 'tspan');
+        tspan.textContent = m[0];
+        tspan.setAttribute('class', 'cg-var-token');
+        tspan.dataset.varName = m[0];
+        frag.appendChild(tspan);
+        last = m.index + m[0].length;
+      }
+      if (last < original.length) frag.appendChild(document.createTextNode(original.slice(last)));
+      textEl.textContent = '';
+      textEl.appendChild(frag);
+    }
+  }
 
   function clearFocus() {
     for (const b of blocks) {
@@ -40,6 +85,16 @@
       const head = document.createElement('div');
       head.className = 'fn-head';
       head.textContent = fn.functionName;
+      head.title = 'Показать «Связи»';
+      // Left-click the function's own name (not a CFG node) — opens/updates
+      // the «Связи» panel for it. stopPropagation so this doesn't also
+      // trigger anything on .fn-block/.viewport (there's no click handler
+      // there today, but background-click semantics may grow one later —
+      // see main.js's own empty-space-clears-selection handler below).
+      head.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        vscode.postMessage({ type: 'openRelations', functionName: fn.functionName });
+      });
       el.appendChild(head);
 
       const body = document.createElement('div');
@@ -60,27 +115,165 @@
       // — everything here is scoped to this one block)
       const nodeEls = new Map();
       const nodeRange = new Map();
+      const nodeMeta = new Map(); // id -> { vars: Set, calls: Set } for symbol highlighting
       if (fn.kind === 'cfg') {
         for (const n of fn.nodeLines) {
           const g = body.querySelector(`g.node[id="${n.id}"]`);
           if (g) nodeEls.set(n.id, g);
           nodeRange.set(n.id, { startLine: n.startLine, endLine: n.endLine });
+          nodeMeta.set(n.id, { vars: new Set(n.vars || []), calls: new Set(n.calls || []) });
+          if (g) tokenizeNodeText(g, n.vars, n.calls);
         }
       }
-      blocks.push({ el, head, body, funcRange: fn.funcRange, kind: fn.kind, nodeEls, nodeRange });
+      blocks.push({ el, head, body, funcRange: fn.funcRange, kind: fn.kind, nodeEls, nodeRange, nodeMeta });
+    }
+    applySymbolHighlight(lastSymbolName);
+  }
+
+  // Selecting a variable/function name in the editor (extension.js) dims
+  // every CFG block across the whole ribbon that doesn't reference it —
+  // "reference" meaning calls it, if it's ever seen as a call target
+  // anywhere in the ribbon (so foo(bar) always reads as "calls foo", never
+  // "uses variable foo" even if some other block also has a local named
+  // foo); otherwise plain identifier use. Reuses the .hl/.dim styling
+  // 'locate' already established (main.css), but its own class names —
+  // sym-hl/sym-dim — so this doesn't fight with locate()'s cursor-driven
+  // single-node highlight over the same classes.
+  function clearSymbolHighlight() {
+    for (const b of blocks) {
+      const svg = b.body.querySelector('svg');
+      if (svg) svg.classList.remove('sym-dim');
+      for (const el of b.nodeEls.values()) el.classList.remove('sym-hl');
     }
   }
+  // A name is read as "calls this function" if it's ever seen as a call
+  // target anywhere in the ribbon, "uses this variable" otherwise — shared by
+  // applySymbolHighlight (below) and showOtherPlaces's "Показать «Связи»"
+  // button (only meaningful for a function, not a plain variable).
+  function isCallName(name) {
+    for (const b of blocks) {
+      for (const meta of b.nodeMeta.values()) {
+        if (meta.calls.has(name)) return true;
+      }
+    }
+    return false;
+  }
+  function applySymbolHighlight(name) {
+    lastSymbolName = name;
+    clearSymbolHighlight();
+    if (!name) return;
+    const isCall = isCallName(name);
+    let any = false;
+    for (const b of blocks) {
+      if (b.kind !== 'cfg') continue;
+      const svg = b.body.querySelector('svg');
+      if (!svg) continue;
+      for (const [id, meta] of b.nodeMeta) {
+        if (isCall ? meta.calls.has(name) : meta.vars.has(name)) {
+          any = true;
+          const el = b.nodeEls.get(id);
+          if (el) el.classList.add('sym-hl');
+        }
+      }
+      svg.classList.add('sym-dim');
+    }
+    // nothing anywhere references it (e.g. a keyword or type name got
+    // selected) — shading everything would just look broken, so don't.
+    if (!any) clearSymbolHighlight();
+  }
+
+  // --- "other places this variable appears" side list ------------------------
+  // Filled in by a separate, later 'symbolOtherPlaces' message (extension.js
+  // resolves it against a whole-project scan, which can take a beat) — kept
+  // apart from symbolSelect/applySymbolHighlight above so the in-ribbon
+  // shading stays instant regardless of that scan's latency. Hidden right
+  // away on every new selection so it never shows a stale variable's list
+  // while the fresh one is still loading.
+  const MODE_LABEL = { r: 'чтение', w: 'запись', rw: 'чтение/запись' };
+
+  function hideOtherPlaces() {
+    otherPlacesEl.style.display = 'none';
+    opListEl.innerHTML = '';
+  }
+  function showOtherPlaces(name, places) {
+    opTitleEl.textContent = `«${name}» также в:`;
+    opListEl.innerHTML = '';
+    if (!places.length) {
+      const info = document.createElement('div');
+      info.className = 'op-empty';
+      info.textContent = 'больше нигде не найдено';
+      opListEl.appendChild(info);
+    } else {
+      for (const p of places) {
+        const item = document.createElement('div');
+        item.className = 'op-item';
+        item.title = MODE_LABEL[p.mode] || '';
+        const fn = document.createElement('span');
+        fn.className = 'op-fn';
+        fn.textContent = p.name;
+        const loc = document.createElement('span');
+        loc.className = 'op-loc';
+        loc.textContent = `${p.file}:${p.startLine + 1}`;
+        item.appendChild(fn);
+        item.appendChild(loc);
+        item.addEventListener('click', () => {
+          vscode.postMessage({ type: 'navigateOther', filePath: p.filePath, startLine: p.startLine });
+        });
+        opListEl.appendChild(item);
+      }
+    }
+    // usageByVar (the source of `places`) only ever covers variables, so this
+    // is the one extra entry point for a function's own "Связи" — right-click
+    // wherever it's called, same as it appears anywhere else in the ribbon,
+    // rather than requiring a trip to hunt down its own definition block
+    // (user request 2026-07-21: the definition-block header alone was too
+    // easy to miss/confuse with the CFG node right above it).
+    if (isCallName(name)) {
+      const relBtn = document.createElement('button');
+      relBtn.className = 'op-relations-btn';
+      relBtn.textContent = 'Показать «Связи»';
+      relBtn.addEventListener('click', () => {
+        vscode.postMessage({ type: 'openRelations', functionName: name });
+      });
+      opListEl.appendChild(relBtn);
+    }
+    otherPlacesEl.style.display = 'block';
+  }
+  opCloseBtn.addEventListener('click', hideOtherPlaces);
 
   // --- graph -> code ----------------------------------------------------------
   viewport.addEventListener('click', (ev) => {
     const g = ev.target.closest && ev.target.closest('g.node');
-    if (!g || !g.id) return;
+    if (!g || !g.id) {
+      // Empty background (or an edge) — release whatever a right-click
+      // token or an editor-side selection pinned, same escape hatch as
+      // level0's own "click empty space clears the highlight" (user
+      // request 2026-07-20). A drag-released pan click never reaches here:
+      // setupPanZoom's own capture-phase listener swallows it first.
+      applySymbolHighlight(null);
+      hideOtherPlaces();
+      return;
+    }
     const blockEl = ev.target.closest('.fn-block');
     const block = blocks.find((b) => b.el === blockEl);
     if (!block) return;
     const range = block.nodeRange.get(g.id);
     if (!range) return;
     vscode.postMessage({ type: 'navigate', startLine: range.startLine, endLine: range.endLine });
+  });
+
+  // Right-click a variable/call token (see tokenizeNodeText above) — same
+  // shading as an editor-side selection (applySymbolHighlight), plus a
+  // cross-file "other places" lookup, but triggered from the graph itself
+  // instead of requiring a trip back to the source to select the name.
+  viewport.addEventListener('contextmenu', (ev) => {
+    const tok = ev.target.closest && ev.target.closest('.cg-var-token');
+    if (!tok) return;
+    ev.preventDefault();
+    const name = tok.dataset.varName;
+    applySymbolHighlight(name);
+    hideOtherPlaces();
+    vscode.postMessage({ type: 'lookupOtherPlaces', name });
   });
 
   // --- code -> graph ----------------------------------------------------------
@@ -110,6 +303,20 @@
       renderAll(msg.functions || []);
     } else if (msg.type === 'locate') {
       locate(msg.functionStartLine, msg.nodeId);
+    } else if (msg.type === 'symbolSelect') {
+      applySymbolHighlight(msg.name);
+      hideOtherPlaces(); // fresh selection — wait for this name's own reply
+    } else if (msg.type === 'symbolClear') {
+      applySymbolHighlight(null);
+      hideOtherPlaces();
+    } else if (msg.type === 'symbolOtherPlaces') {
+      if (msg.name !== lastSymbolName) return; // superseded by a newer selection
+      // A right-click lookup (msg.explicit) always confirms something, even
+      // "nothing else" — it's a deliberate ask. The passive editor-selection
+      // path fires on every identifier you select while reading code, so an
+      // empty result there just stays quiet instead of popping up a panel.
+      if (msg.explicit || (msg.places && msg.places.length)) showOtherPlaces(msg.name, msg.places || []);
+      else hideOtherPlaces();
     }
   });
 
