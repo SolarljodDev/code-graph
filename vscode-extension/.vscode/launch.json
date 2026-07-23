@@ -10,6 +10,16 @@
         "${workspaceFolder}/../CORE"
       ],
       "outFiles": []
+    },
+    {
+      "name": "Запустить расширение (Acc_150V_1600W)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "--folder-uri=file:///C:/Users/Solarljod/Downloads/Downloads/Acc_150V_1600W"
+      ],
+      "outFiles": []
     }
   ]
 }

@@ -170,6 +170,24 @@
     showStatus('Пересканирование проекта…');
     vscode.postMessage({ type: 'refresh' });
   });
+  // Final node size (and, riding the same knob, font size) — see
+  // extension.js's level0NodeScale. Debounced so dragging doesn't fire a
+  // full project re-scan per pixel. fontSize scales linearly off graphviz's
+  // own ~14pt default, so 100% reproduces the untouched default look.
+  const sizeSlider = document.getElementById('size-slider');
+  const sizeValueEl = document.getElementById('size-value');
+  let sizeDebounce = null;
+  if (sizeSlider) {
+    sizeSlider.addEventListener('input', () => {
+      const pct = parseInt(sizeSlider.value, 10);
+      sizeValueEl.textContent = `${pct}%`;
+      clearTimeout(sizeDebounce);
+      sizeDebounce = setTimeout(() => {
+        showStatus('Пересканирование проекта…');
+        vscode.postMessage({ type: 'setNodeSize', scale: pct / 100, fontSize: Math.round(14 * pct / 100) });
+      }, 500);
+    });
+  }
   maxBtn.addEventListener('click', () => GraphView.toggleMaximize(diagram));
   zoomInBtn.addEventListener('click', () => {
     GraphView.applyZoom(diagram, 1.25, diagram.clientWidth / 2, diagram.clientHeight / 2);

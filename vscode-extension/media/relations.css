@@ -18,3 +18,22 @@ svg g.node.hlring ellipse {
 svg g.edge.hlring path {
   filter: drop-shadow(0 0 3px #2563eb);
 }
+
+/* Peripheral register-detail flags (.periph-detail/.periph-default —
+   injectPeriphDetailLabels in level0-analyzer.mjs) must only ever show
+   while an edge is actually being hovered right now. graph-view.css's
+   generic `g.edge.hl > text` reveal was written assuming .hl always means
+   "currently hovered", true everywhere else but not here: relations.js
+   marks the focus function's own confirmed chain with a PERMANENT .hl
+   (see its module doc comment), so that generic rule left every direct
+   peripheral/var edge off the focus node permanently un-maskable —
+   its full register breakdown shown at rest forever, cluttered whenever
+   there were many (user report 2026-07-23). Re-key both rules off
+   'hover-live' (mark() in relations.js, added/removed alongside 'hl'/
+   'hlring' but meaning only "hovered right now") instead — these load
+   after graph-view.css, so equal-specificity + !important + later source
+   order lets them win over its generic .hl-keyed rules. */
+#diagram svg g.edge.hl > text.periph-detail { opacity: 0 !important; }
+#diagram svg g.edge.hover-live > text.periph-detail { opacity: 1 !important; }
+#diagram svg g.edge.hl > text.periph-default { opacity: 1 !important; }
+#diagram svg g.edge.hover-live > text.periph-default { opacity: 0 !important; }

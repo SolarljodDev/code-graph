@@ -83,7 +83,7 @@
   // 2026-07-22). Own class triple (path-dim/path-hl/path-hover), independent
   // of .dim/.hl (locate) and .sym-dim/.sym-hl (symbol selection) so the three
   // dimming mechanisms don't fight over the same classes.
-  const HOVER_PATH_DELAY_MS = 2000;
+  const HOVER_PATH_DELAY_MS = 1000;
   let hoverTimer = null;
   let hoverTimerNodeId = null;  // node the pending timer belongs to
   let hoverPathBlock = null;    // block currently showing a hover-path highlight

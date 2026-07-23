@@ -36,6 +36,17 @@ async function ensureAnalyzer(context) {
 let level0Analyzer = null;    // lazily-imported ESM module
 let level0Panel = null;       // vscode.WebviewPanel («Уровень 0»)
 let level0SaveDebounce = null;
+// «Уровень 0»'s node-size control — overlap-removal needs a much bigger
+// margin than the diagram should actually look like (see level0-analyzer.
+// mjs's renderDotAll) to get force-directed layout to actually separate two
+// touching nodes, so every node gets shrunk back down afterward; nodeScale
+// is how far *back out* from that bare label-fit size the user wants the
+// final, visible node — 1 = tightest fit, bigger = more breathing room
+// (user request 2026-07-23). fontSize rides the same control, scaled
+// alongside it, so bigger nodes get bigger text to match rather than more
+// empty padding. null = renderDotAll's own defaults.
+let level0NodeScale = null;
+let level0FontSize = null;
 
 const LEVEL0_SAVE_DEBOUNCE_MS = 1500;
 const LEVEL0_EXCLUDE_GLOB = '{**/node_modules/**,**/.git/**,**/graph-html/**,**/build/**}';
@@ -78,7 +89,11 @@ async function buildWorkspaceIndex(context) {
   }
   try {
     const mod = await ensureLevel0Analyzer(context);
-    return await mod.buildLevel0({ files });
+    return await mod.buildLevel0({
+      files,
+      nodeScale: level0NodeScale || undefined,
+      fontSize: level0FontSize || undefined,
+    });
   } catch (e) {
     throw new Error('Ошибка анализа: ' + e.message);
   }
@@ -174,6 +189,10 @@ function getLevel0Html(webview, context) {
         <label class="gv-ctrl"><input type="checkbox" id="cyclic-toggle" checked> цикличное</label>
         <label class="gv-ctrl"><input type="checkbox" id="setup-toggle" checked> однократное</label>
         <label class="gv-ctrl"><input type="checkbox" id="dma-toggle"> DMA-потоки</label>
+        <label class="gv-ctrl" title="Итоговый размер узлов и шрифта">
+          размер <input type="range" id="size-slider" min="100" max="200" step="5" value="130" style="width:70px">
+          <span id="size-value">130%</span>
+        </label>
         <button id="refresh-btn" title="Обновить">&#8635;</button>
         <button class="maxbtn" id="max-btn" title="На весь экран (F)">&#9974;</button>
       </div>
@@ -207,6 +226,12 @@ function openLevel0Panel(context) {
       scanWorkspaceLevel0(context);
     } else if (msg.type === 'navigateFn' && msg.file && typeof msg.startLine === 'number') {
       navigateToFunctionAndShowCfg(context, msg.file, msg.startLine);
+    } else if (msg.type === 'setNodeSize') {
+      // see level0NodeScale's own comment.
+      level0NodeScale = msg.scale || null;
+      level0FontSize = msg.fontSize || null;
+      workspaceIndexCache = null; // force a rebuild at the new size
+      scanWorkspaceLevel0(context);
     }
   });
   level0Panel.onDidDispose(() => { level0Panel = null; });

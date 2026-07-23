@@ -96,16 +96,24 @@
     });
 
     let locked = null;
-    const hoverAdded = new Map(); // el -> 'hl' | 'hlring'
+    const hoverAdded = new Map(); // el -> ['hl'|'hlring', 'hover-live']
     function clearHover() {
-      for (const [el, cls] of hoverAdded) el.classList.remove(cls);
+      for (const [el, classes] of hoverAdded) el.classList.remove(...classes);
       hoverAdded.clear();
     }
+    // 'hover-live' always accompanies whichever of 'hl'/'hlring' this call
+    // adds, marking "actually being hovered right now" independently of
+    // 'hl's OWN meaning here (a permanent confirmed-chain mark, not hover —
+    // see the module doc comment above). Peripheral register-detail flags
+    // key off 'hover-live' (relations.css), not 'hl', for exactly that
+    // reason: an edge that's permanently 'hl' (say, focus's own direct
+    // write to a peripheral) must still mask its detail at rest and reveal
+    // it only on real hover, not show it forever (user report 2026-07-23).
     function mark(el) {
       if (!el || hoverAdded.has(el)) return;
       const cls = el.classList.contains('hl') ? 'hlring' : 'hl';
-      el.classList.add(cls);
-      hoverAdded.set(el, cls);
+      el.classList.add(cls, 'hover-live');
+      hoverAdded.set(el, [cls, 'hover-live']);
     }
     function markKey(key) { mark(nodeEls.get(key)); }
     function highlightNode(key) {

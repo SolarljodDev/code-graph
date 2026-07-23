@@ -9,5 +9,6 @@ node_modules/tree-sitter-wasms/**
 test-analyzer.mjs
 test-level0-analyzer.mjs
 test-output.svg
+_tmp-*
 .vscode/**
 .gitignore

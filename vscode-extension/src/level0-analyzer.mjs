@@ -371,7 +371,19 @@ function analyzeFunction(funcNode) {
   // resolveLocalAlias — so `X->CMAR = m->data` can be traced through
   // `U1Msg *m = &u1_q[u1_q_tail];` back to `u1_q`, the same way a direct
   // `X->CMAR = u1_rx_buf` already resolves. name -> {kind, name/key, field}
+  // Orthogonal to resolveSymbolicRef below (this is CPAR/CMAR's OWN "what
+  // does this pointer ultimately point at, var or periph" question, not
+  // periph-base resolution) — kept as its own separate mechanism.
   const localAliases = new Map();
+  // This function's own local array literals (`T *const PORTS[] = {...};`)
+  // and locals resolved to a peripheral candidate set via resolveSymbolicRef
+  // (`GPIO_TypeDef *p = port_reg(...);` or `= PORTS[i];`) — both feed the
+  // `scope` resolveSymbolicRef needs for everything below. Built in
+  // declaration order in the SAME walk, so a local may reference an EARLIER
+  // one (never a later one — matches normal C declare-before-use).
+  const localArrays = new Map();
+  const localPeriphVars = new Map();
+  const scope = { locals, localArrays, localVars: localPeriphVars };
   if (declarator) {
     walkTree(declarator, n => {
       if (n.type === 'parameter_declaration') {
@@ -391,6 +403,13 @@ function analyzeFunction(funcNode) {
             const value = d.childForFieldName('value');
             const ref = value && resolveAddrExpr(value);
             if (ref) localAliases.set(nm, ref);
+            if (value && value.type === 'initializer_list' && value.namedChildren.length
+                && value.namedChildren.every((it) => it.type === 'identifier' && MACRO_CONST_RE.test(it.text))) {
+              localArrays.set(nm, new Set(value.namedChildren.map((it) => it.text)));
+            } else if (value) {
+              const resolved = resolveSymbolicRef(value, scope);
+              if (resolved.size) localPeriphVars.set(nm, resolved);
+            }
           }
         }
       }
@@ -410,6 +429,100 @@ function analyzeFunction(funcNode) {
   const derefAddrRefs = new Map();
   const access = new Map();      // name -> { r, w }
   const NVIC_ARM_RE = /^(HAL_|LL_)?NVIC_EnableIRQ$/;
+  // Records one `NAME->field` dereference — `p` is the `->` field_expression
+  // itself. Shared by the direct case below (NAME is a bare identifier, the
+  // common path — `p`'s own argument IS `n`) and the config-table-array case
+  // (NAME is one of several candidates resolved from ARRAY_FIELD_PERIPHS,
+  // `p`'s argument is a whole `ARR[i].field` chain instead — see that map's
+  // own doc comment). Pulled out of the walkTree callback below so both
+  // sites can call it without duplicating this logic.
+  function recordDeref(name, field, p, mode) {
+    derefNames.add(name);
+    if (!field) return;
+    // `w`'s per-flag value is a Map(flagName -> 'set'|'clear'|'both'), not a
+    // Set — same flag name can mean opposite things depending on whether it
+    // came in via `|=` (arm) or `&= ~` (disarm); `r` stays a plain Set (a
+    // bit *test* has no set/clear polarity). `polarity` is only meaningful
+    // when kind === 'w'.
+    function addFlagNames(kind, node, polarity) {
+      const flagNames = new Set();
+      collectIdentifiers(node, flagNames);
+      if (!flagNames.size) return;
+      let flagMap = derefFlags.get(name);
+      if (!flagMap) { flagMap = new Map(); derefFlags.set(name, flagMap); }
+      let perKind = flagMap.get(field);
+      if (!perKind) { perKind = { r: new Set(), w: new Map() }; flagMap.set(field, perKind); }
+      if (kind === 'w') {
+        for (const fl of flagNames) mergeFlagPolarity(perKind.w, fl, polarity);
+      } else {
+        for (const fl of flagNames) perKind.r.add(fl);
+      }
+    }
+    // `X->field |= FLAG` / `X->field &= ~FLAG` is set/clear-a-bit — a
+    // read-modify-write in hardware, but nothing is semantically *read*
+    // here, so field-level mode downgrades to plain 'w' for this idiom
+    // (avoids a phantom read edge with no real read site).
+    let fieldMode = mode;
+    const parent = p.parent;
+    const isSetClearIdiom = parent && parent.type === 'assignment_expression'
+      && sameNode(parent.childForFieldName('left'), p)
+      && (() => {
+        const op = parent.children.find(c => !c.isNamed() && c.text.endsWith('='))?.text;
+        const right = parent.childForFieldName('right');
+        if (op === '|=' && right) return true;
+        if (op === '&=' && right && right.type === 'unary_expression'
+            && right.children[0]?.text === '~') return true;
+        return false;
+      })();
+    if (isSetClearIdiom) fieldMode = 'w';
+
+    let fm = derefFields.get(name);
+    if (!fm) { fm = new Map(); derefFields.set(name, fm); }
+    fm.set(field, mergeMode(fm.get(field), fieldMode));
+
+    if (parent && parent.type === 'binary_expression' && parent.childForFieldName('operator')?.text === '&') {
+      const left = parent.childForFieldName('left'), right = parent.childForFieldName('right');
+      const other = sameNode(left, p) ? right : (sameNode(right, p) ? left : null);
+      if (other) addFlagNames('r', other);
+    } else if (parent && parent.type === 'assignment_expression' && sameNode(parent.childForFieldName('left'), p)) {
+      const op = parent.children.find(c => !c.isNamed() && c.text.endsWith('='))?.text;
+      const right = parent.childForFieldName('right');
+      if (op === '|=' && right) {
+        addFlagNames('w', right, 'set');
+      } else if (op === '&=' && right && right.type === 'unary_expression'
+          && right.children[0]?.text === '~') {
+        addFlagNames('w', right.childForFieldName('argument'), 'clear');
+      } else if (op === '=' && right) {
+        addFlagNames('w', right, 'set');
+        if (field === 'CPAR' || field === 'CMAR') {
+          const ref = resolveLocalAlias(resolveAddrExpr(right), locals, localAliases);
+          if (ref) {
+            let am = derefAddrRefs.get(name);
+            if (!am) { am = new Map(); derefAddrRefs.set(name, am); }
+            am.set(field, ref);
+          }
+        }
+      }
+    }
+  }
+  // Records a periph access resolved not to one certain name but to a whole
+  // candidate SET (anything resolveSymbolicRef returns more than one — or
+  // even exactly one non-obvious — answer for). Pass 2 (below, in
+  // buildLevel0) decides var-vs-periph by walking fn.access's own keys,
+  // falling back to fn.derefNames only for names it finds there —
+  // recordDeref alone (which only touches derefNames/derefFields/
+  // derefFlags) leaves a candidate invisible to that walk entirely unless
+  // it's ALSO in fn.access, same as the bottom-of-callback update below
+  // does for every directly-visited identifier.
+  function recordCandidates(candidates, field, p, mode) {
+    for (const cand of candidates) {
+      recordDeref(cand, field, p, mode);
+      const cur = access.get(cand) || { r: false, w: false };
+      if (mode.includes('r')) cur.r = true;
+      if (mode.includes('w')) cur.w = true;
+      access.set(cand, cur);
+    }
+  }
   if (body) {
     walkTree(body, n => {
       if (n.type === 'call_expression') {
@@ -426,86 +539,27 @@ function analyzeFunction(funcNode) {
         }
         return;
       }
+      // Every `->` access, resolved through the SAME general chain
+      // (resolveSymbolicRef) regardless of whether its base is a bare
+      // peripheral name, a config-table array field, a helper-function
+      // call, or a local variable holding any of the above — see that
+      // function's own doc comment. Does NOT `return` afterward: walkTree
+      // still descends into this field_expression's own children below
+      // (the base expression's own identifiers, any nested `[index]`
+      // subscripts, ...), each getting its ordinary access-tracking the
+      // same as in any other expression.
+      if (n.type === 'field_expression' && n.childForFieldName('operator')?.text === '->') {
+        const candidates = resolveSymbolicRef(n.childForFieldName('argument'), scope);
+        if (candidates.size) recordCandidates(candidates, n.childForFieldName('field')?.text, n, classifyAccess(n));
+      }
       if (n.type !== 'identifier') return;
       const p = n.parent;
       if (p && p.type === 'call_expression' && sameNode(p.childForFieldName('function'), n)) return;
       if (p && p.type === 'field_expression' && sameNode(p.childForFieldName('field'), n)) return;
       if (p && (p.type.endsWith('_declarator')) && sameNode(p.childForFieldName('declarator'), n)) return;
-      const name = n.text;
+      const name = resolveMacroName(n.text);
       if (locals.has(name)) return;
       const mode = classifyAccess(n);
-      if (p && p.type === 'field_expression' && p.childForFieldName('operator')?.text === '->'
-          && sameNode(p.childForFieldName('argument'), n)) {
-        derefNames.add(name);
-        const field = p.childForFieldName('field')?.text;
-        if (field) {
-          // `w`'s per-flag value is a Map(flagName -> 'set'|'clear'|'both'),
-          // not a Set — same flag name can mean opposite things depending on
-          // whether it came in via `|=` (arm) or `&= ~` (disarm); `r` stays a
-          // plain Set (a bit *test* has no set/clear polarity). `polarity` is
-          // only meaningful when kind === 'w'.
-          function addFlagNames(kind, node, polarity) {
-            const flagNames = new Set();
-            collectIdentifiers(node, flagNames);
-            if (!flagNames.size) return;
-            let flagMap = derefFlags.get(name);
-            if (!flagMap) { flagMap = new Map(); derefFlags.set(name, flagMap); }
-            let perKind = flagMap.get(field);
-            if (!perKind) { perKind = { r: new Set(), w: new Map() }; flagMap.set(field, perKind); }
-            if (kind === 'w') {
-              for (const fl of flagNames) mergeFlagPolarity(perKind.w, fl, polarity);
-            } else {
-              for (const fl of flagNames) perKind.r.add(fl);
-            }
-          }
-          // `X->field |= FLAG` / `X->field &= ~FLAG` is set/clear-a-bit — a
-          // read-modify-write in hardware, but nothing is semantically
-          // *read* here, so field-level mode downgrades to plain 'w' for
-          // this idiom (avoids a phantom read edge with no real read site).
-          let fieldMode = mode;
-          const parent = p.parent;
-          const isSetClearIdiom = parent && parent.type === 'assignment_expression'
-            && sameNode(parent.childForFieldName('left'), p)
-            && (() => {
-              const op = parent.children.find(c => !c.isNamed() && c.text.endsWith('='))?.text;
-              const right = parent.childForFieldName('right');
-              if (op === '|=' && right) return true;
-              if (op === '&=' && right && right.type === 'unary_expression'
-                  && right.children[0]?.text === '~') return true;
-              return false;
-            })();
-          if (isSetClearIdiom) fieldMode = 'w';
-
-          let fm = derefFields.get(name);
-          if (!fm) { fm = new Map(); derefFields.set(name, fm); }
-          fm.set(field, mergeMode(fm.get(field), fieldMode));
-
-          if (parent && parent.type === 'binary_expression' && parent.childForFieldName('operator')?.text === '&') {
-            const left = parent.childForFieldName('left'), right = parent.childForFieldName('right');
-            const other = sameNode(left, p) ? right : (sameNode(right, p) ? left : null);
-            if (other) addFlagNames('r', other);
-          } else if (parent && parent.type === 'assignment_expression' && sameNode(parent.childForFieldName('left'), p)) {
-            const op = parent.children.find(c => !c.isNamed() && c.text.endsWith('='))?.text;
-            const right = parent.childForFieldName('right');
-            if (op === '|=' && right) {
-              addFlagNames('w', right, 'set');
-            } else if (op === '&=' && right && right.type === 'unary_expression'
-                && right.children[0]?.text === '~') {
-              addFlagNames('w', right.childForFieldName('argument'), 'clear');
-            } else if (op === '=' && right) {
-              addFlagNames('w', right, 'set');
-              if (field === 'CPAR' || field === 'CMAR') {
-                const ref = resolveLocalAlias(resolveAddrExpr(right), locals, localAliases);
-                if (ref) {
-                  let am = derefAddrRefs.get(name);
-                  if (!am) { am = new Map(); derefAddrRefs.set(name, am); }
-                  am.set(field, ref);
-                }
-              }
-            }
-          }
-        }
-      }
       const cur = access.get(name) || { r: false, w: false };
       if (mode.includes('r')) cur.r = true;
       if (mode.includes('w')) cur.w = true;
@@ -533,6 +587,307 @@ function analyzeFunction(funcNode) {
   return { calls, indirectCalls, armCalls, derefNames, derefFields, derefFlags, derefAddrRefs, access, signature, loopCallNames, hasLoop };
 }
 
+// Simple object-like `#define NAME OTHER_IDENT` peripheral/var aliases (e.g.
+// STM32 code that names a UART's GPIO port `#define UART1_Prt GPIOB` because
+// that's where its pins live) resolve to the SAME hardware block as whatever
+// `OTHER_IDENT` itself resolves to — but this analyzer has no C preprocessor
+// pass at all, so `UART1_Prt->CRL` and `GPIOB->CRL` used to name two
+// different peripherals purely because they're spelled differently at the
+// access site (user report 2026-07-23, real project). Fixed with a light,
+// best-effort pre-pass: collect every `#define NAME VALUE` project-wide
+// where VALUE is *exactly* one bare identifier (never a function-like macro,
+// never `((T*)0x...)` address casts — those define the REAL peripheral, not
+// an alias of one, and must stay as themselves), then canonicalize through
+// the chain at the same two points every periph/var base name is first read
+// out of the AST (resolveAddrExpr below, and analyzeFunction's own `name`
+// extraction) — every downstream consumer (Pass 2 aggregation, DMA facts,
+// "Связи") sees only the canonical name from there on, no other call site
+// needs to know aliasing exists. Module-level like FONT_SCALE: rebuilt fresh
+// at the top of every buildLevel0() call from its own `files`, read from
+// deep inside analyzeFunction/resolveAddrExpr without threading a parameter
+// through their whole call chain.
+let MACRO_ALIASES = new Map();
+const resolveMacroName = (name) => MACRO_ALIASES.get(name) || name;
+// One file's `#define`s, raw (unchained) — walks the whole tree, not just
+// top-level, so aliases guarded by `#ifdef` are still picked up (same
+// "best-effort project-wide union" trade-off already made for periph/DMA
+// resolution elsewhere here — no macro is actually evaluated, so which
+// #ifdef branch a define lives in is never checked).
+function collectMacroAliases(root, out) {
+  walkTree(root, (n) => {
+    if (n.type !== 'preproc_def') return;
+    const name = n.childForFieldName('name')?.text;
+    const value = n.childForFieldName('value')?.text?.trim();
+    if (name && value && /^[A-Za-z_]\w*$/.test(value)) out.set(name, value);
+  });
+}
+// Chases each raw alias to whatever it ultimately names — `#define A B` +
+// `#define B GPIOC` resolves `A` straight to `GPIOC`, not just one hop to
+// `B`. Cycle-guarded (a chain that loops back on itself falls back to the
+// last name seen before the repeat, rather than hanging).
+function resolveMacroChains(raw) {
+  const out = new Map();
+  for (const start of raw.keys()) {
+    const seen = new Set();
+    let cur = start;
+    while (raw.has(cur) && !seen.has(cur)) { seen.add(cur); cur = raw.get(cur); }
+    if (cur !== start) out.set(start, cur);
+  }
+  return out;
+}
+
+// Config-table-driven peripheral access: `const PinConfig OUTPUT_PINS[N] =
+// { {GPIOB, 0}, ... }; OUTPUT_PINS[i].port->BSRR = bit;` touches a real GPIO
+// peripheral, but `->`'s own base here is `OUTPUT_PINS[i].port` — a whole
+// subscript+field chain, not the bare identifier every other periph/var
+// access in this analyzer requires — so it fell through completely
+// unrecognized, silently missing from the diagram (user report 2026-07-23,
+// real project: "где чтение и запись в гпио?? ...его нет"). `i` is a
+// runtime index, so which exact element a given call touches can't be known
+// statically; this resolves the field to the UNION of every literal
+// SHOUTING_SNAKE_CASE value ever assigned to it across the array's own
+// initializer instead — "touches ANY of these", not a precise per-call
+// answer (explicitly accepted trade-off — the alternative is the access not
+// appearing at all). ARRAY_FIELD_PERIPHS: arrayName -> Map(fieldName ->
+// Set(candidate names)); rebuilt fresh per buildLevel0() call, same as
+// MACRO_ALIASES right above.
+let ARRAY_FIELD_PERIPHS = new Map();
+// Same idea, one level simpler: a FLAT array (no struct/field involved) —
+// `static GPIO_TypeDef *const PORTS[] = { GPIOA, GPIOB };` — where `arr[i]`
+// alone (no trailing `.field`) names one of its own literal elements.
+// arrayName -> Set(candidate names).
+let ARRAY_ELEMENT_PERIPHS = new Map();
+// A struct field's own declarator name — `GPIO_TypeDef *port;` wraps its
+// `field_identifier` in a pointer_declarator, so this unwraps one layer the
+// same way findNameInDeclarator does for ordinary variable declarators
+// (which never see a field_identifier, hence its own separate helper here).
+function fieldIdentifierName(declarator) {
+  let d = declarator;
+  while (d) {
+    if (d.type === 'field_identifier') return d.text;
+    d = d.childForFieldName('declarator');
+  }
+  return null;
+}
+// Struct field order (`typedef struct { A; B; } Name;` -> ['a','b']),
+// needed to match a POSITIONAL array-of-struct initializer element
+// (`{ GPIOA, 9 }`, no `.port =`/`.pin =` designators) back to field names.
+function collectStructFieldOrders(root, out) {
+  walkTree(root, (n) => {
+    if (n.type !== 'type_definition') return;
+    const typeNode = n.childForFieldName('type');
+    const nameNode = n.childForFieldName('declarator');
+    if (!typeNode || typeNode.type !== 'struct_specifier' || !nameNode) return;
+    const body = typeNode.childForFieldName('body');
+    if (!body) return;
+    const fields = [];
+    for (const fd of body.namedChildren) {
+      if (fd.type !== 'field_declaration') continue;
+      for (const d of childrenForField(fd, 'declarator')) {
+        const fname = fieldIdentifierName(d);
+        if (fname) fields.push(fname);
+      }
+    }
+    if (fields.length) out.set(nameNode.text, fields);
+  });
+}
+// One file's global array-of-known-struct declarations, each field's
+// literal values collected into ARRAY_FIELD_PERIPHS (see its own doc
+// comment above) whenever they look like SHOUTING_SNAKE_CASE peripheral
+// names — every other kind of field value (numbers, expressions) is simply
+// never added, so a field like `.pin` (plain integers) never produces a
+// (harmless, just unused) entry at all.
+function collectArrayFieldPeripherals(root, structFields, out) {
+  walkTree(root, (n) => {
+    if (n.type !== 'declaration' || insideFunction(n)) return;
+    const typeNode = n.childForFieldName('type');
+    const fieldOrder = typeNode && structFields.get(typeNode.text);
+    if (!fieldOrder) return;
+    for (const d of childrenForField(n, 'declarator')) {
+      if (d.type !== 'init_declarator') continue;
+      const arrDecl = d.childForFieldName('declarator');
+      if (!arrDecl || arrDecl.type !== 'array_declarator') continue;
+      const arrName = findNameInDeclarator(arrDecl);
+      const initList = d.childForFieldName('value');
+      if (!arrName || !initList || initList.type !== 'initializer_list') continue;
+      let fieldMap = out.get(arrName);
+      if (!fieldMap) { fieldMap = new Map(); out.set(arrName, fieldMap); }
+      for (const elem of initList.namedChildren) {
+        // each element is either `[IDX] = {...}` (initializer_pair) or a
+        // bare `{...}` (plain positional array literal) — either way, what
+        // we actually want is the {...} itself.
+        const elemInit = elem.type === 'initializer_pair' ? elem.childForFieldName('value') : elem;
+        if (!elemInit || elemInit.type !== 'initializer_list') continue;
+        let pos = 0;
+        for (const item of elemInit.namedChildren) {
+          let fieldName, valueNode;
+          if (item.type === 'initializer_pair') {
+            const desig = item.childForFieldName('designator');
+            const fid = desig && desig.type === 'field_designator' ? desig.namedChildren[0] : null;
+            fieldName = fid && fid.text;
+            valueNode = item.childForFieldName('value');
+          } else {
+            fieldName = fieldOrder[pos];
+            valueNode = item;
+            pos++;
+          }
+          if (!fieldName || !valueNode) continue;
+          if (valueNode.type === 'identifier' && MACRO_CONST_RE.test(valueNode.text)) {
+            if (!fieldMap.has(fieldName)) fieldMap.set(fieldName, new Set());
+            fieldMap.get(fieldName).add(valueNode.text);
+          }
+        }
+      }
+    }
+  });
+}
+// Flat (no struct) global array literal — `T *const PORTS[] = { GPIOA,
+// GPIOB };` — feeds ARRAY_ELEMENT_PERIPHS (see its own doc comment). The
+// declarator can be wrapped in an extra pointer_declarator ahead of the
+// array_declarator (`T *const NAME[]` — the `*const` itself, not the array)
+// so this unwraps however many layers separate the two, unlike
+// collectArrayFieldPeripherals's array (always the OUTERMOST declarator
+// there, since a struct-typed array is never itself behind a pointer).
+function collectArrayElementPeripherals(root, out) {
+  walkTree(root, (n) => {
+    if (n.type !== 'declaration' || insideFunction(n)) return;
+    for (const d of childrenForField(n, 'declarator')) {
+      if (d.type !== 'init_declarator') continue;
+      let ad = d.childForFieldName('declarator');
+      while (ad && ad.type !== 'array_declarator') ad = ad.childForFieldName && ad.childForFieldName('declarator');
+      if (!ad || ad.type !== 'array_declarator') continue;
+      const arrName = findNameInDeclarator(d);
+      const initList = d.childForFieldName('value');
+      if (!arrName || !initList || initList.type !== 'initializer_list' || !initList.namedChildren.length) continue;
+      const items = initList.namedChildren;
+      if (!items.every((it) => it.type === 'identifier' && MACRO_CONST_RE.test(it.text))) continue;
+      out.set(arrName, new Set(items.map((it) => it.text)));
+    }
+  });
+}
+
+// General symbolic-reference resolver — "which peripheral(s) could this
+// expression evaluate to", by walking the SAME handful of primitives every
+// indirection idiom seen so far turned out to be built from: a bare name
+// (always its own answer, unless a known LOCAL resolution overrides it —
+// the historical base case: any non-local identifier used as `->`'s base is
+// assumed to name a peripheral, CMSIS's `((T*)BASE_ADDR)` convention, no
+// naming-convention filter), a struct-array field's own static initializer
+// (ARRAY_FIELD_PERIPHS), a flat array's own elements (ARRAY_ELEMENT_PERIPHS
+// or the CALLER's own locally-declared array, via `scope.localArrays`), or
+// a function call resolved through its own precomputed return-expression
+// summary (FUNC_RETURN_PERIPHS) — chased recursively instead of hand-
+// matching each shape's own exact AST pattern at its own call site (four
+// near-identical detectors before this, user report 2026-07-23: "программа
+// превращается в перебор конкретных паттернов... нет универсального
+// решения?"). Always returns a Set (possibly empty — "no candidates" for
+// anything genuinely computed, e.g. real pointer arithmetic, or a plain
+// unresolved local, rather than a wrong guess).
+// scope: { locals: Set(names) — this function's OWN local variables, never
+//   themselves a project-wide peripheral unless localVars below says so;
+//   localArrays: Map(name -> Set) — arrays declared INSIDE this function;
+//   localVars: Map(name -> Set) — locals already resolved via this same
+//   function, one assignment at a time, in declaration order (see
+//   analyzeFunction) }. Omit entirely (undefined) when resolving outside
+//   any function context (a global initializer, or a callee's own
+//   return-summary computation using only ITS OWN locals).
+function resolveSymbolicRef(node, scope) {
+  let n = node;
+  for (;;) {
+    if (n && n.type === 'parenthesized_expression') { n = n.namedChildren[0]; continue; }
+    if (n && n.type === 'cast_expression') { n = n.childForFieldName('value'); continue; }
+    break;
+  }
+  if (!n) return new Set();
+  if (n.type === 'identifier') {
+    const name = resolveMacroName(n.text);
+    if (scope && scope.localVars && scope.localVars.has(name)) return scope.localVars.get(name);
+    if (scope && scope.locals && scope.locals.has(name)) return new Set(); // genuine unresolved local, never a global periph guess
+    return new Set([name]);
+  }
+  if (n.type === 'field_expression') {
+    if (n.childForFieldName('operator')?.text !== '.') return new Set();
+    let base = n.childForFieldName('argument');
+    while (base && base.type === 'parenthesized_expression') base = base.namedChildren[0];
+    if (!base || base.type !== 'subscript_expression') return new Set();
+    let arrBase = base.childForFieldName('argument');
+    while (arrBase && arrBase.type === 'parenthesized_expression') arrBase = arrBase.namedChildren[0];
+    if (!arrBase || arrBase.type !== 'identifier') return new Set();
+    const field = n.childForFieldName('field')?.text;
+    const fieldMap = ARRAY_FIELD_PERIPHS.get(arrBase.text);
+    return (field && fieldMap && fieldMap.get(field)) || new Set();
+  }
+  if (n.type === 'subscript_expression') {
+    let arrBase = n.childForFieldName('argument');
+    while (arrBase && arrBase.type === 'parenthesized_expression') arrBase = arrBase.namedChildren[0];
+    if (!arrBase || arrBase.type !== 'identifier') return new Set();
+    return (scope && scope.localArrays && scope.localArrays.get(arrBase.text))
+      || ARRAY_ELEMENT_PERIPHS.get(arrBase.text) || new Set();
+  }
+  if (n.type === 'call_expression') {
+    const fnNode = n.childForFieldName('function');
+    if (!fnNode || fnNode.type !== 'identifier') return new Set();
+    return FUNC_RETURN_PERIPHS.get(fnNode.text) || new Set();
+  }
+  return new Set();
+}
+// A function's own local array literals (`T *const PORTS[] = {...};`
+// declared INSIDE it) — the scaffolding resolveSymbolicRef needs to resolve
+// a RETURN statement built on one, WITHOUT yet having that function's own
+// full analyzeFunction scope (this runs in the project-wide pre-pass,
+// before any function body is otherwise analyzed). Verbatim subset of what
+// analyzeFunction's own declaration walk builds for `localArrays` — kept
+// separate since this one only ever needs to look at ONE function in
+// isolation, never the whole project.
+function collectLocalArrayLiterals(body) {
+  const out = new Map();
+  walkTree(body, (n) => {
+    if (n.type !== 'declaration') return;
+    for (const d of childrenForField(n, 'declarator')) {
+      if (d.type !== 'init_declarator') continue;
+      const nm = findNameInDeclarator(d);
+      const value = d.childForFieldName('value');
+      if (!nm || !value || value.type !== 'initializer_list' || !value.namedChildren.length) continue;
+      const items = value.namedChildren;
+      if (!items.every((it) => it.type === 'identifier' && MACRO_CONST_RE.test(it.text))) continue;
+      out.set(nm, new Set(items.map((it) => it.text)));
+    }
+  });
+  return out;
+}
+// A "peripheral-resolving helper" — one more hop of indirection past
+// ARRAY_FIELD_PERIPHS/ARRAY_ELEMENT_PERIPHS: `static inline GPIO_TypeDef
+// *port_reg(uint8_t port) { static GPIO_TypeDef *const PORTS[] = { GPIOA,
+// GPIOB }; return PORTS[port]; }` wraps a PortId enum around the same
+// "which peripheral" question those tables only used to answer directly
+// (real project, seen after switching PinConfig's own `.port` field from a
+// raw GPIO_TypeDef* to a 1-byte PortId — 2026-07-23: "твоя правка не дала
+// результата... гпио не появился"). `port_reg(OUTPUT_PINS[i].port)->BSRR`
+// (or the equivalent through a local — see analyzeFunction's own
+// localPeriphVars) needs this resolved too. Driven by resolveSymbolicRef —
+// not limited to the exact `return ARR[x];` shape, since anything that
+// resolver can already chase (a direct `return GPIOA;`, `return
+// ARR[x].field;`, even a call to ANOTHER such helper) resolves through the
+// same recursive machinery. funcName -> Set(candidate names).
+let FUNC_RETURN_PERIPHS = new Map();
+function collectFuncReturnPeripherals(funcs, out) {
+  for (const fn of funcs) {
+    const body = fn.node.childForFieldName('body');
+    if (!body) continue;
+    const localArrays = collectLocalArrayLiterals(body);
+    if (!localArrays.size) continue;
+    const scope = { locals: new Set(), localArrays, localVars: new Map() };
+    let found = null;
+    walkTree(body, (n) => {
+      if (found || n.type !== 'return_statement') return;
+      const val = n.namedChildren[0];
+      if (!val) return;
+      const resolved = resolveSymbolicRef(val, scope);
+      if (resolved.size) found = resolved;
+    });
+    if (found) out.set(fn.name, found);
+  }
+}
 // Strips a DMA CPAR/CMAR assignment's right-hand side (or a local pointer's
 // own initializer — see resolveLocalAlias) down to the expression that
 // actually names the source/destination address — casts and parens first,
@@ -577,10 +932,11 @@ function resolveAddrExpr(node) {
       while (base && base.type === 'parenthesized_expression') base = base.namedChildren[0];
       if (!base || base.type !== 'identifier') return null;
       const field = n.childForFieldName('field')?.text;
-      return op === '->' ? { kind: 'periph', name: base.text, field } : { kind: 'var', name: base.text, field };
+      const baseName = resolveMacroName(base.text);
+      return op === '->' ? { kind: 'periph', name: baseName, field } : { kind: 'var', name: baseName, field };
     }
   }
-  if (n.type === 'identifier') return { kind: 'var', name: n.text };
+  if (n.type === 'identifier') return { kind: 'var', name: resolveMacroName(n.text) };
   return null;
 }
 // Follows resolveAddrExpr's result one step further when it turns out to
@@ -635,7 +991,19 @@ const dotEsc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').repla
 function dotNode(id, rows, shape, cls, extra = '') {
   return `  ${id} [id="${id}" class="${cls}" shape=${shape} label=<${rows.join('<BR/>')}>${extra}];`;
 }
-const dotKindRow = text => `<FONT POINT-SIZE="10">${dotEsc(text)}</FONT>`;
+// Module-level, not a parameter threaded through every node/row builder
+// below (dotKindRow, dotFnNode, dotVarNode, dotPeriphNode, ... are called
+// from deep inside assembleLevel0's node-building loops, several calls away
+// from renderDotAll's own fontSize option) — set once per buildLevel0() call
+// before any of them run. All the little "kind" (ISR/периферия/var) and
+// sub-detail (file, description, ISR flag list) rows carry their own fixed
+// <FONT POINT-SIZE> distinct from the main bold name, so scaling only the
+// graph-level node default (what renderDotAll's fontSize does) left them
+// exactly where they'd always been while the name grew around them — user
+// report 2026-07-23: "шрифты типа подписей... это всё не увеличивается".
+let FONT_SCALE = 1;
+const subPt = (basePt) => Math.round(basePt * FONT_SCALE);
+const dotKindRow = text => `<FONT POINT-SIZE="${subPt(11)}">${dotEsc(text)}</FONT>`;
 // ghost nodes need a dashed border restated in full, since a node's own
 // style= replaces the graph-level default rather than merging with it.
 const GHOST_STYLE = ' style="filled,dashed"';
@@ -658,14 +1026,14 @@ function isrFlagList(fn, cap = 6) {
 function dotFnNode(fn, { ghost = false, withFile = false, focus = false } = {}) {
   const kind = fn.isISR ? 'ISR' : fn.isEntry ? 'main' : 'func';
   const rows = [dotKindRow(kind), `<B>${dotEsc(fn.name)}</B>`];
-  if (withFile || ghost) rows.push(`<FONT POINT-SIZE="9">${dotEsc(fn.file)}</FONT>`);
-  if (fn.desc && !ghost) rows.push(`<FONT POINT-SIZE="9"><I>${dotEsc(truncate(fn.desc, 46))}</I></FONT>`);
+  if (withFile || ghost) rows.push(`<FONT POINT-SIZE="${subPt(10)}">${dotEsc(fn.file)}</FONT>`);
+  if (fn.desc && !ghost) rows.push(`<FONT POINT-SIZE="${subPt(10)}"><I>${dotEsc(truncate(fn.desc, 46))}</I></FONT>`);
   if (fn.isISR && !ghost) {
     const flags = isrFlagList(fn);
-    if (flags) rows.push(`<FONT POINT-SIZE="9">${dotEsc(flags)}</FONT>`);
+    if (flags) rows.push(`<FONT POINT-SIZE="${subPt(10)}">${dotEsc(flags)}</FONT>`);
   }
   const cls = ghost ? 'ghost' : fnClass(fn);
-  const extra = (ghost ? GHOST_STYLE : '') + (focus ? ' penwidth=3' : '');
+  const extra = (ghost ? GHOST_STYLE : '') + (focus ? ` penwidth=${(3 * FONT_SCALE).toFixed(1)}` : '');
   return dotNode(fnId(fn.key), rows, 'box', cls, extra);
 }
 
@@ -675,10 +1043,18 @@ function dotFnNode(fn, { ghost = false, withFile = false, focus = false } = {}) 
 const ENABLE_FLAG_RE = /(?:EN|ON|UE)$/;
 function isEnableFlagName(name) { return ENABLE_FLAG_RE.test(name); }
 // STM32 CMSIS bit-flag macros are <family>_<register>_<bit> — only the
-// leading family segment repeats info the diagram already carries elsewhere.
+// leading family segment repeats info the diagram already carries elsewhere,
+// so it strips cleanly (USART_CR1_TXEIE -> CR1_TXEIE). Project-specific pin
+// macros (FAN_PS, a "which pin" constant, not a CMSIS bit name) are only
+// <purpose>_<suffix> — stripping their one leading segment the same way
+// leaves a bare, contextless "PS" that could be any "_PS" pin in the whole
+// project (user report 2026-07-23, real project). Only strip when at least
+// two segments remain afterward, so a 2-segment name is left whole instead.
 function shortFlagName(flagName) {
   const idx = flagName.indexOf('_');
-  return idx === -1 ? flagName : flagName.slice(idx + 1);
+  if (idx === -1) return flagName;
+  const rest = flagName.slice(idx + 1);
+  return rest.includes('_') ? rest : flagName;
 }
 
 function dotVarNode(v, hotCut, { tiered = false, ghost = false, withFile = false, extraClass = '' } = {}) {
@@ -695,14 +1071,33 @@ function dotVarNode(v, hotCut, { tiered = false, ghost = false, withFile = false
   if (v.typeText) sub.push(dotEsc(v.typeText));
   if (v.isStatic) sub.push('static');
   if ((withFile || ghost) && v.file) sub.push(dotEsc(v.file));
-  if (sub.length) rows.push(`<FONT POINT-SIZE="9">${sub.join(' &#183; ')}</FONT>`);
+  if (sub.length) rows.push(`<FONT POINT-SIZE="${subPt(10)}">${sub.join(' &#183; ')}</FONT>`);
   return dotNode(varId(v.key), rows, 'cylinder', cls, ghost ? GHOST_STYLE : '');
 }
 
 function periphDirDetail(fields, flags, dir, cap = 6) {
   if (!fields || !fields.size) return { detail: '', hasEnable: false, enableLabel: '', readLabel: '' };
-  const regs = [...fields.entries()].filter(([, m]) => m.includes(dir)).map(([f]) => f).sort();
+  let regs = [...fields.entries()].filter(([, m]) => m.includes(dir)).map(([f]) => f).sort();
   if (!regs.length) return { detail: '', hasEnable: false, enableLabel: '', readLabel: '' };
+  // GPIOx's BSRR/BRR are STM32's standard atomic pin set/reset register
+  // pair — one bit name written via both (`X->BSRR = 1<<PIN` somewhere,
+  // `X->BRR = 1<<PIN` elsewhere) is exactly the same "arm/disarm"
+  // relationship one register's own |=/&=~ pair already gets a single
+  // ~clear/set line for — but split across two whole *registers* instead of
+  // one bit-op, it fell through as two separate lines with the identical
+  // bare bit name and no register shown to tell them apart, reading as a
+  // flat-out duplicate (user report 2026-07-23, real project: "B_GS, B_GS").
+  // Fold BRR's bits into BSRR's own (as 'clear' — BRR only ever resets) so
+  // the one shared per-register-loop below renders them on the SAME line,
+  // through the exact same notation.
+  if (dir === 'w' && regs.includes('BSRR') && regs.includes('BRR')) {
+    const merged = new Map((flags && flags.get('BSRR') && flags.get('BSRR').w) || []);
+    const brrBits = flags && flags.get('BRR') && flags.get('BRR').w;
+    if (brrBits) for (const fl of brrBits.keys()) mergeFlagPolarity(merged, fl, 'clear');
+    flags = new Map(flags); // shallow clone — never mutate the caller's own data
+    flags.set('BSRR', { r: new Set(), w: merged });
+    regs = regs.filter(r => r !== 'BRR');
+  }
   let hasEnable = false, enableLabel = '';
   const names = regs.map(reg => {
     const bits = flags && flags.get(reg) && flags.get(reg)[dir];
@@ -999,7 +1394,163 @@ function injectPeriphDetailLabels(svg, details) {
   }
   return growCanvasForLabels(svg, frame, extents);
 }
-function bendOneEdge(pathD, body) {
+
+// Every node's own (id -> {w,h}) footprint in an already-rendered svg —
+// shrinkNodesAndReconnectEdges's reference for "what size should this node
+// actually be".
+function parseNodeSizes(svg) {
+  const sizes = new Map();
+  const nodeRe = /<g id="([^"]+)" class="node[^"]*">([\s\S]*?)<\/g>/g;
+  let m;
+  while ((m = nodeRe.exec(svg))) {
+    const xs = [], ys = [];
+    for (const attrM of m[2].matchAll(/(?:points|d)="([^"]+)"/g)) {
+      for (const cm of attrM[1].matchAll(/(-?\d+\.?\d*),(-?\d+\.?\d*)/g)) {
+        xs.push(parseFloat(cm[1]));
+        ys.push(parseFloat(cm[2]));
+      }
+    }
+    if (!xs.length) continue;
+    sizes.set(m[1], { w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) });
+  }
+  return sizes;
+}
+
+// Draws every node's shape back down toward its size in `naturalSvg` — a
+// second render of the *same* graph at graphviz's own default margin — and
+// retracts the one endpoint of every edge touching a shrunk node to match.
+// The companion to build()'s oversized margin="X,Y": that margin exists
+// purely to give overlap-removal enough of a size difference to actually
+// separate two touching nodes (user report 2026-07-23), not because the
+// diagram is supposed to look like that.
+//
+// Shrinking to an exact per-node target (rather than subtracting a fixed
+// pt amount from every node alike) matters because graphviz doesn't inflate
+// every shape by the same amount for the same margin: a hexagon (periph)
+// or cylinder (var) needs proportionally more headroom than a box to
+// inscribe the same label once you account for their own shape geometry —
+// measured on a real project: margin="0.6,0.4" grew a box ×1.34 in width but
+// a hexagon ×1.58 and a cylinder ×1.72 (user report 2026-07-23: "только
+// фиолетовые блоки увеличиваются, прямоугольники как были"). A single
+// formula can't undo that; comparing each node against its own natural-size
+// twin can, exactly, however differently graphviz treats a shape.
+function shrinkNodesAndReconnectEdges(svg, naturalSvg, growthFactor = 1) {
+  const naturalSizes = parseNodeSizes(naturalSvg);
+
+  const nodeRe = /<g id="([^"]+)" class="node[^"]*">[\s\S]*?<\/g>/g;
+  const nodeBlocks = [];
+  let m;
+  while ((m = nodeRe.exec(svg))) nodeBlocks.push({ id: m[1], start: m.index, end: m.index + m[0].length, text: m[0] });
+
+  // one scale-toward-center transform per node that actually needs shrinking
+  // (never touches <text> — see below) — every edge endpoint touching that
+  // node reuses the exact same transform, so the edge's tip lands exactly
+  // where the shape's own new boundary ends up, not just close to it.
+  const xf = new Map(); // node id -> { cx, cy, sx, sy }
+  for (const nb of nodeBlocks) {
+    const natural = naturalSizes.get(nb.id);
+    if (!natural) continue; // wasn't in the reference render — leave alone
+    const xs = [], ys = [];
+    for (const attrM of nb.text.matchAll(/(?:points|d)="([^"]+)"/g)) {
+      for (const cm of attrM[1].matchAll(/(-?\d+\.?\d*),(-?\d+\.?\d*)/g)) {
+        xs.push(parseFloat(cm[1]));
+        ys.push(parseFloat(cm[2]));
+      }
+    }
+    if (!xs.length) continue;
+    const x1 = Math.min(...xs), x2 = Math.max(...xs), y1 = Math.min(...ys), y2 = Math.max(...ys);
+    const w = x2 - x1, h = y2 - y1;
+    if (w < 1 || h < 1) continue;
+    // never grow a node past its inflated (margin) size, whatever
+    // growthFactor asks for — "final size" is a user taste knob (see «Уровень
+    // 0»'s node-size control), not a license to reintroduce the overlap the
+    // oversized margin was there to avoid.
+    const sx = Math.min(1, (natural.w * growthFactor) / w);
+    const sy = Math.min(1, (natural.h * growthFactor) / h);
+    if (sx > 0.995 && sy > 0.995) continue;
+    xf.set(nb.id, { cx: (x1 + x2) / 2, cy: (y1 + y2) / 2, sx, sy });
+  }
+  if (!xf.size) return svg;
+  const apply = (t, px, py) => [t.cx + (px - t.cx) * t.sx, t.cy + (py - t.cy) * t.sy];
+
+  let out = svg;
+  // Shape only — never touch <text>. The label's own internal line spacing
+  // was never inflated by the outer margin in the first place (only the
+  // padding *around* the whole label block was), and it's already centered
+  // on this same (cx,cy); scaling it down on top of that over-compresses
+  // multi-line labels toward each other (user report 2026-07-23: node text
+  // "slipping together"). Shrinking only the outer shape, unmoved center,
+  // tightens it around the already-correctly-laid-out text for free.
+  for (let i = nodeBlocks.length - 1; i >= 0; i--) {
+    const nb = nodeBlocks[i];
+    const t = xf.get(nb.id);
+    if (!t) continue;
+    const shrunk = nb.text.replace(/((?:points|d)=")([^"]+)(")/g, (_, pre, coords, post) => {
+      const nc = coords.replace(/(-?\d+\.?\d*),(-?\d+\.?\d*)/g, (_2, px, py) => {
+        const [nx, ny] = apply(t, parseFloat(px), parseFloat(py));
+        return `${nx.toFixed(2)},${ny.toFixed(2)}`;
+      });
+      return pre + nc + post;
+    });
+    out = out.slice(0, nb.start) + shrunk + out.slice(nb.end);
+  }
+
+  // Retract the one endpoint of every edge touching a shrunk node (using
+  // that *same* node's transform, so the tip lands exactly on the shape's
+  // new boundary) — without this, edges still reach for the old, bigger
+  // boundary and hang visibly short of the now-smaller shape (user report
+  // 2026-07-23). Only the first/last coordinate pair moves, never the
+  // interior of the spline, so a long curved edge's overall route/shape is
+  // undisturbed — just its very tip.
+  const edgeRe = /<g id="[^"]*" class="edge[^"]*">[\s\S]*?<\/g>/g;
+  const edgeBlocks = [];
+  while ((m = edgeRe.exec(out))) edgeBlocks.push({ start: m.index, end: m.index + m[0].length, text: m[0] });
+  for (let i = edgeBlocks.length - 1; i >= 0; i--) {
+    const eb = edgeBlocks[i];
+    const titleM = eb.text.match(/<title>([^<]+)<\/title>/);
+    if (!titleM) continue;
+    const parts = titleM[1].split('&#45;&gt;');
+    if (parts.length !== 2) continue;
+    const tFrom = xf.get(parts[0]), tTo = xf.get(parts[1]);
+    if (!tFrom && !tTo) continue;
+    let text = eb.text.replace(/(<path\b[^>]*\bd=")([^"]+)(")/, (_, pre, d, post) => {
+      const coords = [...d.matchAll(/(-?\d+\.?\d*),(-?\d+\.?\d*)/g)];
+      if (!coords.length) return pre + d + post;
+      let nd = '', cursor = 0;
+      coords.forEach((cm, idx) => {
+        nd += d.slice(cursor, cm.index);
+        let px = parseFloat(cm[1]), py = parseFloat(cm[2]);
+        if (idx === 0 && tFrom) [px, py] = apply(tFrom, px, py);
+        else if (idx === coords.length - 1 && tTo) [px, py] = apply(tTo, px, py);
+        nd += `${px.toFixed(2)},${py.toFixed(2)}`;
+        cursor = cm.index + cm[0].length;
+      });
+      nd += d.slice(cursor);
+      return pre + nd + post;
+    });
+    // the arrowhead polygon always sits at the target end (every edge here
+    // is dir=forward — see dotEdge/dotDmaFlowEdge) — move with tTo, not tFrom.
+    if (tTo) {
+      text = text.replace(/(<polygon\b[^>]*\bpoints=")([^"]+)(")/, (_, pre, pts, post) => {
+        const npts = pts.trim().split(/\s+/).map((p) => {
+          const [px, py] = p.split(',').map(Number);
+          const [nx, ny] = apply(tTo, px, py);
+          return `${nx.toFixed(2)},${ny.toFixed(2)}`;
+        }).join(' ');
+        return pre + npts + post;
+      });
+    }
+    out = out.slice(0, eb.start) + text + out.slice(eb.end);
+  }
+
+  return out;
+}
+
+// Start/end/control point for bending pathD's straight(ish) endpoint-to-
+// endpoint line by `sign` (+1 or -1 — which of the two perpendicular sides
+// to bow toward). Split out of bendOneEdge so chooseBendSign (below) can
+// probe both candidate control points without touching any SVG text.
+function bendControlPoint(pathD, sign) {
   const nums = pathD.match(/-?\d+(?:\.\d+)?/g);
   if (!nums || nums.length < 4) return null;
   const x1 = parseFloat(nums[0]), y1 = parseFloat(nums[1]);
@@ -1007,14 +1558,20 @@ function bendOneEdge(pathD, body) {
   const dx = x2 - x1, dy = y2 - y1;
   const len = Math.hypot(dx, dy);
   if (len < 1) return null;
-  const bend = Math.min(18, len * 0.16);
-  const cx = (x1 + x2) / 2 + (-dy / len) * bend, cy = (y1 + y2) / 2 + (dx / len) * bend;
+  const bend = Math.min(18, len * 0.16) * sign;
+  return { x1, y1, x2, y2, cx: (x1 + x2) / 2 + (-dy / len) * bend, cy: (y1 + y2) / 2 + (dx / len) * bend };
+}
+
+function bendOneEdge(pathD, body, sign = 1) {
+  const pt = bendControlPoint(pathD, sign);
+  if (!pt) return null;
+  const { x1, y1, x2, y2, cx, cy } = pt;
   const newD = `M${x1.toFixed(2)},${y1.toFixed(2)} Q${cx.toFixed(2)},${cy.toFixed(2)} ${x2.toFixed(2)},${y2.toFixed(2)}`;
   let out = body.replace(/(<path\b[^>]*\bd=")([^"]+)(")/, (_, pre, _old, post) => pre + newD + post);
 
   const polyM = out.match(/<polygon\b[^>]*\bpoints="([^"]+)"[^>]*\/>/);
   if (polyM) {
-    const rot = Math.atan2(y2 - cy, x2 - cx) - Math.atan2(dy, dx);
+    const rot = Math.atan2(y2 - cy, x2 - cx) - Math.atan2(y2 - y1, x2 - x1);
     const cos = Math.cos(rot), sin = Math.sin(rot);
     const pts = polyM[1].trim().split(/\s+/).map(p => {
       const [px, py] = p.split(',').map(Number);
@@ -1039,8 +1596,100 @@ function stripXmlProlog(svg) {
   return at > 0 ? svg.slice(at) : svg;
 }
 
+// Every graph node's bounding box, keyed by its own id — the obstacle set
+// chooseBendSign checks a candidate bend against. Reads every coordinate out
+// of each node's own points="…"/d="…" attributes (covers box/hexagon's
+// <polygon> and cylinder's <path> alike — level0/relations diagrams never
+// draw a node as <ellipse>, unlike the CFG ribbon), so it doesn't need to
+// know each shape's own geometry rules.
+function parseNodeBBoxes(svg) {
+  const boxes = new Map();
+  const nodeRe = /<g id="([^"]+)" class="node[^"]*">([\s\S]*?)<\/g>/g;
+  let m;
+  while ((m = nodeRe.exec(svg))) {
+    const xs = [], ys = [];
+    for (const attrM of m[2].matchAll(/(?:points|d)="([^"]+)"/g)) {
+      for (const cm of attrM[1].matchAll(/(-?\d+\.?\d*),(-?\d+\.?\d*)/g)) {
+        xs.push(parseFloat(cm[1]));
+        ys.push(parseFloat(cm[2]));
+      }
+    }
+    if (!xs.length) continue;
+    boxes.set(m[1], { x1: Math.min(...xs), x2: Math.max(...xs), y1: Math.min(...ys), y2: Math.max(...ys) });
+  }
+  return boxes;
+}
+// 0 when (px,py) is inside/on box, else the distance out to its nearest edge.
+function distToBox(px, py, box) {
+  const dx = Math.max(box.x1 - px, 0, px - box.x2);
+  const dy = Math.max(box.y1 - py, 0, py - box.y2);
+  return Math.hypot(dx, dy);
+}
+
+// Anti-parallel edges (both directions between the same two nodes, e.g. a
+// peripheral's register read edge and write edge) are meant to bow to
+// *opposite* sides of the line joining the two nodes, giving a non-crossing
+// "eye" shape. bendControlPoint's ±sign flips which side a SINGLE edge's own
+// chord bows to — but the two directions' chords aren't exact mirror images
+// of each other: each end attaches at a different point on its node's
+// boundary (very visible on a hub node like `dot`'s "Связи" focus, which can
+// have dozens of edges fanning out to distinct ports), so their (dx,dy)
+// directions differ. Applying the *same* literal sign to both edges' own
+// (differently-angled) formulas does not reliably land them on opposite
+// sides of the line joining the two NODES (their centers) — verified on real
+// project data (f_main<->v_VI_Mr) that the old shared-sign choice put both
+// control points on the same side, producing the inward-crossing bow the
+// user reported (2026-07-23) as present only in "Связи", not "Уровень 0"
+// (whose neato-laid-out nodes have low enough degree that this port-
+// divergence rarely bites). The reference line MUST be the node-center line,
+// not either edge's own endpoint-to-endpoint chord: a hub node's two
+// directed edges attach at different boundary ports, so eBA's endpoints can
+// sit entirely to one side of eAB's own chord regardless of bend sign —
+// tried that first and it degenerated back to the old same-side bug. Fixed
+// by trying all 4 sign combinations, keeping only those where the two
+// resulting control points fall on opposite sides of the node-center line,
+// then using clearance-from-other-nodes to pick among the survivors.
+function chooseBendSign(from, to, edgesByKey, nodeBoxes) {
+  const eAB = edgesByKey.get(`${from}>${to}`);
+  const eBA = edgesByKey.get(`${to}>${from}`);
+  if (!eAB || !eBA) return { signAB: 1, signBA: 1 };
+  const boxA = nodeBoxes.get(from), boxB = nodeBoxes.get(to);
+  let rx1, ry1, rx2, ry2;
+  if (boxA && boxB) {
+    rx1 = (boxA.x1 + boxA.x2) / 2; ry1 = (boxA.y1 + boxA.y2) / 2;
+    rx2 = (boxB.x1 + boxB.x2) / 2; ry2 = (boxB.y1 + boxB.y2) / 2;
+  } else {
+    const refP = bendControlPoint(eAB.pathD, 1);
+    if (!refP) return { signAB: 1, signBA: 1 };
+    ({ x1: rx1, y1: ry1, x2: rx2, y2: ry2 } = refP);
+  }
+  const side = (p) => (rx2 - rx1) * (p.cy - ry1) - (ry2 - ry1) * (p.cx - rx1);
+  const others = [...nodeBoxes.entries()].filter(([id]) => id !== from && id !== to).map(([, box]) => box);
+
+  let best = { signAB: 1, signBA: 1 }, bestClearance = -Infinity, foundOpposite = false;
+  for (const signAB of [1, -1]) {
+    const cAB = bendControlPoint(eAB.pathD, signAB);
+    if (!cAB) continue;
+    const sAB = side(cAB);
+    for (const signBA of [1, -1]) {
+      const cBA = bendControlPoint(eBA.pathD, signBA);
+      if (!cBA) continue;
+      const sBA = side(cBA);
+      const opposite = (sAB >= 0) !== (sBA >= 0);
+      if (foundOpposite && !opposite) continue; // once we have an opposite-sides candidate, only compete among those
+      let clearance = others.length ? Infinity : 0;
+      for (const box of others) {
+        clearance = Math.min(clearance, distToBox(cAB.cx, cAB.cy, box), distToBox(cBA.cx, cBA.cy, box));
+      }
+      if (opposite && !foundOpposite) { foundOpposite = true; bestClearance = -Infinity; }
+      if (clearance > bestClearance) { bestClearance = clearance; best = { signAB, signBA }; }
+    }
+  }
+  return best;
+}
+
 function bendAntiParallelEdges(svg) {
-  const groupRe = /<g id="[^"]*" class="edge">[\s\S]*?<\/g>/g;
+  const groupRe = /<g id="[^"]*" class="edge[^"]*">[\s\S]*?<\/g>/g;
   const found = [];
   let m;
   while ((m = groupRe.exec(svg))) {
@@ -1053,11 +1702,24 @@ function bendAntiParallelEdges(svg) {
     found.push({ start: m.index, end: m.index + body.length, body, from: parts[0], to: parts[1], pathD: pathM[1] });
   }
   const pairKeys = new Set(found.map(e => `${e.from}>${e.to}`));
+  const pairEdges = found.filter(e => pairKeys.has(`${e.to}>${e.from}`));
+  if (!pairEdges.length) return svg;
+
+  const edgesByKey = new Map(pairEdges.map(e => [`${e.from}>${e.to}`, e]));
+  const nodeBoxes = parseNodeBBoxes(svg);
+  const pairChoice = new Map(); // "A|B" (a<b) -> { signAB, signBA }, AB meaning a->b
+  function signFor(a, b) {
+    const lo = a < b ? a : b, hi = a < b ? b : a;
+    const key = lo + '|' + hi;
+    if (!pairChoice.has(key)) pairChoice.set(key, chooseBendSign(lo, hi, edgesByKey, nodeBoxes));
+    const choice = pairChoice.get(key);
+    return a === lo ? choice.signAB : choice.signBA;
+  }
+
   let out = svg;
-  for (let i = found.length - 1; i >= 0; i--) {
-    const e = found[i];
-    if (!pairKeys.has(`${e.to}>${e.from}`)) continue;
-    const bent = bendOneEdge(e.pathD, e.body);
+  for (let i = pairEdges.length - 1; i >= 0; i--) {
+    const e = pairEdges[i];
+    const bent = bendOneEdge(e.pathD, e.body, signFor(e.from, e.to));
     if (!bent) continue;
     out = out.slice(0, e.start) + bent + out.slice(e.end);
   }
@@ -1096,14 +1758,30 @@ function sizeTier(n, allSizes) {
 
 const LEVEL0_ENGINES = ['neato'];
 
-async function renderDotAll(coreNodeLines, coreEdgeLines, varNodeLines = [], varEdgeLines = [], { rankdir = 'LR' } = {}) {
+async function renderDotAll(coreNodeLines, coreEdgeLines, varNodeLines = [], varEdgeLines = [],
+  { rankdir = 'LR', marginNeato = '0.6,0.4', nodeScale = 1.3, fontSize = null } = {}) {
   const graphviz = getGraphviz();
   const svgs = {};
   const hasVars = varNodeLines.length > 0;
-  const build = (nodeLines, edgeLines, engine) => {
+  // fontSize overrides the main (bold name) label's graph-level default —
+  // the smaller "kind"/register-detail/ISR-flag rows carry their own
+  // explicit <FONT POINT-SIZE>, scaled by the *module-level* FONT_SCALE
+  // (see subPt) instead, since dotFnNode/dotVarNode/dotPeriphNode build
+  // those long before this function (and its own fontSize option) ever
+  // runs — buildLevel0Diagram sets FONT_SCALE from this same value before
+  // any of them are called.
+  const fontAttr = fontSize ? `, fontsize=${fontSize}` : '';
+  // Outline/stroke weight rides the same knob as node size — CSS's own
+  // hover/hot-variant stroke-width overrides (main.css/level0.css) still win
+  // cleanly on top of this, they're just no longer starting from a
+  // razor-thin base once the whole diagram is bigger (user request
+  // 2026-07-23: "толщину всех обводок стрелок тоже сделай с масштабом").
+  const penwidth = (nodeScale || 1).toFixed(2);
+  const build = (nodeLines, edgeLines, engine, margin) => {
     const engineAttrs = engine === 'dot'
       ? `rankdir=${rankdir}, ranksep=0.6`
       : 'overlap=false, splines=true, sep="+12"';
+    const marginAttr = margin ? `, margin="${margin}"` : '';
     return ['digraph G {',
       // transparent, not white: graphviz otherwise paints an opaque
       // background polygon covering the whole canvas — reads as a stray
@@ -1111,15 +1789,33 @@ async function renderDotAll(coreNodeLines, coreEdgeLines, varNodeLines = [], var
       // cfg-analyzer.mjs's cfgToSvg already applies). Node fill colors are
       // still styled by CSS class (see media/level0.css), independent of this.
       `  graph [fontname="Segoe UI, Helvetica, sans-serif", nodesep=0.35, bgcolor=transparent, ${engineAttrs}];`,
-      '  node [fontname="Segoe UI, Helvetica, sans-serif", style=filled, fillcolor=white];',
-      '  edge [fontname="Segoe UI, Helvetica, sans-serif", fontsize=10];',
+      `  node [fontname="Segoe UI, Helvetica, sans-serif", style=filled, fillcolor=white, penwidth=${penwidth}${marginAttr}${fontAttr}];`,
+      `  edge [fontname="Segoe UI, Helvetica, sans-serif", fontsize=${subPt(11)}, penwidth=${penwidth}];`,
       ...nodeLines, ...edgeLines, '}'].join('\n');
   };
+  // A big margin is a *layout* lever, not a visual one — shrinkNodesAndRecon-
+  // nectEdges draws the actual shapes back down toward their size in a
+  // *second*, default-margin render of the very same graph afterward (see
+  // that function's own comment for why an exact per-node reference beats a
+  // one-size-fits-all shrink formula), then grows that back out by
+  // `nodeScale` — «Уровень 0»'s node-size control (user request 2026-07-23:
+  // shrinking all the way down to the bare label-fit size left nodes looking
+  // small against how far apart overlap-removal had just spread them out).
+  // `sep` is ignored outright by this build's neato (verified: identical
+  // 0-gap layout across a wide range of values); a *small* margin barely
+  // moved node centers at all, but this large one gives overlap-removal
+  // enough of a size difference to actually separate two touching nodes —
+  // confirmed live on a real project, non-monotonically: 0.16 and 0.3
+  // changed nothing, 0.6 did.
   for (const engine of LEVEL0_ENGINES) {
-    svgs[engine] = graphviz.layout(
-      build([...coreNodeLines, ...varNodeLines], [...coreEdgeLines, ...varEdgeLines], engine), 'svg', engine);
+    const bigNodes = [...coreNodeLines, ...varNodeLines], bigEdges = [...coreEdgeLines, ...varEdgeLines];
+    svgs[engine] = shrinkNodesAndReconnectEdges(
+      graphviz.layout(build(bigNodes, bigEdges, engine, marginNeato), 'svg', engine),
+      graphviz.layout(build(bigNodes, bigEdges, engine, null), 'svg', engine), nodeScale);
     if (hasVars) {
-      svgs[engine + '_novars'] = graphviz.layout(build(coreNodeLines, coreEdgeLines, engine), 'svg', engine);
+      svgs[engine + '_novars'] = shrinkNodesAndReconnectEdges(
+        graphviz.layout(build(coreNodeLines, coreEdgeLines, engine, marginNeato), 'svg', engine),
+        graphviz.layout(build(coreNodeLines, coreEdgeLines, engine, null), 'svg', engine), nodeScale);
     }
   }
   return { svgs, hasVars };
@@ -1593,13 +2289,19 @@ function mergeFilteredInfo(entries, allowedPeriphs, allowedVars, ...infos) {
   return { varInfo, periphInfo, periphFieldInfo, periphFlagInfo, periphAddrRefInfo, armInfo };
 }
 
-async function buildLevel0Diagram(funcs, varDefs, peripherals, hotCut) {
+async function buildLevel0Diagram(funcs, varDefs, peripherals, hotCut, renderOpts) {
   const entries = [...funcs.values()].filter(f => f.isEntry || f.isISR);
   if (entries.length === 0) return null;
 
+  // Must be set before assembleLevel0 below — it's what dotFnNode/dotVarNode/
+  // dotPeriphNode's own subPt() calls (building each node's "kind"/register-
+  // detail/ISR-flag rows) read, and they run inside assembleLevel0, well
+  // before renderDotAll ever sees renderOpts.fontSize itself.
+  FONT_SCALE = renderOpts && renderOpts.fontSize ? renderOpts.fontSize / 14 : 1;
+
   const allInfo = aggregateEntryInfo(funcs, entries, e => [...e.calls]);
   const all = assembleLevel0(varDefs, peripherals, hotCut, entries, allInfo, 'a');
-  const { svgs: rawSvgs, hasVars } = await renderDotAll(all.nodeLines, all.edgeLines, all.varNodeLines, all.varEdgeLines);
+  const { svgs: rawSvgs, hasVars } = await renderDotAll(all.nodeLines, all.edgeLines, all.varNodeLines, all.varEdgeLines, renderOpts);
   const svgs = {};
   for (const [k, v] of Object.entries(rawSvgs)) {
     svgs[k] = stripXmlProlog(injectPeriphDetailLabels(bendAntiParallelEdges(v), all.edgeDetails));
@@ -1649,7 +2351,7 @@ async function buildLevel0Diagram(funcs, varDefs, peripherals, hotCut) {
 
   async function renderVariant(info, idPrefix, suffix, includeDma = false) {
     const v = assembleLevel0(varDefs, peripherals, hotCut, entries, info, idPrefix, includeDma, includeDma ? dmaFacts : null);
-    const r = await renderDotAll(v.nodeLines, v.edgeLines, v.varNodeLines, v.varEdgeLines);
+    const r = await renderDotAll(v.nodeLines, v.edgeLines, v.varNodeLines, v.varEdgeLines, renderOpts);
     for (const [k, val] of Object.entries(r.svgs)) {
       svgs[withVariantSuffix(k, suffix)] = stripXmlProlog(injectPeriphDetailLabels(bendAntiParallelEdges(val), v.edgeDetails));
     }
@@ -1688,18 +2390,50 @@ async function buildLevel0Diagram(funcs, varDefs, peripherals, hotCut) {
 // diagram + a flat node-info lookup table for hover tooltips.
 // ---------------------------------------------------------------------------
 
-export async function buildLevel0({ files }) {
-  // --- Pass 1: parse every file -------------------------------------------
-  const fileRecords = [];
+export async function buildLevel0({ files, nodeScale, fontSize }) {
+  // --- Pass 1: parse every file, collect #define aliases project-wide ----
+  // Two sub-passes over the same already-parsed trees (not two parses):
+  // analyzeFunction (below) needs MACRO_ALIASES fully built BEFORE it reads
+  // a single peripheral/var name off any function body, but a `#define` an
+  // alias resolves through can live in any OTHER file (a header, typically
+  // — see resolveMacroName's own doc comment) — so every file's defines
+  // must be collected before any file's functions are analyzed.
+  const parsed = [];
+  const rawAliases = new Map();
   for (const file of files) {
-    const src = file.text;
     let tree;
     try {
-      tree = parseC(src);
+      tree = parseC(file.text);
     } catch (e) {
       continue; // unparsable file — skip, matching the CLI's console.error+continue
     }
     const root = tree.rootNode;
+    collectMacroAliases(root, rawAliases);
+    parsed.push({ file, root });
+  }
+  MACRO_ALIASES = resolveMacroChains(rawAliases);
+
+  // Struct field orders come first (a config-table array's own struct type
+  // is typically declared in a different file than the array itself, same
+  // header/source split as macro aliases above), then array-field
+  // peripherals against the now-complete struct map — see
+  // ARRAY_FIELD_PERIPHS's own doc comment.
+  const structFields = new Map();
+  for (const { root } of parsed) collectStructFieldOrders(root, structFields);
+  ARRAY_FIELD_PERIPHS = new Map();
+  for (const { root } of parsed) collectArrayFieldPeripherals(root, structFields, ARRAY_FIELD_PERIPHS);
+  ARRAY_ELEMENT_PERIPHS = new Map();
+  for (const { root } of parsed) collectArrayElementPeripherals(root, ARRAY_ELEMENT_PERIPHS);
+  // Independent of the maps above (needs only each file's own functions),
+  // but same timing requirement — a helper can be defined in one file and
+  // called from another, so every file's helpers must be known before any
+  // file's functions are analyzed. See FUNC_RETURN_PERIPHS's own doc comment.
+  FUNC_RETURN_PERIPHS = new Map();
+  for (const { root } of parsed) collectFuncReturnPeripherals(extractFunctions(root), FUNC_RETURN_PERIPHS);
+
+  const fileRecords = [];
+  for (const { file, root } of parsed) {
+    const src = file.text;
     const basename = path.basename(file.filePath);
     const commentIdx = buildCommentIndex(root, src.split('\n'));
     const vars = extractFileScopeVars(root, commentIdx);
@@ -2093,7 +2827,7 @@ export async function buildLevel0({ files }) {
     : Infinity;
 
   // --- Build the diagram ---------------------------------------------------
-  const level0 = await buildLevel0Diagram(funcs, varDefs, peripherals, hotCut);
+  const level0 = await buildLevel0Diagram(funcs, varDefs, peripherals, hotCut, { nodeScale, fontSize });
   if (!level0) return null;
 
   // Every variable a DMA channel writes/reads via its CMAR/CPAR wiring
@@ -2302,8 +3036,8 @@ const RELKIND = { isr: 'ISR', entry: 'main', fn: 'func' };
 
 function relFnNodeLine(id, info, sameFile) {
   const rows = [dotKindRow(RELKIND[info.kind] || 'func'), `<B>${dotEsc(info.label)}</B>`];
-  if (info.file && !sameFile) rows.push(`<FONT POINT-SIZE="9">${dotEsc(info.file)}</FONT>`);
-  if (info.desc) rows.push(`<FONT POINT-SIZE="9"><I>${dotEsc(relTrunc(info.desc, 46))}</I></FONT>`);
+  if (info.file && !sameFile) rows.push(`<FONT POINT-SIZE="${subPt(10)}">${dotEsc(info.file)}</FONT>`);
+  if (info.desc) rows.push(`<FONT POINT-SIZE="${subPt(10)}"><I>${dotEsc(relTrunc(info.desc, 46))}</I></FONT>`);
   return dotNode(id, rows, 'box', info.kind);
 }
 function relVarNodeLine(id, info, sameFile) {
@@ -2316,7 +3050,7 @@ function relVarNodeLine(id, info, sameFile) {
   if (info.type) sub.push(dotEsc(info.type));
   if (info.static) sub.push('static');
   if (info.file && !sameFile) sub.push(dotEsc(info.file));
-  if (sub.length) rows.push(`<FONT POINT-SIZE="9">${sub.join(' &#183; ')}</FONT>`);
+  if (sub.length) rows.push(`<FONT POINT-SIZE="${subPt(10)}">${sub.join(' &#183; ')}</FONT>`);
   return dotNode(id, rows, 'cylinder', cls);
 }
 // peripheral block on a function's "Связи" diagram — kept compact (just the
@@ -2332,14 +3066,27 @@ const REL_ENABLE_FLAG_RE = /(?:EN|ON|UE)$/;
 function relIsEnableFlagName(name) { return REL_ENABLE_FLAG_RE.test(name); }
 function relShortFlagName(flagName) {
   const idx = flagName.indexOf('_');
-  return idx === -1 ? flagName : flagName.slice(idx + 1);
+  if (idx === -1) return flagName;
+  const rest = flagName.slice(idx + 1);
+  return rest.includes('_') ? rest : flagName;
 }
 // one direction's full register/bit breakdown, revealed on hover via
 // injectPeriphDetailLabels — mirrors periphDirDetail (level-0's own version)
 // against this function's `regs` array instead of a fields/flags Map pair.
 function relPeriphDirDetail(regs, dir, cap = 6) {
-  const relevant = regs.filter(r => r.mode.includes(dir));
+  let relevant = regs.filter(r => r.mode.includes(dir));
   if (!relevant.length) return { detail: '', hasEnable: false, enableLabel: '', readLabel: '' };
+  // BSRR/BRR merge — see periphDirDetail's own comment (level0's version).
+  if (dir === 'w') {
+    const bsrr = relevant.find(r => r.reg === 'BSRR');
+    const brr = relevant.find(r => r.reg === 'BRR');
+    if (bsrr && brr) {
+      const merged = new Map(bsrr.wFlags || []);
+      for (const [fl] of (brr.wFlags || [])) mergeFlagPolarity(merged, fl, 'clear');
+      relevant = relevant.filter(r => r.reg !== 'BRR' && r.reg !== 'BSRR');
+      relevant.push({ ...bsrr, wFlags: [...merged] });
+    }
+  }
   let hasEnable = false, enableLabel = '';
   const sorted = [...relevant].sort((a, b) => a.reg.localeCompare(b.reg));
   const names = sorted.map(r => {
@@ -2654,6 +3401,9 @@ function buildRelationsDot(G, { focusId, upPath, downPath, showVars, prevOrder }
 // stays stable across clicks; pass null/undefined on the very first render.
 export async function renderRelations({ G, focusId, upPath = [], downPath = [], showVars = true, prevOrder = null }) {
   if (!G[focusId]) throw new Error('renderRelations: unknown focusId');
+  // «Связи» has no size control of its own — always the untouched default,
+  // whatever «Уровень 0» last left FONT_SCALE at (see buildLevel0Diagram).
+  FONT_SCALE = 1;
   const { nodeLines, edgeLines, orderLines, fullColor, depthOf, edgeDetails, newOrder, seenNodes } =
     buildRelationsDot(G, { focusId, upPath, downPath, showVars, prevOrder });
   const dotText = [
