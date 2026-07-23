@@ -18,6 +18,11 @@
   // text-editor selection) — reapplied after every renderAll (edits
   // re-analyze the file and rebuild `blocks` from scratch).
   let lastSymbolName = null;
+  // Variable names a DMA channel writes/reads directly (extension.js's
+  // 'dmaVars', sourced from the whole-project index) — reapplied after every
+  // renderAll for the same reason lastSymbolName is: a fresh analysis
+  // rebuilds every .cg-var-token from scratch.
+  let dmaVarNames = new Set();
 
   const KIND_NOTE = {
     trivial: 'тривиальный алгоритм',
@@ -71,12 +76,100 @@
     }
   }
 
+  // --- hover-to-path highlighting --------------------------------------------
+  // Hovering a CFG node for HOVER_PATH_DELAY_MS dims everything except the
+  // branch(es) that can actually reach it — tracing "how do we get here" in a
+  // busy diagram otherwise means eyeballing arrows by hand (user request
+  // 2026-07-22). Own class triple (path-dim/path-hl/path-hover), independent
+  // of .dim/.hl (locate) and .sym-dim/.sym-hl (symbol selection) so the three
+  // dimming mechanisms don't fight over the same classes.
+  const HOVER_PATH_DELAY_MS = 2000;
+  let hoverTimer = null;
+  let hoverTimerNodeId = null;  // node the pending timer belongs to
+  let hoverPathBlock = null;    // block currently showing a hover-path highlight
+  let hoverPathNodeId = null;   // node currently anchoring that highlight
+
+  function clearHoverPath() {
+    if (!hoverPathBlock) return;
+    const svg = hoverPathBlock.body.querySelector('svg');
+    if (svg) svg.classList.remove('path-dim');
+    for (const el of hoverPathBlock.nodeEls.values()) el.classList.remove('path-hl', 'path-hover');
+    for (const el of hoverPathBlock.edgeEls.values()) el.classList.remove('path-hl');
+    hoverPathBlock = null;
+    hoverPathNodeId = null;
+  }
+
+  // Every node with a directed path to nodeId — reverse BFS over
+  // block.predecessors (built from the CFG's real edges, so it naturally
+  // follows however many branches actually converge here, loops included).
+  function showHoverPath(block, nodeId) {
+    const svg = block.body.querySelector('svg');
+    if (!svg) return;
+    const ancestors = new Set([nodeId]);
+    const queue = [nodeId];
+    while (queue.length) {
+      const cur = queue.pop();
+      const preds = block.predecessors.get(cur);
+      if (!preds) continue;
+      for (const p of preds) {
+        if (ancestors.has(p)) continue;
+        ancestors.add(p);
+        queue.push(p);
+      }
+    }
+    for (const [id, el] of block.nodeEls) if (ancestors.has(id)) el.classList.add('path-hl');
+    const hoverEl = block.nodeEls.get(nodeId);
+    if (hoverEl) hoverEl.classList.add('path-hover');
+    for (const e of block.edgeList) {
+      if (!ancestors.has(e.from) || !ancestors.has(e.to)) continue;
+      const el = block.edgeEls.get(e.id);
+      if (el) el.classList.add('path-hl');
+    }
+    svg.classList.add('path-dim');
+    hoverPathBlock = block;
+    hoverPathNodeId = nodeId;
+  }
+
+  // mouseenter always clears whatever was showing/pending first, so a leave
+  // firing late (after the pointer already entered a different node) never
+  // cancels that other node's fresh state — only a leave that belongs to the
+  // node currently "owning" the timer/display acts.
+  function wireHoverPath(g, block, nodeId) {
+    g.addEventListener('mouseenter', () => {
+      clearTimeout(hoverTimer);
+      clearHoverPath();
+      hoverTimerNodeId = nodeId;
+      hoverTimer = setTimeout(() => {
+        hoverTimer = null;
+        hoverTimerNodeId = null;
+        showHoverPath(block, nodeId);
+      }, HOVER_PATH_DELAY_MS);
+    });
+    g.addEventListener('mouseleave', () => {
+      if (hoverTimerNodeId === nodeId) {
+        clearTimeout(hoverTimer);
+        hoverTimer = null;
+        hoverTimerNodeId = null;
+      }
+      if (hoverPathNodeId === nodeId) clearHoverPath();
+    });
+  }
+
   // --- build the ribbon -----------------------------------------------------
   function renderAll(functions) {
     status.style.display = 'none';
     viewport.style.display = 'block';
     inner.innerHTML = '';
     blocks = [];
+    // inner.innerHTML='' above already destroyed any DOM the hover-path
+    // machinery was pointing at (or about to fire a pending timer against) —
+    // drop the stale references so a leftover timeout can't reach into a
+    // detached svg after re-analysis rebuilds the ribbon.
+    clearTimeout(hoverTimer);
+    hoverTimer = null;
+    hoverTimerNodeId = null;
+    hoverPathBlock = null;
+    hoverPathNodeId = null;
 
     for (const fn of functions) {
       const el = document.createElement('div');
@@ -116,6 +209,9 @@
       const nodeEls = new Map();
       const nodeRange = new Map();
       const nodeMeta = new Map(); // id -> { vars: Set, calls: Set } for symbol highlighting
+      const edgeEls = new Map();  // edge id -> its <g class="edge"> element
+      const predecessors = new Map(); // node id -> Set(node id that has an edge into it)
+      const edgeList = fn.edges || [];
       if (fn.kind === 'cfg') {
         for (const n of fn.nodeLines) {
           const g = body.querySelector(`g.node[id="${n.id}"]`);
@@ -124,10 +220,29 @@
           nodeMeta.set(n.id, { vars: new Set(n.vars || []), calls: new Set(n.calls || []) });
           if (g) tokenizeNodeText(g, n.vars, n.calls);
         }
+        for (const e of edgeList) {
+          const g = body.querySelector(`g.edge[id="${e.id}"]`);
+          if (g) edgeEls.set(e.id, g);
+          if (!predecessors.has(e.to)) predecessors.set(e.to, new Set());
+          predecessors.get(e.to).add(e.from);
+        }
       }
-      blocks.push({ el, head, body, funcRange: fn.funcRange, kind: fn.kind, nodeEls, nodeRange, nodeMeta });
+      const block = { el, head, body, funcRange: fn.funcRange, kind: fn.kind, nodeEls, nodeRange, nodeMeta, edgeEls, edgeList, predecessors };
+      for (const [id, g] of nodeEls) wireHoverPath(g, block, id);
+      blocks.push(block);
     }
     applySymbolHighlight(lastSymbolName);
+    applyDmaTagging();
+  }
+
+  // Marks every call/var token whose name is a known DMA target (see
+  // dmaVarNames above) so main.css can color it purple, same as the
+  // periph/DMA blocks in «Уровень 0»/«Связи» — purely a class toggle over
+  // whatever tokenizeNodeText already produced, no re-render involved.
+  function applyDmaTagging() {
+    for (const tok of inner.querySelectorAll('.cg-var-token')) {
+      tok.classList.toggle('dma-target', dmaVarNames.has(tok.dataset.varName));
+    }
   }
 
   // Selecting a variable/function name in the editor (extension.js) dims
@@ -189,7 +304,7 @@
   // shading stays instant regardless of that scan's latency. Hidden right
   // away on every new selection so it never shows a stale variable's list
   // while the fresh one is still loading.
-  const MODE_LABEL = { r: 'чтение', w: 'запись', rw: 'чтение/запись' };
+  const MODE_LABEL = { r: 'чтение', w: 'запись', rw: 'чтение/запись', decl: 'объявление', call: 'вызов' };
 
   function hideOtherPlaces() {
     otherPlacesEl.style.display = 'none';
@@ -317,6 +432,9 @@
       // empty result there just stays quiet instead of popping up a panel.
       if (msg.explicit || (msg.places && msg.places.length)) showOtherPlaces(msg.name, msg.places || []);
       else hideOtherPlaces();
+    } else if (msg.type === 'dmaVars') {
+      dmaVarNames = new Set(msg.names || []);
+      applyDmaTagging();
     }
   });
 

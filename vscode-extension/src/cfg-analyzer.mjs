@@ -25,8 +25,79 @@ function walkTree(node, cb) {
   for (const child of node.children) walkTree(child, cb);
 }
 
-const CFG_SHAPE = { term: 'ellipse', ret: 'ellipse', cond: 'diamond', loop: 'diamond', call: 'box', jump: 'ellipse' };
-const CFG_CLASS = { term: 'cfgterm', ret: 'cfgterm', cond: 'cfgcond', loop: 'cfgcond', call: 'cfgcall', jump: 'cfgjump' };
+const CFG_SHAPE = { term: 'ellipse', ret: 'ellipse', cond: 'diamond', loop: 'diamond', call: 'box', jump: 'ellipse', periph: 'hexagon' };
+const CFG_CLASS = { term: 'cfgterm', ret: 'cfgterm', cond: 'cfgcond', loop: 'cfgcond', call: 'cfgcall', jump: 'cfgjump', periph: 'cfgperiph' };
+
+// Ported (simplified) from level0-analyzer.mjs's findNameInDeclarator — walks
+// a declarator down to its bound identifier, through pointer/array/init
+// wrapping (`U1Msg *m = ...` -> `m`).
+function findNameInDeclarator(node) {
+  if (!node) return null;
+  if (node.type === 'identifier') return node.text;
+  const inner = node.childForFieldName('declarator');
+  if (inner) return findNameInDeclarator(inner);
+  for (const child of node.children) {
+    const found = findNameInDeclarator(child);
+    if (found) return found;
+  }
+  return null;
+}
+
+// Every name this function binds itself — parameters plus locally declared
+// variables/loop counters — so a `->` field access rooted at one of them
+// (e.g. `m->data` off `U1Msg *m = &u1_q[...]`) reads as "just a local
+// struct", not a peripheral register. Anything else `X->field` is rooted at
+// (DMA1_Channel4, GPIOA, ...) is, by elimination, a real global/peripheral —
+// same test level0-analyzer.mjs's analyzeFunction uses (`!locals.has(name)`),
+// ported here so the per-function CFG view doesn't need the whole-project
+// scan level0 depends on for the same fact.
+function collectLocals(paramsNode, bodyNode) {
+  const locals = new Set();
+  if (paramsNode) {
+    walkTree(paramsNode, (n) => {
+      if (n.type === 'parameter_declaration') {
+        const nm = findNameInDeclarator(n.childForFieldName('declarator'));
+        if (nm) locals.add(nm);
+      }
+    });
+  }
+  if (bodyNode) {
+    walkTree(bodyNode, (n) => {
+      if (n.type === 'declaration') {
+        for (const child of n.namedChildren) {
+          if (!child.type.endsWith('declarator')) continue;
+          const nm = findNameInDeclarator(child);
+          if (nm) locals.add(nm);
+        }
+      }
+    });
+  }
+  return locals;
+}
+
+// Does statement `s` touch a peripheral register (`X->field` where X isn't
+// one of this function's own locals)? Answers the user's complaint
+// (2026-07-22) that a straight-line run of DMA1_Channel4->CCR/CMAR/CNDTR
+// writes got folded into one invisible "trivial algorithm" placeholder —
+// this is what promotes such statements into their own visible CFG node
+// (kind 'periph', drawn as a purple hexagon — same visual language as the
+// periph/DMA blocks in «Уровень 0»/«Связи», see media/main.css .cfgperiph).
+function hasPeriphAccess(s, locals) {
+  let found = false;
+  walkTree(s, (n) => {
+    if (found || n.type !== 'field_expression') return;
+    if (n.childForFieldName('operator')?.text !== '->') return;
+    // peel `[index]` layers off the base too — an array of channel/peripheral
+    // pointers (`chans[i]->CCR`) names a peripheral just as directly as a
+    // bare `DMA1_Channel4->CCR` does (same unwrap level0-analyzer.mjs's
+    // resolveAddrExpr applies when resolving a DMA target's own base).
+    let base = n.childForFieldName('argument');
+    while (base && base.type === 'subscript_expression') base = base.childForFieldName('argument');
+    while (base && base.type === 'parenthesized_expression') base = base.namedChildren[0];
+    if (base && base.type === 'identifier' && !locals.has(base.text)) found = true;
+  });
+  return found;
+}
 
 // A loop body that does nothing — a bare `;` or empty `{}` — the spin-wait
 // idiom (`while (!ready) ;`). Drawing a dedicated node for it is pure noise.
@@ -51,11 +122,23 @@ function isAlwaysTruthy(condNode) {
   return inner.type === 'identifier' && /^(true|TRUE)$/.test(inner.text);
 }
 
-function buildCfg(body, { startLabel, endLabel } = {}) {
+function buildCfg(body, { startLabel, endLabel, locals } = {}) {
   if (!body) return null;
+  const localNames = locals || new Set();
   const nodes = [];
   const edges = [];
   let seq = 0;
+
+  // Which loop (if any) a node was created inside of — drives cfgToSvg's
+  // cluster boxes (user report 2026-07-22: the loop-exit edge reads as
+  // "wanders off across the diagram" rather than "leaves the loop", so wrap
+  // each loop's own nodes in a visible box instead). loopScopeStack's top is
+  // the *innermost* loop currently being built; loopParent records each
+  // loop's own enclosing loop (or null for a top-level loop), letting
+  // cfgToSvg nest cluster subgraphs the same way the loops themselves nest.
+  let loopSeq = 0;
+  const loopScopeStack = [];
+  const loopParent = new Map(); // loopId -> parent loopId | null
 
   // node param is the tree-sitter node this CFG node came from (may be null for
   // the synthetic начало/конец terminals) — its row span drives line-mapping.
@@ -68,11 +151,31 @@ function buildCfg(body, { startLabel, endLabel } = {}) {
     const startLine = node ? node.startPosition.row : null;
     const endLine = node ? node.endPosition.row : null;
     const varsOut = vars || (node ? identNames(node) : new Set());
-    nodes.push({ id, kind, label, calls, vars: varsOut, startLine, endLine });
+    const loopScope = loopScopeStack.length ? loopScopeStack[loopScopeStack.length - 1] : null;
+    nodes.push({ id, kind, label, calls, vars: varsOut, startLine, endLine, loopScope });
     return id;
   };
   const mkEdge = (from, to, label) => { edges.push({ from, to, label: label || '' }); };
   const attach = (pending, id) => { for (const p of pending) mkEdge(p.from, id, p.label); };
+  const openLoopScope = () => {
+    const id = 'L' + loopSeq++;
+    loopParent.set(id, loopScopeStack.length ? loopScopeStack[loopScopeStack.length - 1] : null);
+    loopScopeStack.push(id);
+    return id;
+  };
+  const closeLoopScope = () => { loopScopeStack.pop(); };
+  // The loop's own "condition now false" exit — attributed to wherever the
+  // body naturally finished an iteration (the same nodes that already feed
+  // the "loop again" back-edge, built right alongside this in every loop
+  // case below), not to the loop header (`cond`) itself: a single edge
+  // straight off the header read as "jumps out of nowhere, crossing the
+  // whole diagram" (user report 2026-07-22) — this also matches how a
+  // rotated/bottom-tested loop actually compiles, where the recheck sits
+  // right after the body rather than at a separately revisited header.
+  // Falls back to `cond` itself only when there's no body node to attribute
+  // it to (while's empty-body spin-wait case).
+  const loopExit = (cond, bodyExits, label) =>
+    (bodyExits && bodyExits.length ? bodyExits : [{ from: cond }]).map((e) => ({ from: e.from, label }));
 
   const trunc = (s, n = 40) => {
     const t = s.replace(/\s+/g, ' ').trim();
@@ -146,6 +249,12 @@ function buildCfg(body, { startLabel, endLabel } = {}) {
           if (!entry) entry = id;
           attach(pending, id);
           pending = [{ from: id }];
+        } else if (hasPeriphAccess(s, localNames)) {
+          flushBlock();
+          const id = mkNode('periph', trunc(s.text, 46), [], s);
+          if (!entry) entry = id;
+          attach(pending, id);
+          pending = [{ from: id }];
         } else {
           blockLines.push(trunc(s.text));
           blockNodes.push(s);
@@ -169,7 +278,8 @@ function buildCfg(body, { startLabel, endLabel } = {}) {
     if (!s) return null;
     if (SIMPLE.has(s.type)) {
       const calls = callNames(s);
-      const id = mkNode(calls.length ? 'call' : 'stmt', trunc(s.text, 46), calls, s);
+      const kind = calls.length ? 'call' : hasPeriphAccess(s, localNames) ? 'periph' : 'stmt';
+      const id = mkNode(kind, trunc(s.text, 46), calls, s);
       return { entry: id, exits: [{ from: id }] };
     }
     return buildStmt(s, ctx);
@@ -199,29 +309,36 @@ function buildCfg(body, { startLabel, endLabel } = {}) {
       }
 
       case 'while_statement': {
+        openLoopScope();
         const condNode = s.childForFieldName('condition') || s;
         const cond = mkNode('loop', trunc('while ' + (s.childForFieldName('condition')?.text ?? '')), callNames(condNode), condNode);
         const bodyNode = s.childForFieldName('body');
         const breaks = [];
-        if (isEmptyBody(bodyNode)) {
-          // spin-wait idiom (`while (!ready) ;`) — see isEmptyBody; a
-          // self-loop on the condition itself says the same thing without a
-          // pointless intermediate node (user report 2026-07-20).
-          mkEdge(cond, cond, 'да');
-        } else {
-          const br = buildAny(bodyNode, { ...ctx, breaks, continueTo: cond });
+        let br = null;
+        // spin-wait idiom (`while (!ready) ;`) — see isEmptyBody. No
+        // self-loop arrow and no "нет" label on the exit either (user
+        // report 2026-07-22): the diamond IS the whole loop, so a "да" arrow
+        // curling back into the very same shape is a visual no-op, and a
+        // self-loop condition only has the one way out — spelling it "нет"
+        // just states the obvious.
+        const isSpin = isEmptyBody(bodyNode);
+        if (!isSpin) {
+          br = buildAny(bodyNode, { ...ctx, breaks, continueTo: cond });
           if (br && br.entry) {
             mkEdge(cond, br.entry, 'да');
             for (const e of br.exits) mkEdge(e.from, cond, e.label);
           }
         }
+        closeLoopScope();
         // see isAlwaysTruthy — `while (1)` etc. only exits via an explicit
         // break, never the generic "нет" fall-through.
-        const exits = isAlwaysTruthy(condNode) ? [...breaks] : [{ from: cond, label: 'нет' }, ...breaks];
+        const exits = [...breaks];
+        if (!isAlwaysTruthy(condNode)) exits.push(...loopExit(cond, br && br.exits, isSpin ? '' : 'нет'));
         return { entry: cond, exits };
       }
 
       case 'do_statement': {
+        openLoopScope();
         const breaks = [];
         const condNode = s.childForFieldName('condition') || s;
         const cond = mkNode('loop', trunc('while ' + (s.childForFieldName('condition')?.text ?? '')), callNames(condNode), condNode);
@@ -232,7 +349,9 @@ function buildCfg(body, { startLabel, endLabel } = {}) {
           for (const e of br.exits) mkEdge(e.from, cond, e.label);
           mkEdge(cond, br.entry, 'да');
         }
-        return { entry, exits: [{ from: cond, label: 'нет' }, ...breaks] };
+        closeLoopScope();
+        const exits = [...breaks, ...loopExit(cond, br && br.exits, 'нет')];
+        return { entry, exits };
       }
 
       case 'for_statement': {
@@ -249,14 +368,17 @@ function buildCfg(body, { startLabel, endLabel } = {}) {
           for (const nm of identNames(c)) headerVars.add(nm);
           headerCalls.push(...callNames(c));
         }
+        openLoopScope();
         const cond = mkNode('loop', trunc(header, 46), headerCalls, s, headerVars);
         const breaks = [];
         const br = buildAny(bodyNode, { ...ctx, breaks, continueTo: cond });
         if (br && br.entry) {
-          mkEdge(cond, br.entry, 'цикл');
+          mkEdge(cond, br.entry);
           for (const e of br.exits) mkEdge(e.from, cond, e.label);
         }
-        return { entry: cond, exits: [{ from: cond, label: 'конец' }, ...breaks] };
+        closeLoopScope();
+        const exits = [...breaks, ...loopExit(cond, br && br.exits, 'конец')];
+        return { entry: cond, exits };
       }
 
       case 'switch_statement': {
@@ -303,7 +425,7 @@ function buildCfg(body, { startLabel, endLabel } = {}) {
 
       case 'continue_statement': {
         const id = mkNode('jump', 'continue', [], s);
-        if (ctx.continueTo) mkEdge(id, ctx.continueTo, '↩');
+        if (ctx.continueTo) mkEdge(id, ctx.continueTo);
         return { entry: id, exits: [] };
       }
 
@@ -326,7 +448,8 @@ function buildCfg(body, { startLabel, endLabel } = {}) {
 
       default: {
         const calls = callNames(s);
-        const id = mkNode(calls.length ? 'call' : 'stmt', trunc(s.text, 46), calls, s);
+        const kind = calls.length ? 'call' : hasPeriphAccess(s, localNames) ? 'periph' : 'stmt';
+        const id = mkNode(kind, trunc(s.text, 46), calls, s);
         return { entry: id, exits: [{ from: id }] };
       }
     }
@@ -379,7 +502,7 @@ function buildCfg(body, { startLabel, endLabel } = {}) {
   // happened to survive — a straight-line function ending in `return x;`
   // shouldn't flip from "draw it" to "trivial" purely because конец, above,
   // decided it was redundant and removed itself.
-  return { nodes, edges, strippedExit };
+  return { nodes, edges, strippedExit, loopParent };
 }
 
 // --- dot emission + graphviz render (ported from index.mjs) -----------------
@@ -394,18 +517,54 @@ function dotEdge(id, from, to, label) {
   return `  ${from} -> ${to} [id="${id}" dir=forward${l}];`;
 }
 
-function cfgToSvg(cfg) {
-  const nodeLines = [];
-  const edgeLines = [];
-  for (const n of cfg.nodes) {
+// Nests each loop's own nodes inside a `subgraph cluster_*` block, mirroring
+// how the loops themselves nest (cfg.loopParent) — graphviz draws a box
+// around each one (styled via main.css's g.cluster rule, same pattern as
+// every other node class here) and routes cross-boundary edges (loop exits)
+// along it, so a loop's exit edge reads as "this leaves the loop" instead of
+// a stray line cutting across unrelated nodes (user report 2026-07-22).
+// Graphviz cluster names *must* start with "cluster" to be treated as one.
+function emitScopedNodes(cfg) {
+  const nodeDot = (n) => {
     const label = n.label.split('\n').map(dotEsc).join('<BR/>');
-    nodeLines.push(dotNode(n.id, [label], CFG_SHAPE[n.kind] || 'box', CFG_CLASS[n.kind] || 'cfgstmt'));
+    return dotNode(n.id, [label], CFG_SHAPE[n.kind] || 'box', CFG_CLASS[n.kind] || 'cfgstmt');
+  };
+  const nodesByScope = new Map(); // loopId ('' = top level) -> nodes
+  for (const n of cfg.nodes) {
+    const key = n.loopScope || '';
+    if (!nodesByScope.has(key)) nodesByScope.set(key, []);
+    nodesByScope.get(key).push(n);
   }
+  const childScopes = new Map(); // parent loopId ('' = top level) -> [loopId]
+  for (const [id, parent] of cfg.loopParent) {
+    const key = parent || '';
+    if (!childScopes.has(key)) childScopes.set(key, []);
+    childScopes.get(key).push(id);
+  }
+  function emitScope(scopeKey, depth) {
+    const lines = [];
+    const pad = '  '.repeat(depth);
+    const inCluster = scopeKey !== '';
+    if (inCluster) {
+      lines.push(`${pad}subgraph cluster_${scopeKey} {`);
+      lines.push(`${pad}  style=rounded; color=gray; bgcolor=white; margin=18;`);
+    }
+    for (const child of (childScopes.get(scopeKey) || [])) lines.push(...emitScope(child, depth + 1));
+    const inner = inCluster ? pad + '  ' : pad;
+    for (const n of (nodesByScope.get(scopeKey) || [])) lines.push(inner + nodeDot(n));
+    if (inCluster) lines.push(`${pad}}`);
+    return lines;
+  }
+  return emitScope('', 0);
+}
+
+function cfgToSvg(cfg) {
+  const nodeLines = emitScopedNodes(cfg);
   // explicit ids (e0, e1, ...) so the webview can select a specific edge
   // element directly instead of relying on graphviz's auto "edgeN" ids, which
   // carry no from/to information.
   cfg.edges.forEach((e, i) => { e.id = 'e' + i; });
-  for (const e of cfg.edges) edgeLines.push(dotEdge(e.id, e.from, e.to, e.label));
+  const edgeLines = cfg.edges.map((e) => dotEdge(e.id, e.from, e.to, e.label));
   const dot = [
     'digraph G {',
     // transparent, not white: graphviz otherwise paints an opaque background
@@ -493,6 +652,7 @@ function collectFunctions(root) {
         startLine: n.startPosition.row,
         endLine: n.endPosition.row,
         body: n.childForFieldName('body'),
+        params: declInfo.params,
         startLabel,
         endLabel,
       });
@@ -542,7 +702,8 @@ function describeFunction(fn) {
     edges: [],
   };
   if (!fn.body) return { ...base, kind: 'none' };
-  const cfg = buildCfg(fn.body, { startLabel: fn.startLabel, endLabel: fn.endLabel });
+  const locals = collectLocals(fn.params, fn.body);
+  const cfg = buildCfg(fn.body, { startLabel: fn.startLabel, endLabel: fn.endLabel, locals });
   const n = cfg.nodes.length + (cfg.strippedExit ? 1 : 0);
   if (n <= 3) return { ...base, kind: 'trivial' };
   if (n > CFG_MAX_NODES) return { ...base, kind: 'toobig' };

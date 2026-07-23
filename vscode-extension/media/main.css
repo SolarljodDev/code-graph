@@ -102,6 +102,32 @@ html, body {
   stroke: var(--vscode-charts-purple, #db2777);
 }
 
+/* Peripheral register access (`X->CCR = ...` where X isn't a local — see
+   cfg-analyzer.mjs's hasPeriphAccess) — same purple hexagon as the
+   periph/DMA blocks in «Уровень 0»/«Связи» (media/level0.css's g.node.periph),
+   so a peripheral write reads the same way across every diagram (user
+   request 2026-07-22: these were disappearing into a folded "trivial
+   algorithm" placeholder alongside plain variable assignments). */
+#inner svg g.node.cfgperiph polygon { fill: #ede9fe; stroke: #4338ca; }
+#inner svg g.node.cfgperiph polygon {
+  fill: color-mix(in srgb, var(--vscode-charts-purple, #4338ca) 38%, var(--vscode-editor-background));
+  stroke: var(--vscode-charts-purple, #4338ca);
+}
+
+/* Loop body box (cfg-analyzer.mjs's cluster_* subgraphs) — wraps a loop's
+   own nodes so its exit edge reads as "leaves this box" instead of a stray
+   line cutting across unrelated nodes further down the diagram (user report
+   2026-07-22). Graphviz emits one <path> per cluster, always the first
+   child of its own g.cluster — deliberately faint/neutral (not tied to any
+   node-kind color) since a nested loop's box sits *inside* its parent's, and
+   two saturated overlapping tints would fight each other for attention. */
+#inner svg g.cluster path { fill: #00000000; stroke: #94a3b8; }
+#inner svg g.cluster path {
+  fill: color-mix(in srgb, var(--vscode-descriptionForeground, #94a3b8) 6%, transparent);
+  stroke: color-mix(in srgb, var(--vscode-descriptionForeground, #94a3b8) 55%, var(--vscode-editor-background));
+  stroke-dasharray: 4 3;
+}
+
 /* focus (from a 'locate' message): dim everything else in that function's
    svg, keep only the located node lit. Deliberately node-only — edges are
    never marked .hl, so they dim along with everything else; there's no
@@ -131,6 +157,24 @@ html, body {
   filter: drop-shadow(0 0 3px var(--vscode-charts-orange, #d97706));
 }
 
+/* Hover a node for HOVER_PATH_DELAY_MS (main.js's wireHoverPath) — dims
+   everything except the branch(es) that actually reach it, so tracing "how
+   do we get here" doesn't mean eyeballing arrows across a busy diagram (user
+   request 2026-07-22). Own class triple (path-dim/path-hl/path-hover),
+   independent of .dim/.hl (locate) and .sym-dim/.sym-hl (symbol selection)
+   so the three dimming mechanisms don't fight over the same classes. Edges
+   dim too here (unlike .dim/.sym-dim above) — the whole point is showing
+   *which* arrows form the path, not just which nodes. */
+#inner svg.path-dim g.node:not(.path-hl) { opacity: 0.15; }
+#inner svg.path-dim g.edge:not(.path-hl) { opacity: 0.1; }
+#inner svg g.node.path-hover path,
+#inner svg g.node.path-hover polygon,
+#inner svg g.node.path-hover ellipse { stroke-width: 2.5px; }
+#inner svg g.node.path-hover > polygon,
+#inner svg g.node.path-hover > ellipse {
+  filter: drop-shadow(0 0 3px var(--vscode-charts-green, #16a34a));
+}
+
 /* edge/label ink follows the theme (graphviz emits black) */
 #inner svg text { fill: var(--vscode-foreground); }
 #inner svg g.edge path { stroke: var(--vscode-foreground); opacity: 0.7; }
@@ -147,6 +191,13 @@ html, body {
   text-underline-offset: 2px;
 }
 #inner svg .cg-var-token:hover { fill: var(--vscode-textLink-foreground, #3794ff); }
+
+/* A variable a DMA channel writes/reads directly (extension.js's 'dmaVars',
+   same set level0-analyzer.mjs's dmaTargetVarKeys marks purple on the
+   periph/DMA blocks in «Уровень 0»/«Связи») — purple here too, so it reads
+   the same way across every diagram (user request 2026-07-22). */
+#inner svg .cg-var-token.dma-target { fill: var(--vscode-charts-purple, #4338ca); font-weight: 600; }
+#inner svg .cg-var-token.dma-target:hover { fill: var(--vscode-textLink-foreground, #3794ff); }
 
 /* "this variable also appears in..." side list (main.js's showOtherPlaces) —
    a floating panel, not part of the ribbon's own pan/zoom transform, so it

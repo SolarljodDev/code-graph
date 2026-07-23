@@ -31,6 +31,17 @@ svg g.node.isr polygon {
   fill: color-mix(in srgb, var(--vscode-charts-red, #dc2626) 45%, var(--vscode-editor-background));
   stroke: var(--vscode-charts-red, #dc2626);
 }
+/* Plain function (dotFnNode's fnClass — neither entry nor ISR) had no color
+   rule at all: text picked up the theme's --vscode-foreground (light grey
+   on dark themes) while the box stayed graphviz's raw fillcolor=white,
+   leaving grey-on-white for the most common node kind in «Связи» (user
+   report 2026-07-22). Blue, matching a "call" the same way main.css's
+   cfgcall does for the CFG ribbon. */
+svg g.node.fn path,
+svg g.node.fn polygon {
+  fill: color-mix(in srgb, var(--vscode-charts-blue, #2563eb) 30%, var(--vscode-editor-background));
+  stroke: var(--vscode-charts-blue, #2563eb);
+}
 svg g.node.periph path,
 svg g.node.periph polygon {
   fill: color-mix(in srgb, var(--vscode-charts-purple, #4338ca) 38%, var(--vscode-editor-background));
@@ -64,6 +75,18 @@ svg g.node.ghost path,
 svg g.node.ghost polygon {
   fill: color-mix(in srgb, var(--vscode-descriptionForeground, #a1a1aa) 26%, var(--vscode-editor-background));
   stroke: var(--vscode-descriptionForeground, #a1a1aa);
+}
+/* A variable a DMA channel writes/reads directly (CMAR/CPAR-resolved, see
+   level0-analyzer.mjs's dmaTargetVarKeys) — same purple as a peripheral/DMA
+   channel block (g.node.periph above), not the usual yellow gvar, so it
+   reads as "DMA hardware touches this" at a glance (user request
+   2026-07-22). Comes after the gvar/gvarhot/gvarminor rules on purpose: same
+   selector specificity, so source order is what makes this win over the
+   plain var-kind color those already set on the same node. */
+svg g.node.dma-flow path,
+svg g.node.dma-flow polygon {
+  fill: color-mix(in srgb, var(--vscode-charts-purple, #4338ca) 42%, var(--vscode-editor-background));
+  stroke: var(--vscode-charts-purple, #4338ca);
 }
 
 /* DMA source/destination edges (dotDmaFlowEdge in level0-analyzer.mjs) — a

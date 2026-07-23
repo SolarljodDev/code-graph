@@ -71,6 +71,102 @@ function findNameInDeclarator(node) {
 // `===`; compare .id instead.
 const sameNode = (a, b) => !!a && !!b && a.id === b.id;
 
+// Classifies a call_expression's own `function` node: a plain name
+// (`foo()`) resolves directly against the project's real functions later,
+// same as before — but `obj->cb()` / `obj.cb()` (field_expression),
+// `table[i]()` (subscript_expression) and `(*fp)()` (a dereferenced
+// pointer) never have, and *specifically because they're indirect never
+// will have, a plain identifier to look up: the call graph used to just
+// drop these on the floor (2026-07-22 user report — "а обращения к
+// функциям по адресам?"). No type information is tracked anywhere in this
+// analyzer, so there's no way to know *which* struct/array a given
+// `->field`/`[i]` targets — the same "key by name alone, union every
+// project-wide match" trade-off already made for periph/DMA resolution
+// (resolveAddrExpr) applies here too: an indirect call's target is
+// resolved by matching its field/variable name against every assignment of
+// that same name anywhere in the project (collectFpAssignments +
+// buildLevel0's fpTargets map), not by tracing the actual pointer's type.
+function resolveCallTarget(fnNode) {
+  let n = fnNode;
+  while (n && n.type === 'parenthesized_expression') n = n.namedChildren[0];
+  if (n && n.type === 'pointer_expression' && n.childForFieldName('operator')?.text === '*') {
+    n = n.childForFieldName('argument');
+    while (n && n.type === 'parenthesized_expression') n = n.namedChildren[0];
+  }
+  if (!n) return null;
+  if (n.type === 'identifier') return { kind: 'direct', name: n.text };
+  if (n.type === 'field_expression') {
+    const field = n.childForFieldName('field')?.text;
+    return field ? { kind: 'indirect', key: field } : null;
+  }
+  if (n.type === 'subscript_expression') {
+    let base = n.childForFieldName('argument');
+    while (base && base.type === 'parenthesized_expression') base = base.namedChildren[0];
+    return base && base.type === 'identifier' ? { kind: 'indirect', key: base.text } : null;
+  }
+  return null;
+}
+
+// Every "name (whether a plain variable, or the last field of a `.`/`->`
+// access) was assigned a real function's name" fact in one file — the raw
+// material for fpTargets (built project-wide in buildLevel0, once
+// functionsByName exists to filter these down to real functions). Deliberately
+// walks the *whole* file (translation_unit), not just function bodies: the
+// classic C pattern this exists for — `static const Ops my_ops = { .read =
+// my_read, ... };` — lives at file scope, outside any function. No type
+// tracking here either, same as resolveCallTarget: `key` is just the bare
+// variable/field name, so `X.read = a;` and `Y.read = b;` for two unrelated
+// struct types both feed the same `read` bucket — an accepted false-positive
+// risk, not a bug (same trade-off as periph resolution elsewhere).
+function collectFpAssignments(root) {
+  const out = [];
+  walkTree(root, n => {
+    if (n.type === 'assignment_expression') {
+      if (n.childForFieldName('operator')?.text !== '=') return;
+      const right = n.childForFieldName('right');
+      if (!right || right.type !== 'identifier') return;
+      let left = n.childForFieldName('left');
+      if (!left) return;
+      // `table[2] = target;` — peel `[index]` layers the same way
+      // resolveCallTarget does for the read side (`table[i]()`), so the two
+      // sides agree on the same base-name key.
+      while (left && left.type === 'subscript_expression') left = left.childForFieldName('argument');
+      while (left && left.type === 'parenthesized_expression') left = left.namedChildren[0];
+      if (!left) return;
+      if (left.type === 'identifier') out.push({ key: left.text, valueName: right.text });
+      else if (left.type === 'field_expression') {
+        const field = left.childForFieldName('field')?.text;
+        if (field) out.push({ key: field, valueName: right.text });
+      }
+      return;
+    }
+    if (n.type === 'init_declarator') {
+      const value = n.childForFieldName('value');
+      if (value && value.type === 'identifier') {
+        const nm = findNameInDeclarator(n.childForFieldName('declarator'));
+        if (nm) out.push({ key: nm, valueName: value.text });
+      }
+      return;
+    }
+    if (n.type === 'initializer_pair') {
+      // `{ .read = my_read, .write = my_write }` — the callback-table
+      // pattern. Only the single-level `.field = value` shape is handled
+      // (childForFieldName only ever returns the *first* designator, so a
+      // nested `.a.b = x`/`.arr[2].field = x` designator falls through
+      // unmatched below rather than being misread) — good enough for the
+      // common case without pretending to parse the general one.
+      const value = n.childForFieldName('value');
+      if (!value || value.type !== 'identifier') return;
+      const designator = n.childForFieldName('designator');
+      if (designator && designator.type === 'field_designator') {
+        const fieldIdent = designator.namedChildren.find(c => c.type === 'field_identifier');
+        if (fieldIdent) out.push({ key: fieldIdent.text, valueName: value.text });
+      }
+    }
+  });
+  return out;
+}
+
 function insideFunction(node) {
   for (let p = node.parent; p; p = p.parent) {
     if (p.type === 'function_definition') return true;
@@ -302,6 +398,7 @@ function analyzeFunction(funcNode) {
   }
 
   const calls = new Set();
+  const indirectCalls = new Set(); // field/subscript/deref call-target keys — see resolveCallTarget
   const armCalls = new Set();
   const derefNames = new Set();
   const derefFields = new Map(); // name -> Map(field -> 'r' | 'w' | 'rw')
@@ -316,14 +413,16 @@ function analyzeFunction(funcNode) {
   if (body) {
     walkTree(body, n => {
       if (n.type === 'call_expression') {
-        const fn = n.childForFieldName('function');
-        if (fn && fn.type === 'identifier') {
-          calls.add(fn.text);
-          if (NVIC_ARM_RE.test(fn.text)) {
+        const target = resolveCallTarget(n.childForFieldName('function'));
+        if (target && target.kind === 'direct') {
+          calls.add(target.name);
+          if (NVIC_ARM_RE.test(target.name)) {
             const args = n.childForFieldName('arguments');
             const first = args ? args.namedChildren[0] : null;
             if (first && first.type === 'identifier') armCalls.add(first.text);
           }
+        } else if (target && target.kind === 'indirect') {
+          indirectCalls.add(target.key);
         }
         return;
       }
@@ -431,7 +530,7 @@ function analyzeFunction(funcNode) {
   }
   const hasLoop = !!loopNode;
 
-  return { calls, armCalls, derefNames, derefFields, derefFlags, derefAddrRefs, access, signature, loopCallNames, hasLoop };
+  return { calls, indirectCalls, armCalls, derefNames, derefFields, derefFlags, derefAddrRefs, access, signature, loopCallNames, hasLoop };
 }
 
 // Strips a DMA CPAR/CMAR assignment's right-hand side (or a local pointer's
@@ -439,12 +538,19 @@ function analyzeFunction(funcNode) {
 // actually names the source/destination address — casts and parens first,
 // then, if what's left is `&something`, unwraps that one layer too, then
 // unwraps one `[index]` layer the same way (`&u1_q[u1_q_tail]` names the
-// array `u1_q`, whichever slot). What remains is classified: a `->` field
-// access names the peripheral it's rooted at (`field` is kept too, for the
-// hover-detail label — see dotDmaFlowEdge) and a bare identifier names a var
-// — this doesn't yet know whether that base name is itself a global or a
-// local pointer/array (e.g. `m` in `m->data`); the caller resolves that
-// ambiguity via resolveLocalAlias. Verbatim port of the CLI's index.mjs.
+// array `u1_q`, whichever slot). What remains is classified: a field access
+// (`->` or `.`) names whatever it's rooted at (`field` is kept too, for the
+// hover-detail label — see dotDmaFlowEdge), unwrapping any `[index]` layers
+// on *that* base too (`bufs[i].payload` names `bufs`, same as the top-level
+// `&arr[i]` case) — and a bare identifier names a var. Neither branch yet
+// knows whether its base name is itself a global or a local pointer/array
+// (e.g. `m` in `m->data`); the caller resolves that ambiguity via
+// resolveLocalAlias. `->` vs `.` picks the default guess for "what kind of
+// global is this, assuming it isn't local": arrow-on-a-global is (almost)
+// always a real MCU peripheral register block (CMSIS's `((T*)BASE_ADDR)`
+// pattern) — dot-on-a-global is the opposite, ordinary field access on a
+// plain global struct/array, never a peripheral. Verbatim port of the CLI's
+// index.mjs.
 function resolveAddrExpr(node) {
   let n = node;
   for (;;) {
@@ -463,11 +569,16 @@ function resolveAddrExpr(node) {
     while (n && n.type === 'parenthesized_expression') n = n.namedChildren[0];
   }
   if (!n) return null;
-  if (n.type === 'field_expression' && n.childForFieldName('operator')?.text === '->') {
-    const base = n.childForFieldName('argument');
-    return base && base.type === 'identifier'
-      ? { kind: 'periph', name: base.text, field: n.childForFieldName('field')?.text }
-      : null;
+  if (n.type === 'field_expression') {
+    const op = n.childForFieldName('operator')?.text;
+    if (op === '->' || op === '.') {
+      let base = n.childForFieldName('argument');
+      while (base && base.type === 'subscript_expression') base = base.childForFieldName('argument');
+      while (base && base.type === 'parenthesized_expression') base = base.namedChildren[0];
+      if (!base || base.type !== 'identifier') return null;
+      const field = n.childForFieldName('field')?.text;
+      return op === '->' ? { kind: 'periph', name: base.text, field } : { kind: 'var', name: base.text, field };
+    }
   }
   if (n.type === 'identifier') return { kind: 'var', name: n.text };
   return null;
@@ -1527,6 +1638,14 @@ async function buildLevel0Diagram(funcs, varDefs, peripherals, hotCut) {
   // (dmaToggle below). off by default (no DMA usage anywhere in the
   // project) so the checkbox never shows at all.
   const hasDma = dmaFacts.addrRefs.size > 0;
+  // Every variable a DMA channel's own CMAR/CPAR wiring resolves to — used
+  // by the caller (buildLevel0) to tag those varDefs records so every other
+  // diagram (relations graph, and via that the CFG ribbon's token coloring)
+  // can mark them too, not just this one's own dma-flow-tagged nodes.
+  const dmaTargetVarKeys = new Set();
+  for (const refs of dmaFacts.addrRefs.values()) {
+    for (const ref of refs.values()) if (ref.kind === 'var') dmaTargetVarKeys.add(ref.key);
+  }
 
   async function renderVariant(info, idPrefix, suffix, includeDma = false) {
     const v = assembleLevel0(varDefs, peripherals, hotCut, entries, info, idPrefix, includeDma, includeDma ? dmaFacts : null);
@@ -1559,6 +1678,7 @@ async function buildLevel0Diagram(funcs, varDefs, peripherals, hotCut) {
     extraNodes: {
       ...all.extraNodes, ...cyclic.extraNodes, ...setupOnly.extraNodes, ...overlap.extraNodes,
     },
+    dmaTargetVarKeys,
   };
 }
 
@@ -1589,7 +1709,7 @@ export async function buildLevel0({ files }) {
       desc: docCommentFor(f.node, commentIdx),
       ...analyzeFunction(f.node),
     }));
-    fileRecords.push({ filePath: file.filePath, basename, funcs: fns, vars });
+    fileRecords.push({ filePath: file.filePath, basename, funcs: fns, vars, fpAssignments: collectFpAssignments(root) });
   }
 
   // --- Pass 2: build the model (resolve names across files) --------------
@@ -1598,6 +1718,22 @@ export async function buildLevel0({ files }) {
     for (const fn of f.funcs) {
       if (!functionsByName.has(fn.name)) functionsByName.set(fn.name, []);
       functionsByName.get(fn.name).push(f);
+    }
+  }
+
+  // key (bare variable name, or the last field of a `.`/`->` access) -> every
+  // real function's name ever assigned to something with that name, anywhere
+  // in the project — resolves indirect calls (see resolveCallTarget) the same
+  // "name-only, project-wide union" way periph/DMA targets already resolve
+  // through resolveAddrExpr. Filtered against functionsByName so a struct
+  // field that happens to be set to a non-function value (an int, a null,
+  // whatever) never contributes a bogus edge.
+  const fpTargets = new Map(); // key -> Set(funcName)
+  for (const f of fileRecords) {
+    for (const { key, valueName } of f.fpAssignments) {
+      if (!functionsByName.has(valueName)) continue;
+      if (!fpTargets.has(key)) fpTargets.set(key, new Set());
+      fpTargets.get(key).add(valueName);
     }
   }
 
@@ -1696,19 +1832,38 @@ export async function buildLevel0({ files }) {
     return nonStatic || keys[0];
   }
 
+  // Adds rec -> calleeName as a call edge if calleeName is a real function;
+  // returns whether it found one (so callers can fall back to extCalls /
+  // skip only once every possibility — direct name, then fpTargets — is
+  // exhausted). Shared by the direct-call loop below and the indirect-call
+  // resolution right after it.
+  function addCallEdge(rec, calleeName, basename) {
+    const candidates = functionsByName.get(calleeName);
+    if (!candidates || !candidates.length) return false;
+    const target = candidates.find(c => c.basename === basename) || candidates[0];
+    const calleeKey = funcKey(calleeName, target.basename);
+    if (calleeKey !== rec.key) rec.calls.add(calleeKey);
+    return true;
+  }
+
   for (const f of fileRecords) {
     for (const fn of f.funcs) {
       const rec = funcs.get(funcKey(fn.name, f.basename));
 
       for (const calleeName of fn.calls) {
-        const candidates = functionsByName.get(calleeName);
-        if (candidates && candidates.length > 0) {
-          const target = candidates.find(c => c.basename === f.basename) || candidates[0];
-          const calleeKey = funcKey(calleeName, target.basename);
-          if (calleeKey !== rec.key) rec.calls.add(calleeKey);
-        } else {
-          rec.extCalls.add(calleeName);
-        }
+        if (addCallEdge(rec, calleeName, f.basename)) continue;
+        // calleeName didn't name a real function directly — it may still be
+        // a function-pointer *variable* someone assigned a real function to
+        // elsewhere (`fp = my_handler;` then `fp()`), same fallback as the
+        // indirect (`->`/`.`/`[]`) call sites just below.
+        const fpNames = fpTargets.get(calleeName);
+        let any = false;
+        if (fpNames) for (const realName of fpNames) any = addCallEdge(rec, realName, f.basename) || any;
+        if (!any) rec.extCalls.add(calleeName);
+      }
+      for (const key of fn.indirectCalls) {
+        const fpNames = fpTargets.get(key);
+        if (fpNames) for (const realName of fpNames) addCallEdge(rec, realName, f.basename);
       }
       for (const calleeName of fn.loopCallNames) {
         const candidates = functionsByName.get(calleeName);
@@ -1941,6 +2096,16 @@ export async function buildLevel0({ files }) {
   const level0 = await buildLevel0Diagram(funcs, varDefs, peripherals, hotCut);
   if (!level0) return null;
 
+  // Every variable a DMA channel writes/reads via its CMAR/CPAR wiring
+  // (level0's own dma-flow-tagged nodes) — mark the shared varDefs record so
+  // relations.G and the CFG ribbon's dmaVarNames (below) can flag the same
+  // variable purple too, project-wide, not just level0's own diagram (user
+  // request 2026-07-22: color DMA-target variables consistently everywhere).
+  for (const vk of level0.dmaTargetVarKeys) {
+    const v = varDefs.get(vk);
+    if (v) v.isDmaTarget = true;
+  }
+
   // --- Flat node-info lookup table for hover tooltips ---------------------
   const fnName = k => funcs.get(k)?.name || k;
   const nodeInfo = {};
@@ -1959,6 +2124,7 @@ export async function buildLevel0({ files }) {
       static: v.isStatic || undefined, volatile: v.isVolatile || undefined,
       desc: v.desc || undefined, users: v.users || undefined,
       writers: [...v.writers].map(fnName), readers: [...v.readers].map(fnName),
+      dmaTarget: v.isDmaTarget || undefined,
     };
   }
   for (const p of peripherals.values()) {
@@ -1993,6 +2159,24 @@ export async function buildLevel0({ files }) {
     (usageByVar[v.name] || (usageByVar[v.name] = [])).push(...entries);
   }
 
+  // --- Per-function-name usage index, mirroring usageByVar above but for a
+  // right-clicked call token: its own declaration plus every function that
+  // calls it (user report 2026-07-22: right-click on a call showed "not
+  // found anywhere else" even though the callee is declared a few lines
+  // above — usageByVar only ever covers variables, so a call token never
+  // matched anything there).
+  const usageByFunc = {};
+  for (const fn of funcs.values()) {
+    const entries = [{ name: fn.name, file: fn.file, filePath: fn.filePath, startLine: fn.startLine, mode: 'decl' }];
+    for (const k of fn.callers) {
+      const caller = funcs.get(k);
+      if (!caller) continue;
+      entries.push({ name: caller.name, file: caller.file, filePath: caller.filePath, startLine: caller.startLine, mode: 'call' });
+    }
+    entries.sort((a, b) => (a.file === b.file ? a.startLine - b.startLine : a.file.localeCompare(b.file)));
+    (usageByFunc[fn.name] || (usageByFunc[fn.name] = [])).push(...entries);
+  }
+
   // --- «Связи»: whole-project function-relations graph, for the VS Code
   // extension's per-function "Связи" panel (interactive caller/callee chain
   // walking — see renderRelations below). Built from the exact same
@@ -2000,10 +2184,19 @@ export async function buildLevel0({ files }) {
   // free to compute here rather than a second project-wide parse.
   const relations = buildRelationsGraph(funcs, varDefs, peripherals);
 
+  // Bare names of every DMA-target variable, for the CFG ribbon (main.js):
+  // it never sees varKeys (it only tokenizes plain identifier text out of
+  // rendered CFG node labels), so a right-click/hover-free "this name is a
+  // DMA target" flag has to travel as a name, same imprecision tradeoff
+  // usageByVar/usageByFunc already accept for a same-named local elsewhere.
+  const dmaVarNames = [...new Set([...varDefs.values()].filter(v => v.isDmaTarget).map(v => v.name))];
+
   return {
     svgs: level0.svgs,
     nodeInfo,
     usageByVar,
+    usageByFunc,
+    dmaVarNames,
     relations,
     varsToggle: level0.varsToggle,
     cyclicToggle: level0.cyclicToggle,
@@ -2070,6 +2263,7 @@ function buildRelationsGraph(funcs, varDefs, peripherals) {
       kind: v.isExternal ? 'extvar' : v.isVolatile ? 'gvolatile' : 'gvar',
       label: v.name, file: v.file || undefined, type: v.typeText || undefined,
       static: v.isStatic || undefined,
+      dmaTarget: v.isDmaTarget || undefined,
     };
   }
   for (const p of peripherals.values()) {
@@ -2114,7 +2308,8 @@ function relFnNodeLine(id, info, sameFile) {
 }
 function relVarNodeLine(id, info, sameFile) {
   const kindLabel = info.kind === 'extvar' ? 'ext var' : info.kind === 'gvolatile' ? 'volatile' : 'var';
-  const cls = info.kind === 'extvar' ? 'ghost' : 'gvar';
+  let cls = info.kind === 'extvar' ? 'ghost' : 'gvar';
+  if (info.dmaTarget) cls += ' dma-flow';
   const nameColor = info.kind === 'gvolatile' ? ' COLOR="#dc2626"' : '';
   const rows = [dotKindRow(kindLabel), `<B${nameColor}>${dotEsc(info.label)}</B>`];
   const sub = [];

@@ -1,0 +1,13 @@
+# Build-time only — copy-wasm.js copies the one grammar this extension
+# actually needs (tree-sitter-c.wasm) into ./wasm at postinstall; nothing at
+# runtime imports tree-sitter-wasms itself (see src/wasm-runtime.mjs), so
+# shipping its 49MB of every other language's grammar in the VSIX is pure
+# bloat.
+node_modules/tree-sitter-wasms/**
+
+# dev-only
+test-analyzer.mjs
+test-level0-analyzer.mjs
+test-output.svg
+.vscode/**
+.gitignore

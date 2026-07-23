@@ -16,7 +16,8 @@
     "commands": [
       {
         "command": "codeGraphCfg.open",
-        "title": "Code Graph: открыть панель «Алгоритмы» рядом с кодом"
+        "title": "Code Graph: открыть панель «Алгоритмы» рядом с кодом",
+        "icon": "$(list-tree)"
       },
       {
         "command": "codeGraphCfg.locate",
@@ -24,7 +25,8 @@
       },
       {
         "command": "codeGraph.level0.open",
-        "title": "Code Graph: показать диаграмму уровня 0 (точки входа, периферия, переменные)"
+        "title": "Code Graph: показать диаграмму уровня 0 (точки входа, периферия, переменные)",
+        "icon": "$(circuit-board)"
       }
     ],
     "keybindings": [
@@ -40,6 +42,18 @@
           "command": "codeGraphCfg.locate",
           "when": "editorLangId == c",
           "group": "navigation"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "codeGraphCfg.open",
+          "when": "editorLangId == c",
+          "group": "navigation@1"
+        },
+        {
+          "command": "codeGraph.level0.open",
+          "when": "editorLangId == c",
+          "group": "navigation@2"
         }
       ]
     }

@@ -441,6 +441,23 @@ async function renderAll(context, editor) {
   sourceFsPath = doc.uri.fsPath;
   lastFunctions = res.functions;
   panel.webview.postMessage({ type: 'renderAll', functions: res.functions });
+  broadcastDmaVarNames(context);
+}
+
+// Tell the ribbon which variable names are DMA channel targets (CMAR/CPAR
+// wiring), so it can color those tokens purple same as the periph/DMA blocks
+// in «Уровень 0»/«Связи» (user request 2026-07-22). Rides on the same cached
+// whole-project index those two panels already use — ensureWorkspaceIndex
+// resolves instantly once it's warm, so this is cheap on every renderAll,
+// not just the first one.
+function broadcastDmaVarNames(context) {
+  if (!panel) return;
+  ensureWorkspaceIndex(context).then((idx) => {
+    if (!panel) return;
+    panel.webview.postMessage({ type: 'dmaVars', names: (idx && idx.dmaVarNames) || [] });
+  }).catch((e) => {
+    console.error('code-graph workspace index build failed:', e);
+  });
 }
 
 function scheduleReanalyze(context, editor) {
@@ -487,7 +504,14 @@ let otherPlacesSeq = 0;
 // in the same file still said "found nowhere else").
 async function lookupOtherPlaces(context, name) {
   const idx = await ensureWorkspaceIndex(context);
-  return (idx && idx.usageByVar && idx.usageByVar[name]) || [];
+  if (!idx) return [];
+  // A name is either a variable or a function, never usefully both — try the
+  // variable index first (existing behavior), and only fall back to the
+  // function index (its own declaration + callers) when that comes up empty,
+  // which is always the case for a right-clicked call token.
+  const varPlaces = idx.usageByVar && idx.usageByVar[name];
+  if (varPlaces && varPlaces.length) return varPlaces;
+  return (idx.usageByFunc && idx.usageByFunc[name]) || [];
 }
 
 function broadcastSymbolSelection(context, editor) {
